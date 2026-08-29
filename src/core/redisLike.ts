@@ -1,0 +1,62 @@
+// The structural minimum tickroom needs from a Redis client.
+//
+// `core` never imports `ioredis` directly. Two reasons, and both matter:
+//
+// 1. TESTABILITY. Every test in this package can hand `RedisLike` a tiny
+//    in-memory fake instead of standing up a real Redis, so the lease and
+//    checkpoint logic (the parts where a bug is expensive) get exercised
+//    thousands of times a second in CI with no network at all.
+// 2. SWAPPABILITY. A host that already runs Redis Cloud, a self-hosted
+//    instance, or a differently-shaped client library only needs to satisfy
+//    this interface, not depend on ioredis at all. `ioredis` itself satisfies
+//    `RedisLike` structurally with zero adapter code: every method below is a
+//    direct copy of an `ioredis` method signature (narrowed to what tickroom
+//    actually calls), so `new Redis(url) as unknown as RedisLike` is never
+//    needed and a plain `new Redis(url)` already type-checks against this
+//    interface wherever tickroom asks for one.
+//
+// Deliberately NOT exhaustive. This is not "the Redis command set", it is
+// "the commands tickroom's core, server, and client layers actually call".
+// Add a method here only when a real call site needs it; a wider surface
+// just makes the fake in tests (and any alternative implementation) do more
+// work for no benefit.
+export interface RedisLike {
+  get(key: string): Promise<string | null>;
+
+  /**
+   * Returns the raw bytes rather than a decoded string. Load-bearing for the
+   * checkpoint path: a checkpoint may be gzip-compressed, and a UTF-8 decode
+   * of gzip bytes is lossy and destroys the payload before anything can even
+   * sniff the magic bytes to tell it was compressed. Any reader of a value
+   * that might be binary must use this, never `get`.
+   */
+  getBuffer(key: string): Promise<Buffer | null>;
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  set(key: string, value: string | Buffer, ...args: any[]): Promise<any>;
+  del(...keys: string[]): Promise<number>;
+  eval(script: string, numKeys: number, ...args: (string | number)[]): Promise<unknown>;
+  publish(channel: string, message: string | Buffer): Promise<number>;
+  expire(key: string, seconds: number): Promise<number>;
+  hgetall(key: string): Promise<Record<string, string>>;
+  hset(key: string, field: string, value: string): Promise<number>;
+  hdel(key: string, ...fields: string[]): Promise<number>;
+  mget(...keys: string[]): Promise<(string | null)[]>;
+  zadd(key: string, score: number, member: string): Promise<unknown>;
+  zrem(key: string, ...members: string[]): Promise<number>;
+  zcard(key: string): Promise<number>;
+  zremrangebyscore(key: string, min: string | number, max: string | number): Promise<number>;
+  incrby(key: string, n: number): Promise<number>;
+  hincrby(key: string, field: string, n: number): Promise<number>;
+
+  /**
+   * Batches several commands into one round trip. Typed `any` deliberately:
+   * ioredis's own pipeline typing is a chained builder whose return type
+   * depends on which methods were called on it in what order, which is not
+   * something a structural interface can describe without dragging in
+   * ioredis's own types (which would defeat the point of this file). Callers
+   * that need real type safety on a pipeline chain should narrow locally.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  pipeline(): any;
+}
