@@ -1,4 +1,19 @@
-import { PLAYOUT_MAX_AHEAD } from '../core/index.js';
+// DEEP IMPORT, NOT THE BARREL, and this is a build constraint rather than a
+// style choice. `../core/index.js` re-exports `checkpoint.ts`, which imports
+// `node:zlib` and `node:util` at module scope. Reaching the barrel from client
+// code therefore drags two Node builtins into the browser module graph, and a
+// browser bundle does not merely bloat, it FAILS TO BUILD: esbuild in browser
+// mode reports `Could not resolve "node:zlib"` and exits non-zero, which is the
+// first thing anyone integrating this library would hit.
+//
+// Tree shaking does not save you here either. `checkpoint.ts` runs
+// `promisify(gzipCb)` at module scope, so it is not side-effect-free, and the
+// import is evaluated before any bundler gets to decide the export is unused.
+//
+// `bundling.test.ts` pins this by actually running a browser-target bundle, so
+// a future edit that "consolidates imports to the barrel" reddens rather than
+// silently breaking every downstream browser build.
+import { PLAYOUT_MAX_AHEAD } from '../core/playout.js';
 
 // Pure netcode decisions, extracted so they can be pinned by direct unit
 // tests instead of only being reachable through a live socket and a real
