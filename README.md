@@ -254,6 +254,39 @@ If bandwidth ever becomes the bill, the lever is not a bigger plan, it is ending
 | [`examples/cursors`](examples/cursors) | Multiplayer cursors. Not a game at all; realtime presence. |
 | [`examples/node-server`](examples/node-server) | The same simulation on a plain Node `ws` server, no serverless. |
 
+Each example is tested, not just illustrative: the round-trip tests prove a
+checkpoint genuinely resumes (both rooms ticked forward through identical input
+and diffed, which is what catches a field somebody forgot to serialise) and
+`examples/pong/codec.ts` works the JSON-to-binary upgrade all the way through,
+measured at **215 bytes to 51, 4.22x smaller**, on a realistic two-player
+snapshot.
+
+---
+
+## Verification
+
+```bash
+npm test                       # 400 tests, no services needed
+redis-server --port 6399 --save '' --appendonly no --daemonize yes
+npm run test:integration       # the same architecture against a real Redis
+```
+
+The integration suite skips cleanly (exit 0) when no Redis is reachable, so the
+default run stays green offline. Measured on Redis 8.10.1:
+
+| | measured |
+| --- | --- |
+| Checkpoint compression | 5,749B to 749B, **7.68x** |
+| Fan-out | 50 publishes issued exactly **50** commands, delivered to 5 subscribers |
+| Tick rate | **20.45Hz** against a 20Hz target, over real wall time |
+| **Handoff** | predecessor died at tick 26, successor **restored at tick 26**, longest snapshot-stream gap **10ms** |
+
+That handoff number is the library's central claim made executable. Read it as a
+floor rather than a typical figure: this is loopback Redis with no network and no
+cold function start, so production is slower. What it demonstrates is the
+mechanism, that a successor picks up the lease, restores the checkpoint, and
+continues the tick count rather than resetting the room.
+
 ---
 
 ## Non-goals
@@ -262,6 +295,21 @@ If bandwidth ever becomes the bill, the lever is not a bigger plan, it is ending
 - **Not lockstep.** State-synchronised with client prediction, not deterministic lockstep. Peers never wait on each other.
 - **Not a CRDT.** There is one authority and it is the server. For text or documents with no natural authority, use a CRDT.
 - **Not zero-latency.** Clients render other entities 80 to 250ms behind, adaptively. That delay is what buys smoothness, and it is the correct trade for everything except a competitive shooter.
+
+---
+
+## Status, honestly
+
+Not published to npm and not deployed anywhere. The architecture's production
+evidence is the game it was extracted from, where the lease, the checkpoint
+handoff, the playout timeline, the stall thresholds and the interpolation rules
+were all measured under real load. This repo proves the extraction is faithful
+and that the mechanisms work against real Redis and a real socket; it has not
+itself served a player.
+
+Known gaps: the integration suite exercises a toy runtime rather than the
+examples end to end, and there is no CI (the integration half needs a Redis
+service container). Both are tracked in `AGENTS.md`.
 
 ---
 

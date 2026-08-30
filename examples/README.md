@@ -73,3 +73,97 @@ buzz along the boundary forever.
 **Emit the edge, not the state.** The cursors idle event fires on the tick the
 threshold is crossed (`=== IDLE_TICKS`), not for every tick past it, so it fires
 once per cursor rather than ten times a second forever.
+
+## What the tests prove
+
+`pong/sim.test.ts` and `cursors/sim.test.ts` exist because "the example does
+this correctly" and "an example that quietly broke would still look fine" are
+both true at once, and only a test tells them apart. Each file checks:
+
+- **The Map round-trip**, asserted on the reconstructed `Map` itself (keys,
+  values, `instanceof Map`), not on the JSON string a looser test would settle
+  for. A string comparison cannot tell you the receiving side got a `Map`
+  back instead of the array `JSON.parse` actually produces.
+- **A full game survives a restore and keeps simulating.** Both tests run
+  real play, take a checkpoint mid-session, then tick the original room and
+  the restored one forward through the *identical remaining input* and
+  diff the final states. This is the test that actually matters: a shallow
+  encode/decode/compare can pass even when a field was dropped, if that
+  field's default happens to match its value at the exact moment the
+  snapshot was taken. Ticking both rooms forward is what makes a forgotten
+  field diverge instead of hiding.
+- **Pong's seeded randomness survives the restore.** The ball's trajectory
+  (and the tick of every subsequent goal) is asserted bit-identical between
+  a room that never restarted and one that was checkpointed and resumed
+  mid-game. If `create` or a tick ever reached for `Math.random`, this is
+  the test that would catch it: neither example calls it on any tick path
+  today, which was checked directly rather than assumed.
+- **`deserialize` throws, in three distinct ways**, on a string that is not
+  JSON, on valid JSON of the wrong shape, and on JSON missing a field the
+  runtime needs (a truncated checkpoint). All three are checked separately
+  because a decoder that happens to throw on one shape of garbage is not
+  proof it throws on the others.
+- **`join` is idempotent** under the relay's own heartbeat behaviour: a
+  repeated join never duplicates a player, never resets their position or
+  score, and (for cursors) a rename-and-reconnect updates the name without
+  touching the hue everyone else already associates with that cursor.
+- **Hostile input is clamped, not passed through.** `1e9`, `NaN`,
+  `-Infinity`, a string, `null`, and a missing field are each sent through
+  `applyInput` and asserted to land inside the legal range rather than
+  crashing the tick or moving an entity faster than the rules allow.
+
+## The JSON-to-binary upgrade path, worked all the way through
+
+`pong/codec.ts` is what "you must write a codec eventually" looks like in
+practice, not just in the README's table of contents. It re-encodes pong's
+exact snapshot (`encodePongSnapshot` / `decodePongSnapshot`) using
+`ByteWriter`, `ByteReader`, and `quantize` from `src/codec/`, and
+`pong/codec.test.ts` measures the result instead of asserting it in prose:
+
+| | bytes |
+| --- | --- |
+| JSON (`sim.ts`'s `encodeSnapshot`) | 215 |
+| Binary (`codec.ts`'s `encodePongSnapshot`) | 51 |
+| Ratio | 4.22x smaller |
+
+That is one realistic two-player snapshot (nonzero ball velocity, paddles off
+their spawn position, mid-game). It is not a contrived best case: the JSON
+version already rounds every float to one decimal place, and the binary
+version still comes in at under a quarter of the size, because JSON pays for
+field names, quotes, and decimal ASCII on every single tick, and a snapshot
+is encoded once per tick and delivered once *per player* (see
+`RoomStats.bytesDelivered` in the README's cost model). That multiplication
+is what makes the switch worth making: a full room publishing at 20Hz turns
+this file's 164-byte-per-tick saving into a real bandwidth line, and a
+two-player room barely notices either way.
+
+**Do not make this switch on day one.** Measure `bytesDelivered` first.
+`pong/sim.ts` keeps its JSON `encodeSnapshot` exactly as it was; `codec.ts` is
+presented as the upgrade a room reaches for once its entity shape has
+stabilised and the bandwidth line has actually shown up, not a replacement
+you are expected to adopt immediately. Swapping it in is a one-line change at
+the call site (`RoomRuntime.encodeSnapshot` may return a `Uint8Array` exactly
+as easily as a string); nothing about the runtime, the transport, or the rest
+of the contract has to change to make that switch.
+
+The three things worth reading `codec.ts` for, beyond the size number:
+
+- **The version byte is checked before anything else is read**, which is
+  what makes a rolling deploy safe. A mismatched version has to fail as a
+  clean, immediate throw naming the mismatch, not a decoder that reads a
+  new layout's bytes at an old layout's offsets and returns a snapshot full
+  of plausible-looking garbage.
+- **Quantised fields are picked with a stated range and headroom**, not
+  just "the smallest type that fits today". Pong's ball and paddle
+  positions use an `i16` at 1/100-unit precision, which covers -327.68 to
+  +327.67 units against a 200x120 field: more than 60% of extra room on
+  every edge, on purpose, so a one-tick overshoot pins at a boundary
+  instead of doing something worse.
+- **Clamping, never wrapping, is what turns an out-of-range value into a
+  non-event instead of a bug report.** A wrapped `i16` takes a position
+  just past its positive limit and turns it into the most negative value
+  the field can hold: an entity at the edge of the world teleports to the
+  opposite edge, which is a screenshot-and-report-it bug. The same
+  out-of-range value, clamped, just pins the entity at the boundary it was
+  already nearly at. `quantize` in `src/codec/quantize.ts` does this for
+  every caller; `codec.ts` inherits it rather than re-deciding it.

@@ -260,10 +260,55 @@ in the library whose failure mode is silent and catastrophic.
   means registration is the caller's job, and skipping it fails SILENTLY: the cap
   keeps passing because the set it counts is always empty.
 
+### Verified against a real Redis and a real socket
+
+`tests/` runs against a REAL Redis (six files), not the fake. Start one with
+`redis-server --port 6399 --save '' --appendonly no --daemonize yes`, then
+`npm run test:integration`. Every key is namespaced per run (`itest-{uuid}`) and
+deleted afterwards, so it never disturbs a shared instance, and the suite SKIPS
+cleanly with exit 0 when no Redis is reachable (override the URL with
+`TICKROOM_TEST_REDIS_URL`). That is why the default `npx vitest run` stays green
+offline.
+
+MEASURED on Redis 8.10.1, and these are the numbers to re-check after any change
+to the ticker, the lease or the checkpoint:
+
+| | measured |
+| --- | --- |
+| Checkpoint compression | 5,749B to 749B, **7.68x** |
+| Fan-out cost | 50 `publish()` calls issued exactly **50** PUBLISH commands, delivered to 5 subscribers |
+| Tick rate | **20.45Hz** against a 20Hz target, over real wall time |
+| **Handoff** | predecessor died at tick 26, successor **restored at tick 26**, longest gap in the snapshot stream **10ms** across 334 snapshots |
+
+The handoff figure is the headline claim of the library and it is now executable
+rather than asserted. Treat 10ms as a floor, not a typical figure: this is
+loopback Redis with no network and no cold function start, so production will be
+slower. What it proves is the MECHANISM (a successor restores and continues the
+tick count rather than resetting), which is the part that either works or does
+not.
+
+What the real Redis proves that the fake structurally cannot: that `ioredis`
+satisfies `RedisLike` with no adapter (a claim previously only ever checked
+against a hand-written fake, i.e. a claim about the fake); the `getBuffer` trap,
+where a plain `get` genuinely corrupts a gzipped checkpoint before anything can
+sniff its magic bytes; the lease resolving 20 CONCURRENT acquires to exactly one
+winner, which a single-threaded fake cannot race; a real TTL expiring so a dead
+room reads as empty and reusable; and that a connection in SUBSCRIBE mode really
+does refuse ordinary commands, which is the entire reason the library carries a
+separate subscriber factory.
+
+GOTCHA FOR ANYONE ADDING AN INTEGRATION TEST: never assert on server-global
+state. The first version of the fan-out test gated on `INFO stats`
+`total_commands_processed`, which counts every client on that server, so any
+other test file running in parallel landed inside the measurement window and it
+failed in the full suite while passing in isolation. Key prefixes isolate keys;
+they do not isolate `INFO`, `DBSIZE`, `CLIENT LIST`, or any other server-level
+metric. Measure something you own.
+
 ### Owed before a 1.0
 
-- An integration test against a real Redis (testcontainers or a local server).
-- The examples actually run end to end against that, rather than only
-  typechecking.
 - A published package, and a decision on whether `ioredis` stays a peer
   dependency or the `RedisLike` seam is documented as the supported swap point.
+- The integration suite runs a toy runtime, not the examples. Wiring the pong
+  example end to end through it would be a stronger demonstration.
+- No CI. The integration suite needs a Redis service container to run there.

@@ -196,6 +196,33 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
     }
     const envelope = unpackCheckpoint(rawBody);
     const expectedGeom = geomKey?.();
+    // OMITTING `geomKey` IS A SILENT FOOTGUN, so say so once, loudly, rather
+    // than letting it pass unremarked.
+    //
+    // Without a digest there is nothing tying a checkpoint to the world it was
+    // simulated against, so a deploy that changes your collision geometry or
+    // rules leaves every live room restoring its predecessor's bytes, continuing
+    // to simulate the OLD world, and re-saving it. Each successor faithfully
+    // repeats that, and the checkpoint's TTL is refreshed on every write, so it
+    // never ages out. The room simulates a world that no longer exists,
+    // indefinitely. Nothing throws, nothing is logged, and no metric moves:
+    // players simply walk through new walls and stop at removed ones.
+    //
+    // It is only warned rather than required because a host with genuinely
+    // static rules (a chat room, a cursor layer) is entitled to skip it, and
+    // because forcing it would break a caller who has not yet written one. Warn
+    // ONLY when a checkpoint actually exists: a cold room has nothing to restore
+    // wrongly, so warning there would just be noise on every fresh start.
+    if (expectedGeom === undefined && envelope !== null) {
+      log({
+        lvl: 'warn',
+        kind: 'ticker.no-geom-key',
+        room: roomId,
+        msg:
+          'restoring a checkpoint with no geomKey: a deploy that changes this world cannot be ' +
+          'detected, and the room will keep simulating the world the checkpoint was written against',
+      });
+    }
     let restored: { state: TState; incarnation: string } | null = null;
     if (envelope !== null && (expectedGeom === undefined || envelope.geom === expectedGeom)) {
       try {
