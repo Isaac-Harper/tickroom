@@ -137,7 +137,12 @@ export function startPong(canvas: HTMLCanvasElement): () => void {
     // and it is cheap: two timestamp comparisons and no allocation.
     conn.pollStall();
 
-    const view = interp.sample(dt);
+    // Pass the rAF timestamp explicitly rather than relying on the
+    // interpolator's default: it happens to be the same clock
+    // (performance.now()) as what onSnapshot() stamps receivedAt with above,
+    // but naming it here keeps the two call sites visibly tied to one clock
+    // instead of one of them reaching for a default and hoping it matches.
+    const view = interp.sample(dt, now);
     const sx = canvas.width / FIELD_W;
     const sy = canvas.height / FIELD_H;
 

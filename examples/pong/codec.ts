@@ -179,11 +179,15 @@ export function decodePongSnapshot(buf: ArrayBuffer | Uint8Array): DecodedPongSn
 
   // winnerIndex came off the wire, so it is exactly as untrusted as anything
   // else here: a corrupt buffer could carry an in-range-for-u8 value that is
-  // out of range for the paddle array THIS buffer actually decoded. Resolve
-  // it to null rather than indexing past the array (which would silently
-  // hand back `undefined` as a "pid" and propagate a wrong-shaped value into
-  // whatever the caller does with `winner` next).
-  const winner = winnerIndex !== NO_WINNER && winnerIndex < paddles.length ? paddles[winnerIndex].pid : null;
+  // out of range for the paddle array THIS buffer actually decoded. Read
+  // through the array access itself (which is `DecodedPongPaddle | undefined`
+  // under `noUncheckedIndexedAccess`, and genuinely can be `undefined`: an
+  // out-of-bounds `winnerIndex` is exactly the corrupt-buffer case this guard
+  // exists for, not a type-checker formality) rather than asserting the
+  // bounds check already proved it defined, so a corrupt buffer resolves to
+  // a null winner instead of silently propagating an `undefined` "pid".
+  const winnerPaddle = winnerIndex !== NO_WINNER ? paddles[winnerIndex] : undefined;
+  const winner = winnerPaddle ? winnerPaddle.pid : null;
 
   return { version, tick, serverTime, ball: { x: ballX, y: ballY }, serveIn, winner, paddles };
 }

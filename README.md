@@ -150,6 +150,10 @@ export const GET = createRelayRoute({
   isValidBase: (b) => b === 'pong',
   fallbackRoom: 'pong',
   maxPlayers: 20,
+  // Relative, so it resolves against this request's own origin: fine as
+  // long as the ticker route lives in the same deployment, which is the
+  // common case and what the ticker route above sets up.
+  tickerUrl: '/api/ticker',
   decodeInput: (buf) => [JSON.parse(new TextDecoder().decode(buf))],
   upgradeWebSocket: experimental_upgradeWebSocket,
 });
@@ -160,14 +164,27 @@ export const GET = createRelayRoute({
 ### 3. Connect from the browser
 
 ```ts
-import { RoomConnection, SnapshotInterpolator } from 'tickroom/client';
+import { RoomConnection, SnapshotInterpolator, type DecodedSnapshotLike } from 'tickroom/client';
 
-const interp = new SnapshotInterpolator();
+// Players are keyed by pid, a string, everywhere else in tickroom (join,
+// leave, applyInput, RoomStats), so the interpolator is typed to match:
+// SnapshotInterpolator() with no type argument defaults to a NUMBER key,
+// which is the wrong key type for anything this library hands you a pid for.
+const interp = new SnapshotInterpolator<string>();
+
+// decodeSnapshot's return type carries an index signature (`[k: string]:
+// unknown`) precisely so tickroom never assumes the shape of your payload;
+// name your own fields on top of it once, here, the same way
+// examples/pong/client.ts's own PongSnapshot does.
+interface Snapshot extends DecodedSnapshotLike {
+  players: [string, { x: number; y: number }][];
+}
 
 const conn = new RoomConnection({
   mint: () => fetch('/api/session', { method: 'POST' }).then((r) => r.json()),
   decodeSnapshot: (buf) => JSON.parse(new TextDecoder().decode(buf)),
-  onSnapshot: (snap) => {
+  onSnapshot: (raw) => {
+    const snap = raw as Snapshot;
     interp.push({
       receivedAt: performance.now(),
       serverTime: snap.serverTime,
@@ -179,9 +196,14 @@ const conn = new RoomConnection({
 
 await conn.start();
 
-function frame(dt: number) {
+function frame(now: number, dt: number) {
   conn.pollStall();
-  for (const [id, e] of interp.sample(dt)) draw(id, e.x, e.y);
+  // Pass `now` explicitly: it is the same clock (performance.now()) that
+  // onSnapshot() stamped receivedAt with above, so playback and the buffer
+  // agree on what time it is. Omitting it also works (sample() defaults to
+  // reading performance.now() itself), but naming it keeps both call sites
+  // visibly tied to one clock.
+  for (const [id, e] of interp.sample(dt, now)) draw(id, e.x, e.y);
 }
 ```
 

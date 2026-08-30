@@ -93,6 +93,18 @@ interface EntityMotionState {
   hasPrev: boolean;
 }
 
+/**
+ * Real wall clock, matching what a browser caller almost always uses for
+ * `push()`'s `receivedAt` (`performance.now()`, falling back to `Date.now()`
+ * in an environment without it, e.g. a test or a non-browser host). This is
+ * `sample()`'s default when `nowMs` is omitted: see the note on `sample()`
+ * for why a self-accumulated fallback clock used to live here instead, and
+ * why that was wrong.
+ */
+function wallClockMs(): number {
+  return typeof performance !== 'undefined' ? performance.now() : Date.now();
+}
+
 function wrapAngle(a: number): number {
   return Math.atan2(Math.sin(a), Math.cos(a));
 }
@@ -120,7 +132,6 @@ export class SnapshotInterpolator<K extends string | number = number> {
   private motion = new Map<K, EntityMotionState>();
 
   private localClockMs = 0;
-  private clockInitialized = false;
   private lastPushReceivedAt: number | null = null;
   private jitterRing: number[] = [];
   private readonly jitterRingCap = 20;
@@ -197,7 +208,6 @@ export class SnapshotInterpolator<K extends string | number = number> {
     this.lastSeenAt.clear();
     this.motion.clear();
     this.localClockMs = 0;
-    this.clockInitialized = false;
     this.lastPushReceivedAt = null;
     this.jitterRing = [];
     this.currentDelayMs = clamp(this.currentDelayMs, this.minDelayMs, this.maxDelayMs);
@@ -207,21 +217,35 @@ export class SnapshotInterpolator<K extends string | number = number> {
 
   /**
    * Advance the playback point and read every tracked entity's smoothed
-   * pose. Call once per rendered frame. `nowMs`, if given, is the
-   * authoritative local clock reading (matching whatever clock `push()`'s
-   * `receivedAt` values use); omit it to let the interpolator accumulate its
-   * own clock from `dt`, which is convenient for a caller that has no
-   * particular clock of its own to hand in, and is exactly what the unit
-   * tests do to stay deterministic.
+   * pose. Call once per rendered frame.
+   *
+   * `nowMs`, if given, is the authoritative local clock reading and MUST use
+   * the same clock as `push()`'s `receivedAt` values, since the two are
+   * compared directly to find the playback bracket. A unit test supplies its
+   * own synthetic clock this way to stay deterministic.
+   *
+   * Omit it and the interpolator reads the real wall clock itself
+   * (`performance.now()`, or `Date.now()` where `performance` does not
+   * exist), which is what almost every real caller wants: browsers stamp
+   * `receivedAt` with `performance.now()` too, so the two clocks agree by
+   * construction and playback tracks the buffer correctly from the first
+   * frame. THIS IS NOT WHAT THIS METHOD USED TO DO: it used to accumulate its
+   * own clock from `dt` starting at zero, which is a SEPARATE clock domain
+   * from `receivedAt`'s absolute timestamps and can never durably reconcile
+   * with it. Any single frame slower than the delay (a GC pause, a
+   * backgrounded tab regaining focus, a busy dev machine) permanently
+   * widened the gap, because a `dt`-accumulated clock can never advance
+   * faster than wall time to make up the difference. Once that gap exceeded
+   * `bufferCap` worth of buffered history the playback point fell before the
+   * oldest frame and rendering pinned to `frames[0]` forever: several
+   * seconds of stale state with nothing to show for it, since every other
+   * signal (the socket, the snapshot rate, `underrunRate`) stayed healthy.
+   * `examples/pong/client.ts` shipped exactly this bug by calling
+   * `interp.sample(dt)` with no second argument; see its own comment at the
+   * call site.
    */
-  sample(dt: number, nowMs?: number): Map<K, InterpolatedEntity> {
-    if (nowMs !== undefined) {
-      this.localClockMs = nowMs;
-      this.clockInitialized = true;
-    } else if (dt > 0) {
-      this.localClockMs += dt * 1000;
-      this.clockInitialized = true;
-    }
+  sample(dt: number, nowMs: number = wallClockMs()): Map<K, InterpolatedEntity> {
+    this.localClockMs = nowMs;
 
     if (dt > 0) {
       const ease = 1 - Math.exp(-INTERP_ADAPT_LAMBDA * dt);
@@ -229,7 +253,7 @@ export class SnapshotInterpolator<K extends string | number = number> {
     }
 
     const out = new Map<K, InterpolatedEntity>();
-    if (!this.clockInitialized || this.frames.length === 0) {
+    if (this.frames.length === 0) {
       this.decayUnderrun(false, dt);
       return out;
     }

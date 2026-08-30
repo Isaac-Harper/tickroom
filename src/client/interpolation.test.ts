@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { SnapshotInterpolator, type SnapshotFrame } from './interpolation.js';
 
 function frame(receivedAt: number, entities: Record<string, { x: number; y: number; heading?: number }>): SnapshotFrame<string> {
@@ -137,5 +137,46 @@ describe('SnapshotInterpolator', () => {
     interp.clear();
     const out = interp.sample(0.05, 10);
     expect(out.size).toBe(0);
+  });
+
+  // Regression for the bug examples/pong/client.ts shipped with: calling
+  // sample(dt) with no nowMs used to accumulate a SEPARATE clock starting at
+  // zero, disconnected from the absolute performance.now() timestamps every
+  // real push() carries as receivedAt. That self-accumulated clock could
+  // never catch up (dt-accumulation cannot advance faster than wall time),
+  // so a caller that omits nowMs, exactly like the shipped example did, would
+  // render frames[0] forever: seconds-stale state that looks like normal,
+  // smooth motion and reports nothing wrong. Simulate a page that has
+  // already been running a while (5s) before its first render, which is
+  // exactly the gap that pinned the bug in place, and confirm the entity
+  // tracks the newest data rather than freezing at the first frame ever
+  // pushed.
+  it('omitting nowMs reads the real wall clock instead of a self-accumulated one, and does not render a stale frame', () => {
+    const nowSpy = vi.spyOn(performance, 'now');
+    let clock = 5000; // page already 5s into its life before the loop starts
+    nowSpy.mockImplementation(() => clock);
+
+    try {
+      const interp = new SnapshotInterpolator<string>({ startDelayMs: 50, minDelayMs: 50, maxDelayMs: 250 });
+
+      interp.push({ receivedAt: clock, serverTime: clock, entities: new Map([['a', { x: 0, y: 0 }]]) });
+      clock += 50;
+      interp.push({ receivedAt: clock, serverTime: clock, entities: new Map([['a', { x: 10, y: 0 }]]) });
+
+      // A rendered frame some time later, calling sample() exactly the way
+      // examples/pong/client.ts used to: dt only, no nowMs.
+      clock += 50;
+      const out = interp.sample(0.05);
+
+      // The fixed default reads performance.now() itself, which is the same
+      // clock push() stamped receivedAt with, so the playback point lands at
+      // (or just past) the newest pushed frame. The old self-accumulated
+      // clock started at zero while receivedAt sat at 5000+, so the playback
+      // point never reached past the buffer's oldest frame and this would
+      // read x === 0 (frames[0], the very first frame ever pushed) forever.
+      expect(out.get('a')?.x).toBeGreaterThan(5);
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 });

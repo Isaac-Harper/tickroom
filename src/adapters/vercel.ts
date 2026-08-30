@@ -168,8 +168,29 @@ export interface VercelRelayRouteOptions {
   /** Called with the verified claims; return extra join metadata (a display name, a colour). */
   joinMeta?(claims: TokenClaims, url: URL): Record<string, unknown>;
   log?: Logger;
-  /** Injected so this module never imports `@vercel/functions` directly. See the module comment for why. */
-  upgradeWebSocket: (cb: (ws: any) => void) => Response; // eslint-disable-line @typescript-eslint/no-explicit-any
+  /**
+   * Injected so this module never imports `@vercel/functions` directly. See
+   * the module comment for why.
+   *
+   * Typed to match the SHAPE of `@vercel/functions`'s real
+   * `experimental_upgradeWebSocket` export (a handler taking the raw
+   * socket, an optional options bag, and a `Promise<Response>` return)
+   * without importing that package at all: `ws` here stays `any` rather
+   * than `import type { WebSocket } from 'ws'`, since pulling in `ws`'s
+   * types for this one field would trade one platform dependency for a
+   * package dependency, when a structural placeholder costs nothing and
+   * `attachRelay`'s own cast to `RelaySocket` (see the call site below) is
+   * where the real shape is actually enforced. This previously declared a
+   * SYNCHRONOUS `(cb) => Response`, which the real export (`(handler,
+   * options?) => Promise<Response>`) does not satisfy: `Promise<Response>`
+   * is not assignable to `Response`, so the README's own quickstart
+   * (`upgradeWebSocket: experimental_upgradeWebSocket`) failed to
+   * typecheck for anyone who copied it verbatim.
+   */
+  upgradeWebSocket: (
+    handler: (ws: any) => void | Promise<void>, // eslint-disable-line @typescript-eslint/no-explicit-any
+    options?: { maxPayload?: number },
+  ) => Promise<Response>;
 }
 
 const WS_OPEN = 1; // the WebSocket standard's OPEN readyState; both browsers and the `ws` package number it this way.

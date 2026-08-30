@@ -260,6 +260,70 @@ in the library whose failure mode is silent and catastrophic.
   means registration is the caller's job, and skipping it fails SILENTLY: the cap
   keeps passing because the set it counts is always empty.
 
+### Defects found by a real app built against this library (2026-08-30)
+
+- `SnapshotInterpolator.sample(dt)` defaulted to a self-accumulated clock
+  starting at zero when `nowMs` was omitted, a SEPARATE clock domain from the
+  absolute `performance.now()` timestamps every real `push()` call stamps
+  `receivedAt` with. A `dt`-accumulated clock can never advance faster than
+  wall time, so any single frame slower than the buffer's delay (a GC pause, a
+  backgrounded tab regaining focus) permanently widened the gap; once it
+  exceeded `bufferCap` worth of history, playback pinned to `frames[0]`
+  forever, several seconds of stale state with every other signal (socket,
+  snapshot rate, `underrunRate`) reading healthy. `examples/pong/client.ts`
+  shipped exactly this by calling `interp.sample(dt)` with no second argument,
+  and every existing unit test happened to always pass `nowMs` explicitly, so
+  a fully green suite never caught it. Fixed by making the OMITTED case read
+  the real wall clock (`performance.now()`, falling back to `Date.now()`)
+  instead of accumulating its own: omission is now correct by default rather
+  than catastrophic. Pinned in `interpolation.test.ts`
+  ("omitting nowMs reads the real wall clock..."), mutation-checked by
+  reintroducing the old accumulator and confirming the test fails on exactly
+  `x === 0` (frozen at the first frame ever pushed).
+- `VercelRelayRouteOptions.upgradeWebSocket` was typed as a SYNCHRONOUS
+  `(cb: (ws: any) => void) => Response`, while the real
+  `@vercel/functions` export is `(handler, options?) => Promise<Response>`.
+  `Promise<Response>` is not assignable to `Response`, so the README's own
+  quickstart (`upgradeWebSocket: experimental_upgradeWebSocket`) failed to
+  typecheck for anyone who copied it. Fixed by widening the declared type to
+  match the real shape (handler returning `void | Promise<void>`, an optional
+  options bag, `Promise<Response>` return), still with no hard dependency on
+  `@vercel/functions` or `ws`.
+- `examples/cursors/sim.ts`'s name sanitiser embedded LITERAL control bytes
+  (raw NUL, 0x1f, 0x7f, U+009F) inside a regex character class instead of
+  escape sequences, which reads as binary to `grep`/`diff`/most editors: a
+  byte that invisible cannot be reviewed. Rewritten as
+  `[\x00-\x1f\x7f-\x9f]`, byte-identical matching behaviour, same tests
+  green unchanged.
+- `examples/pong/codec.ts`'s `decodePongSnapshot` read `paddles[winnerIndex]`
+  after a bounds check that a type checker cannot correlate with the index
+  expression, so it fails to compile under `noUncheckedIndexedAccess` (which
+  this library's own `tsconfig.json` does not enable, but a consumer's often
+  does). Fixed by reading the indexed access into a variable and checking
+  IT for `undefined` rather than asserting the earlier bounds check already
+  proved it defined.
+- The README's relay-route quickstart omitted `tickerUrl`, a required field
+  of `VercelRelayRouteOptions`, so a copy-paste did not compile. Also fixed
+  two further quickstart defects found by actually typechecking it end to
+  end in a scratch file: `SnapshotInterpolator()` with no type argument
+  defaults to a NUMBER key while every pid in the library is a `string`, and
+  `onSnapshot`'s `snap.players` is `unknown` (from `DecodedSnapshotLike`'s
+  index signature) until cast to a caller-defined shape, exactly like
+  `examples/pong/client.ts`'s own `PongSnapshot` already does. Verified by
+  writing the ENTIRE quickstart (all three steps) into a scratch `.ts` file
+  inside `src/` (so it resolves through the real tsconfig) and confirming
+  zero errors, then deleting the scratch file.
+
+`noUncheckedIndexedAccess` VERDICT: measured at 28 errors across 6 files
+(`examples/node-server/server.ts` 1, `src/codec/snapshot.test.ts` 21,
+`src/core/checkpoint.test.ts` 1, `src/server/balancer.ts` 1,
+`tests/pubsub.redis.test.ts` 1, `tests/ticker.redis.test.ts` 3) when turned on
+repo-wide. That touches production source (`balancer.ts`,
+`node-server/server.ts`), not only test scaffolding, so it is real churn
+rather than a quick pass. Left OFF in `tsconfig.json` per this finding; only
+the one example file consumers actually copy (`examples/pong/codec.ts`) was
+fixed to compile under it.
+
 ### Verified against a real Redis and a real socket
 
 `tests/` runs against a REAL Redis (six files), not the fake. Start one with
