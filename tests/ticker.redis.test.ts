@@ -34,6 +34,14 @@ d('ticker / real Redis', () => {
   });
 
   afterAll(async () => {
+    // Every checkpoint write and lease renew inside the ticker's hot loop is
+    // fire-and-forget with a `.catch` (by design: see the "no awaits in the
+    // hot loop" invariant), so `runTicker`'s returned promise resolving does
+    // NOT guarantee every in-flight Redis round trip it started has landed
+    // yet. A settle delay here, before the namespace-wide flush, is cheap
+    // insurance against a stray write recreating a key a few milliseconds
+    // after this file's tests believe everything is torn down.
+    await new Promise((resolve) => setTimeout(resolve, 200));
     await flushNamespace(TEST_REDIS_URL, namespace);
     raw.disconnect();
   });
