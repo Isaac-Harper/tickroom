@@ -60,11 +60,71 @@ export interface TickerOptions<TState, TEvent> {
    */
   spawnSuccessor?(roomId: string): Promise<unknown>;
   /**
+   * One-time asynchronous setup this ticker needs before it can simulate:
+   * instantiating a wasm module, spinning up a worker, loading a baked
+   * table off disk. Awaited AFTER the lease is won and before anything
+   * touches the runtime (including `deserialize`, which for a physics-backed
+   * simulation is itself a consumer of whatever this initialises).
+   *
+   * THE ORDERING IS THE ENTIRE POINT AND IT IS NOT COSMETIC. The obvious
+   * placement is in the caller, before `runTicker`, and that is wrong in a
+   * way that only shows up under exactly the conditions this library exists
+   * to survive. Acquiring the lease is a race that almost every invocation
+   * LOSES: when a room's lease genuinely lapses, every socket's jittered
+   * poll fires a spawn at once, and all but one of them are supposed to
+   * discover that within a single Redis round trip and return 'busy' having
+   * done nothing. Put a multi-megabyte wasm init in front of the acquire and
+   * every one of those losers pays it in full before finding out it had no
+   * work to do: a cold start, a compile, and a heap allocation, repeated
+   * once per connected socket, on the one code path whose entire budget is
+   * the sub-second handoff gap players are not supposed to notice.
+   *
+   * Behind the acquire it is paid exactly once, by the ticker that is
+   * actually going to use it.
+   *
+   * A throw here is fatal to this invocation and handled as such: the lease
+   * is released so a successor is not locked out for the whole TTL, and the
+   * ticker returns 'error' without spawning one, because a successor would
+   * hit the identical failure and the pair would spin.
+   */
+  init?(): Promise<void>;
+  /**
    * A digest of the world geometry / rules this room's state must have been
    * simulated against. THE SINGLE MOST IMPORTANT OPTIONAL FIELD HERE: see
    * the restore block below for what silently breaks without it.
    */
   geomKey?(): string;
+  /**
+   * What to do when a checkpoint's `geom` does not match `geomKey()`.
+   *
+   * `'reset'` (the default, and today's behaviour) discards the checkpoint
+   * and builds a fresh room. It is always safe and always correct, and for
+   * most hosts it is the right answer: a geometry-changing deploy costs
+   * every live room its in-progress state once, which is the honest price
+   * and is why such deploys belong outside peak hours.
+   *
+   * A FUNCTION is for the host that can do better than that. Some state
+   * survives a geometry change perfectly well (who is in the room, their
+   * names, their scores, the tick count) while only some of it does not
+   * (positions relative to a wall that moved, a physics world built from the
+   * old colliders). Such a host can rebuild the parts that are stale and
+   * keep the parts that are not, turning "every room in the fleet is wiped"
+   * into "everyone keeps their score, the map reloads". Return the partially
+   * restored state to use it, or `null` to fall back to a full reset.
+   *
+   * The envelope is handed over whole, including its `tick` and `geom`, so
+   * the callback can decide based on HOW stale the state is rather than only
+   * that it is. A throw is treated as `null`: a partial restore that failed
+   * is a corrupt room, and the fresh start is already the correct handling
+   * for one.
+   *
+   * The restored room KEEPS THE CHECKPOINT'S INCARNATION on this path,
+   * exactly as an ordinary restore does, because a partial restore is a
+   * continuation of the same room and not a new one. An idempotency key
+   * derived from it must stay stable across a restore or a replayed event
+   * pays twice.
+   */
+  onGeomMismatch?: 'reset' | ((envelope: CheckpointEnvelope) => TState | null);
   /** Events this tick emitted, handed to the host OFF the hot path (no await happens before or after this call inside the loop). */
   onEvents?(events: TEvent[], ctx: { roomId: string; tick: number; incarnation: string; redis: RedisLike }): void;
   onStats?(stats: RoomStats): void;
@@ -81,6 +141,47 @@ export interface TickerOptions<TState, TEvent> {
   metaTtlS?: number;
   /** Stamped into `RoomStats.build` for whoever reads the stats gauge. */
   buildId?: string;
+  /**
+   * Copied verbatim into `RoomStats.labels` on every flush, so a scraper can
+   * dimension this room's gauges by something the library has no concept of
+   * (which world it is, which region, which shard). Fixed for the lifetime
+   * of the ticker on purpose: these become metric label values, and one whose
+   * value varies with room state is unbounded cardinality in the backend.
+   */
+  statsLabels?: Record<string, string | number>;
+  /**
+   * How far past the tick being consumed a stamped input may be buffered.
+   * Defaults to `PLAYOUT_MAX_AHEAD` (40 ticks, 2s at 20Hz).
+   *
+   * THE OVERFLOW POLICY IS A DISTANCE BOUND WITH REFUSAL, NOT A SIZE BOUND
+   * WITH EVICTION, and the two are different in kind rather than at the
+   * edges. Both keep memory bounded, so the choice looks arbitrary until a
+   * client's clock runs away.
+   *
+   * Evicting the oldest entry once the buffer exceeds some SIZE means a
+   * sender stamping ever-further-future ticks (a broken clock, a re-anchor
+   * gone wrong, an adversary) pushes out precisely the entries that were
+   * about to be consumed. Its own imminent, legitimate inputs are destroyed
+   * to make room for inputs that will not be due for minutes, so the player
+   * starves continuously while the buffer sits full, and the starvation
+   * backstop decays their controls the whole time. The failure is
+   * self-inflicted, invisible from the server, and does not clear until the
+   * client happens to re-anchor.
+   *
+   * Refusing a push more than `maxAhead` ticks past the consumed floor
+   * inverts that: the runaway stamps are the ones dropped, everything
+   * already buffered is protected, and the moment the sender's stamps come
+   * back into range they are accepted again. It is also a memory bound for
+   * free, since the admissible window is exactly `maxAhead` distinct slots.
+   * The cost is that a genuine burst of far-ahead input is refused rather
+   * than half-kept, which is the correct trade: an input due 2 seconds from
+   * now was going to be superseded by the redundancy window anyway.
+   *
+   * So the KIND is fixed deliberately and only the DISTANCE is tunable.
+   * Raise it for a host with a very long client lead, lower it to make a
+   * badly-clocked sender fail faster.
+   */
+  playoutMaxAhead?: number;
   /**
    * Overrides `LEASE_TTL_MS`/`LEASE_RENEW_MS` from `core/lease.ts`. A host
    * has no reason to touch these in production (the defaults are the ones
@@ -125,6 +226,42 @@ function envelopePid(env: RoomEnvelope): string | null {
   return 't' in env && typeof (env as { pid?: unknown }).pid === 'string' ? ((env as { pid: string }).pid) : null;
 }
 
+/**
+ * Publish a `custom` envelope onto a room's input channel, for the live
+ * ticker to hand to `RoomRuntime.onCustom`.
+ *
+ * THE PRODUCER SIDE OF THE CONTROL CHANNEL, and it exists because for a
+ * while there was not one: `RoomEnvelope` declared the variant, the ticker
+ * consumed it, and nothing in the library ever emitted one, so the only way
+ * to reach `onCustom` was to hand-roll the JSON at a call site and hope its
+ * shape matched. A shape that did not match was not an error, it was
+ * silence, because the ticker's switch had no default branch either. Both
+ * halves are closed now: this produces the envelope, and an unrecognised `t`
+ * is counted and summarised rather than dropped.
+ *
+ * NEVER CALL THIS FROM ANYTHING A CLIENT CAN REACH. `onCustom` is an
+ * administrative surface: forcing a phase, resetting a round, injecting a
+ * fixture. The relay deliberately does not produce this variant, so the only
+ * envelopes of this kind on the bus are the ones a server-side caller put
+ * there. Gate the endpoint that calls this exactly as hard as you would gate
+ * direct write access to the room's state, because that is what it is.
+ *
+ * Fire-and-forget by nature (pub/sub drops a message with no subscriber, so a
+ * room with no live ticker simply does not receive it); the returned promise
+ * resolves when the PUBLISH is acknowledged, not when the ticker has acted.
+ */
+export async function publishCustom(
+  redis: RedisLike,
+  roomId: string,
+  name: string,
+  data?: unknown,
+  opts?: { namespace?: string; pid?: string }
+): Promise<void> {
+  const keys = roomKeys(roomId, opts?.namespace);
+  const envelope: RoomEnvelope = { t: 'custom', name, data, pid: opts?.pid };
+  await redis.publish(keys.in, JSON.stringify(envelope));
+}
+
 export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEvent>): Promise<TickerResult> {
   const {
     runtime,
@@ -133,7 +270,9 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
     roomId,
     namespace,
     spawnSuccessor,
+    init,
     geomKey,
+    onGeomMismatch = 'reset',
     onEvents,
     onStats,
     log = defaultLog,
@@ -143,6 +282,8 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
     emptyGraceMs = EMPTY_GRACE_MS,
     metaTtlS = 120,
     buildId,
+    statsLabels,
+    playoutMaxAhead,
     leaseTtlMs = LEASE_TTL_MS,
     leaseRenewMs,
   } = opts;
@@ -167,6 +308,41 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
   let clock: OwnershipClock = createOwnershipClock(startedAt);
   let owns = true;
   let lostLeaseExplicitly = false;
+
+  // --- 1b. one-time async setup, PAID ONLY BY THE WINNER ---
+  //
+  // This sits between the acquire above and the restore below, and both
+  // sides of that placement are load-bearing.
+  //
+  // It is after the ACQUIRE because losing the acquire is the normal
+  // outcome: a lapsed lease makes every connected socket's poll fire a
+  // spawn at once and all but one of those must discover they have no work
+  // within a single Redis round trip. In front of the acquire, a wasm
+  // instantiation or a worker boot is paid by every one of those losers,
+  // multiplying a cold start by the room's population on the one path whose
+  // whole budget is the handoff gap.
+  //
+  // It is before the RESTORE because `runtime.deserialize` is itself a
+  // consumer of whatever this sets up: a simulation that rebuilds a physics
+  // world from a checkpoint cannot do so before the physics engine exists.
+  //
+  // A throw releases the lease before returning. Holding it would lock the
+  // room out for the full TTL on top of an invocation that already failed,
+  // and no successor is spawned because a successor would fail identically
+  // and the two would spin.
+  if (init) {
+    try {
+      await init();
+    } catch (err) {
+      log({ lvl: 'error', kind: 'ticker.init-failed', room: roomId, meta: { error: String(err) } });
+      try {
+        await releaseLease(redis, keys.lease, owner);
+      } catch {
+        // Best effort. The lease's own TTL is the backstop.
+      }
+      return { reason: 'error', ticks: 0, uptimeMs: Date.now() - startedAt };
+    }
+  }
 
   // --- 2. restore from checkpoint, or create fresh ---
   //
@@ -237,6 +413,37 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
         room: roomId,
         meta: { expected: expectedGeom, got: envelope.geom },
       });
+      // A full reset is always CORRECT here, and for most hosts it is also
+      // the right answer. It is not the only defensible one: a host that
+      // can tell which parts of its state a geometry change actually
+      // invalidates can keep the rest, which is the difference between "the
+      // map reloaded" and "every room in the fleet was wiped mid-session".
+      // Only the host knows which of its fields depend on the geometry, so
+      // this is a callback rather than a policy flag with cases in it.
+      //
+      // The INCARNATION IS PRESERVED on this path, deliberately, for the
+      // same reason an ordinary restore preserves it: a partial restore
+      // continues the same room, so an idempotency key derived from it must
+      // not move, or a replayed event pays out twice.
+      if (typeof onGeomMismatch === 'function') {
+        try {
+          const partial = onGeomMismatch(envelope);
+          if (partial !== null && partial !== undefined) {
+            restored = { state: partial, incarnation: envelope.incarnation };
+            log({ lvl: 'info', kind: 'ticker.geom-partial-restore', room: roomId, meta: { tick: envelope.tick } });
+          }
+        } catch (err) {
+          // A partial restore that threw IS a corrupt room, and starting
+          // fresh is already this function's correct handling for one, so
+          // fall through to it rather than inventing a second path.
+          log({
+            lvl: 'warn',
+            kind: 'ticker.geom-partial-restore-failed',
+            room: roomId,
+            meta: { error: String(err) },
+          });
+        }
+      }
     }
     if (restored !== null) {
       state = restored.state;
@@ -292,6 +499,11 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
   const sub = createSubscriber();
   const inbox = new Inbox<RoomEnvelope>(); // core's defaults (cap 4096, perSenderCap 64, maxDrainPerTick 1024) are exactly what this ticker needs
   let badEnvelopes = 0;
+  // Kept apart from `badEnvelopes` on purpose: a bad envelope is a broken or
+  // hostile sender, an unknown one is almost always a producer deployed ahead
+  // of its consumer. Merging them is what made the original failure invisible.
+  let unknownEnvelopes = 0;
+  let lastUnknownEnvelopeT = '';
 
   sub.on('message', (channel: unknown, message: unknown) => {
     if (channel !== keys.in || typeof message !== 'string') return;
@@ -323,6 +535,23 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
   // --- per-player playout state ---
   const playouts = new Map<string, PlayoutBuffer<ClientInput>>();
   const starve = new StarveTracker();
+
+  /**
+   * Drop a player's buffer AND their starvation streak together, and tell the
+   * runtime the depth is now 0.
+   *
+   * All three parts matter. Dropping the buffer alone leaves the streak
+   * standing, so the next time that player genuinely starves, `onStarve` is
+   * handed a streak carried over from an unrelated earlier session and the
+   * decay backstop fires at full strength on the very first starved tick
+   * instead of ramping. Not reporting a final 0 leaves whatever depth was last
+   * observed pinned on the wire for a player who no longer has a buffer at all.
+   */
+  function dropPlayout(pid: string): void {
+    if (!playouts.delete(pid)) return;
+    starve.forget(pid);
+    runtime.onBufferHealth?.(state, pid, 0);
+  }
 
   // --- counters, reset every stats flush (see the stats block) ---
   let publishes = 0;
@@ -356,6 +585,46 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
       body: runtime.serialize(state),
     };
     await writeCheckpoint(redis, keys.state, packCheckpoint(envelope));
+  }
+
+  /** Forget one player's metadata locally and in the hash, and mark the roster for republication. Idempotent. */
+  function removeMeta(pid: string): void {
+    if (!metaMap.delete(pid)) return;
+    metaDirty = true;
+    redis
+      .hdel(keys.meta, pid)
+      .catch((err) => log({ lvl: 'error', kind: 'ticker.meta-hdel-failed', room: roomId, meta: { error: String(err) } }));
+  }
+
+  /**
+   * Reconcile the metadata map against the simulation's OWN membership.
+   *
+   * This is what makes a departure a fact about the room rather than a fact
+   * about a socket. A `leave` envelope is produced by a TCP connection ending,
+   * and connections end for reasons that have nothing to do with a player
+   * quitting: a phone handing off between cells, a lid closing, a background
+   * tab throttled to a stop, a routine reconnect after a deploy. A simulation
+   * that holds a departed player through a grace period so their reconnect
+   * resumes seamlessly still HAS that player, and announcing their removal on
+   * the socket's timetable tears their name tag off every other client's screen
+   * and puts it back a second later, for a player who never moved.
+   *
+   * Runs every tick and is deliberately cheap: nothing is allocated and nothing
+   * is even asked of the runtime while the roster is empty or while every
+   * mapped pid is still present, which is every tick in normal operation.
+   */
+  function reconcileMeta(): void {
+    if (runtime.presentPids === undefined || metaMap.size === 0) return;
+    let live: Set<string> | null = null;
+    let gone: string[] | null = null;
+    for (const pid of metaMap.keys()) {
+      if (live === null) live = new Set(runtime.presentPids(state));
+      if (!live.has(pid)) (gone ??= []).push(pid);
+    }
+    // Collected first, removed after: `removeMeta` mutates `metaMap`, and
+    // deleting from a Map while iterating its own keys is exactly the kind of
+    // thing that works until the day it silently skips an entry.
+    if (gone !== null) for (const pid of gone) removeMeta(pid);
   }
 
   function publishMeta(): void {
@@ -401,23 +670,47 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
       case 'leave': {
         present.delete(env.pid);
         runtime.leave(state, env.pid);
-        if (metaMap.delete(env.pid)) {
-          metaDirty = true;
-          redis
-            .hdel(keys.meta, env.pid)
-            .catch((err) => log({ lvl: 'error', kind: 'ticker.meta-hdel-failed', room: roomId, meta: { error: String(err) } }));
+        // METADATA REMOVAL FOLLOWS THE SIMULATION'S OWN MEMBERSHIP WHEN THE
+        // RUNTIME REPORTS ONE, not this envelope. A `leave` means a socket
+        // closed, which is not the same fact as a player having left: a
+        // simulation with a disconnect grace deliberately keeps a departed
+        // player for several seconds so their reconnect resumes seamlessly,
+        // and removing their name here would announce a departure and an
+        // arrival to the whole room for a player who never moved. The
+        // reconcile pass in the loop owns removal in that case, and it
+        // removes them when the SIMULATION says they are gone.
+        //
+        // With no `presentPids` there is nothing better to go on, so removal
+        // stays exactly where it was: this is today's behaviour, unchanged,
+        // for every runtime that does not opt in.
+        if (runtime.presentPids === undefined) {
+          removeMeta(env.pid);
         }
-        playouts.delete(env.pid);
-        starve.forget(env.pid);
+        dropPlayout(env.pid);
         break;
       }
       case 'in': {
         for (const input of env.w) {
+          // ARRIVAL, reported before any decision about WHEN this will be
+          // applied. This is the round-trip signal; `ackTick` on consume is
+          // the timeline signal. See `onInputArrived` in `core/types.ts` for
+          // why a client's dilation controller cannot be fed the second one
+          // in place of the first.
+          // Caught HERE rather than left to the drain site's own catch,
+          // which would abandon the rest of this window: an input packet
+          // carries the last few inputs as redundancy, so one throwing hook
+          // call would silently discard several ticks' worth of a player's
+          // input instead of one record's worth of an optional callback.
+          try {
+            runtime.onInputArrived?.(state, env.pid, input);
+          } catch (err) {
+            log({ lvl: 'warn', kind: 'ticker.onInputArrived-threw', room: roomId, meta: { error: String(err) } });
+          }
           const stamped = (input.targetTick ?? 0) > 0;
           if (stamped && (runtime.usesPlayout?.(state, env.pid) ?? false)) {
             let buf = playouts.get(env.pid);
             if (!buf) {
-              buf = new PlayoutBuffer<ClientInput>();
+              buf = new PlayoutBuffer<ClientInput>(playoutMaxAhead);
               playouts.set(env.pid, buf);
             }
             buf.push(input.targetTick as number, input);
@@ -429,14 +722,48 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
             // of the session: without this, the consume-exact pass below
             // would keep reporting starves and calling `onStarve` for a
             // player who is not sending stamped input at all anymore.
-            if (!stamped) playouts.delete(env.pid);
+            // `clearPlayout` covers the transition this cannot see, where a
+            // player stops sending stamped input without sending anything
+            // else at all.
+            if (!stamped) dropPlayout(env.pid);
             runtime.applyInput(state, env.pid, input);
           }
         }
         break;
       }
       case 'custom': {
+        // The out-of-band control channel: an admin command, a dev route
+        // forcing a phase. Produced server-side with `publishCustom`, never
+        // by the relay, so a client can never reach `onCustom`.
         runtime.onCustom?.(state, env.name, env.data, env.pid);
+        break;
+      }
+      default: {
+        // AN ENVELOPE SHAPE THIS TICKER DOES NOT KNOW MUST NEVER VANISH IN
+        // SILENCE. Without this branch the switch simply falls through and
+        // the message is gone, which is indistinguishable from a Redis
+        // outage, a subscribe that never landed, or a producer that was
+        // never deployed. Every one of those was chased in turn before
+        // anyone checked whether the message was arriving and being ignored.
+        //
+        // In practice this fires on a DEPLOY SKEW: a producer rolled out
+        // ahead of the consumer that understands its new envelope. That is
+        // exactly the window in which an operator most needs to be told.
+        //
+        // COUNTED, NOT LOGGED PER MESSAGE. `t` comes off a channel a client's
+        // traffic reaches, so a log line here would be a log amplifier (and,
+        // on a host that bills per line, a cost amplifier). The count rides
+        // the stats gauge and one summary line is emitted per stats flush, a
+        // cadence nothing on the wire can drive. The observed name is kept
+        // for that summary and TRUNCATED, because it is an unbounded string
+        // from off the wire.
+        unknownEnvelopes++;
+        // `t` is already known to be a string here (the subscriber's shape
+        // check rejects anything else into `badEnvelopes` before it reaches
+        // the inbox); the fallback exists so this cannot throw if that ever
+        // changes, not because the branch is reachable today.
+        const t = (env as { t?: unknown }).t;
+        lastUnknownEnvelopeT = typeof t === 'string' ? t.slice(0, 32) : typeof t;
         break;
       }
     }
@@ -466,8 +793,24 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
         }
       }
 
+      // 4b. metadata follows the simulation's membership, not the socket's
+      reconcileMeta();
+
       // 5. playout consume-exact pass, BEFORE the tick
       const tickNow = runtime.currentTick(state);
+      // A buffer the runtime has stood down is dropped BEFORE the consume
+      // pass, never after: consuming first would report one more starve and
+      // run one more decay step for a player the simulation has already said
+      // is not on the stamped path anymore, which is the entire thing
+      // `clearPlayout` exists to stop. Collected before removing for the same
+      // reason `reconcileMeta` does; `dropPlayout` mutates `playouts`.
+      if (runtime.clearPlayout !== undefined && playouts.size > 0) {
+        let stale: string[] | null = null;
+        for (const pid of playouts.keys()) {
+          if (runtime.clearPlayout(state, pid)) (stale ??= []).push(pid);
+        }
+        if (stale !== null) for (const pid of stale) dropPlayout(pid);
+      }
       for (const [pid, buf] of playouts) {
         const { item, starved } = buf.consume(tickNow);
         if (starved) {
@@ -479,6 +822,14 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
           (runtime.applyBufferedInput ?? runtime.applyInput)(state, pid, item);
           runtime.ackTick?.(state, pid, tickNow);
         }
+        // REPORTED ON BOTH PATHS, INCLUDING THE STARVE. The buffer lives in
+        // this Map, so this is the only route by which its depth can reach the
+        // host's state and therefore its snapshot, and a starve is precisely
+        // when the depth matters and precisely when `ackTick` does not fire.
+        // Hanging the health off `ackTick` instead would report it only on
+        // ticks where the buffer was healthy enough to consume, which is the
+        // one measurement nobody needs.
+        runtime.onBufferHealth?.(state, pid, buf.health());
       }
 
       // 6. the sim step itself
@@ -587,6 +938,7 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
           starves,
           renewFails,
           badEnvelopes,
+          unknownEnvelopes,
           bytesPublished,
           bytesDelivered,
           cadence: cadenceHist.percentiles(),
@@ -594,7 +946,15 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
           serverInternal: serverInternalHist.percentiles(),
           at: now,
           build: buildId,
+          labels: statsLabels,
         };
+        // Captured before the reset below so the summary can be emitted AFTER
+        // it. A host-supplied logger is allowed to throw, and a throw between
+        // building `stats` and zeroing the counters it was built from would
+        // escape to the loop's catch with the counters still holding a window
+        // that has already been reported, double-counting it into the next one.
+        const unknownThisWindow = unknownEnvelopes;
+        const lastUnknownThisWindow = lastUnknownEnvelopeT;
         // Read-and-reset in ONE uninterrupted synchronous block, no `await`
         // between building `stats` and zeroing the counters it was built
         // from: several of these are also written from the subscriber's
@@ -607,6 +967,8 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
         starves = 0;
         renewFails = 0;
         badEnvelopes = 0;
+        unknownEnvelopes = 0;
+        lastUnknownEnvelopeT = '';
         bytesPublished = 0;
         bytesDelivered = 0;
         ticksSinceStats = 0;
@@ -623,6 +985,20 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
         // its own cleanup) must not leave a phantom-full roster behind
         // forever. Riding an existing cadence costs nothing extra.
         redis.expire(keys.meta, metaTtlS).catch(() => {});
+        // ONE summary line per stats flush, never one per message. `t` arrives
+        // on a channel client traffic reaches, so a line per unknown envelope
+        // would be a log amplifier (and on a host that bills per line, a cost
+        // amplifier); the flush cadence is one nothing on the wire can drive.
+        // Silent when the count is zero, so a healthy room says nothing.
+        if (unknownThisWindow > 0) {
+          log({
+            lvl: 'warn',
+            kind: 'ticker.unknown-envelope',
+            room: roomId,
+            msg: 'envelopes arrived with a type this ticker has no branch for, usually a producer deployed ahead of its consumer',
+            meta: { count: unknownThisWindow, lastType: lastUnknownThisWindow },
+          });
+        }
         try {
           onStats?.(stats);
         } catch (err) {

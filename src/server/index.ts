@@ -17,7 +17,7 @@ export type { TokenClaims, SessionAuthOptions } from './session.js';
 export { makeToken, verifyToken, makeSpawnToken, verifySpawnToken, secretMatches, requireSecret } from './session.js';
 
 export type { TickerOptions, TickerResult } from './ticker.js';
-export { runTicker } from './ticker.js';
+export { runTicker, publishCustom } from './ticker.js';
 
 export type { RelaySocket, RelayOptions, RelayHandle, AdmissionOptions, AdmissionResult } from './relay.js';
 export { attachRelay, checkAdmission } from './relay.js';
