@@ -1,9 +1,13 @@
 /**
- * How far ahead of the last consumed tick a buffered item may sit before it
- * is evicted. Bounds memory against a client that stamps garbage far-future
- * ticks (deliberately or from a broken clock), and bounds how long a genuine
- * burst of out-of-order delivery can be absorbed before the buffer gives up
- * waiting for a gap to fill.
+ * How far ahead of the consumer a buffered item may sit before it is refused.
+ * Bounds memory against a client that stamps garbage far-future ticks
+ * (deliberately or from a broken clock), and bounds how long a genuine burst
+ * of out-of-order delivery can be absorbed before the buffer gives up waiting
+ * for a gap to fill.
+ *
+ * "The consumer" is the last consumed tick once there is one, and the first
+ * tick pushed before that. It is NOT the `-1` a fresh buffer's floor holds:
+ * see the reference note on `push`.
  */
 export const PLAYOUT_MAX_AHEAD = 40;
 
@@ -50,6 +54,15 @@ export class PlayoutBuffer<T> {
   private readonly entries = new Map<number, Entry<T>>();
   private readonly maxAhead: number;
 
+  /**
+   * What the ahead bound is measured FROM. `null` means "no reference yet",
+   * which is a genuinely different fact from `lastConsumedTick`'s -1, and
+   * conflating the two is the defect written up on `push`. The first push
+   * installs a provisional reference; the first consume replaces it with the
+   * consumer's real position and it tracks the floor from then on.
+   */
+  private aheadBase: number | null = null;
+
   /** Starts at -1 (no tick has been asked for yet), never at 0: tick 0 is a real, consumable tick and must not be treated as already-passed. */
   lastConsumedTick = -1;
 
@@ -66,6 +79,36 @@ export class PlayoutBuffer<T> {
    * eviction rules.
    */
   push(tick: number, item: T): void {
+    // THE AHEAD BOUND IS RELATIVE, SO IT NEEDS SOMETHING REAL TO BE RELATIVE
+    // TO. `lastConsumedTick` starts at -1 meaning "nothing has been asked for
+    // yet", NOT "the consumer is sitting at tick -1". Measuring the bound
+    // from that sentinel makes the distance to any tick in a room that has
+    // been up for a while enormous, so a buffer created FRESH in a room
+    // already past `maxAhead` refused every single push until some later
+    // consume happened to anchor the floor. Measured by a game integrating
+    // this library: at room tick 100 and at room tick 50000 the first push
+    // into a new buffer was dropped, while at tick 0 and tick 30 it was kept.
+    // A host whose client re-sends its recent inputs (the redundancy window,
+    // see `codec/snapshot.ts`) loses only the first copy and the buffer heals
+    // on the next packet, which is why this hid for so long; a host that
+    // sends each input once loses the first stamped input of every buffer
+    // outright, and in a game that creates a buffer when a player takes
+    // control of something, that is the first input of the thing they just
+    // took control of.
+    //
+    // A fresh buffer has no consumer position, so it has no meaningful
+    // "ahead" yet: the first push establishes the reference instead.
+    //
+    // DELIBERATELY NOT DONE BY MOVING `lastConsumedTick` ITSELF. That field
+    // means "the consumer has already passed this tick" and a producer's
+    // stamp is not entitled to assert it. Anchoring the FLOOR to `tick - 1`
+    // would make every slightly-older re-send in the same redundancy burst
+    // count as late, so the never-drop-late path below would re-stamp them
+    // all onto the one slot above the floor and the freshness dedupe would
+    // discard all but one: it converts one dropped input into several, which
+    // is worse than the defect it fixes.
+    if (this.aheadBase === null) this.aheadBase = tick - 1;
+
     let target = tick;
     if (target <= this.lastConsumedTick) {
       this.lateCount += 1;
@@ -78,11 +121,21 @@ export class PlayoutBuffer<T> {
         // same slot.
         return;
       }
-    } else if (target - this.lastConsumedTick > this.maxAhead) {
-      // Far enough in the future that buffering it risks unbounded growth
-      // from a misbehaving or clock-skewed sender. Drop rather than evict
-      // something else to make room: an item this far out is not worth
+    } else if (target - this.aheadBase > this.maxAhead || this.aheadBase - target > this.maxAhead) {
+      // Far enough from the reference that buffering it risks unbounded
+      // growth from a misbehaving or clock-skewed sender. Drop rather than
+      // evict something else to make room: an item this far out is not worth
       // protecting at another's expense.
+      //
+      // The BELOW-the-reference half can only ever fire before the first
+      // consume: once one has happened `aheadBase` is the floor, and
+      // anything at or below the floor took the late branch above instead.
+      // It is what keeps the admissible window finite in both directions
+      // while no consumer position exists, so "this buffer holds O(maxAhead)
+      // slots" is true from construction rather than only from the first
+      // consume. Without it a sender walking its stamps DOWNWARD before the
+      // first consume would be admitted without limit, and the stamp comes
+      // off the wire.
       return;
     }
     this.entries.set(target, { item, orig: tick });
@@ -110,6 +163,13 @@ export class PlayoutBuffer<T> {
     // outside. Guarding the assignment is one comparison and removes the whole
     // class.
     if (tick > this.lastConsumedTick) this.lastConsumedTick = tick;
+    // The consumer's own position supersedes whatever provisional reference
+    // the first push installed. From here it tracks the floor, which is
+    // monotonic, so the only step this can ever take BACKWARDS is this first
+    // one (from `firstPushedTick - 1` down to where the consumer actually
+    // is), and that direction widens the admissible window back toward the
+    // truth rather than narrowing it.
+    this.aheadBase = this.lastConsumedTick;
     this.pruneAtOrBelow(this.lastConsumedTick);
     if (entry === undefined) {
       return { item: undefined, starved: true };
@@ -125,6 +185,11 @@ export class PlayoutBuffer<T> {
   clear(): void {
     this.entries.clear();
     this.lastConsumedTick = -1;
+    // Back to "no reference yet", not to the -1 sentinel: a cleared buffer is
+    // in exactly the state a freshly constructed one is, and if this were
+    // left pointing at the old floor the next push would be measured against
+    // a consumer position that no longer exists.
+    this.aheadBase = null;
     this.lateCount = 0;
   }
 

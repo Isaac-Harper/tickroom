@@ -1145,3 +1145,114 @@ describe('runTicker: runtime contract', () => {
     expect(stats[0]?.labels).toBeUndefined();
   });
 });
+
+// TR-4, ticker half. The relay's `metaSeedPayload` shapes the roster frame a
+// joining socket is SEEDED with; this shapes the roster frame every socket is
+// BROADCAST on a change. Both are client-visible wire shapes with no version
+// byte, so a host cannot force already-loaded bundles onto a new one, and a
+// client that early-returns on a shape it does not recognise loses its whole
+// roster SILENTLY: no names, no presence count, no join or leave events, and
+// nothing that fails anywhere.
+describe('runTicker: metaPayload', () => {
+  /**
+   * Runs a ticker long enough for one join to be broadcast, and returns every
+   * raw metaout message a subscriber saw. Raw, not parsed: `JSON.stringify`
+   * can produce `undefined`, and the suppression case below is precisely
+   * about that value never reaching `publish`, which a parsed view cannot
+   * see.
+   */
+  async function metaRun(overrides: Record<string, unknown> = {}) {
+    const redis = new FakeRedis();
+    const keys = roomKeys('r-metafmt', NS);
+    const seen: string[] = [];
+    const listener = redis.fork();
+    listener.on('message', (_ch: unknown, msg: unknown) => {
+      if (typeof msg === 'string') seen.push(msg);
+    });
+    await listener.subscribe(keys.metaout);
+
+    const resultPromise = runTicker({
+      runtime: makeCounterRuntime({ tickHz: 50 }),
+      redis,
+      createSubscriber: () => redis.fork(),
+      roomId: 'r-metafmt',
+      namespace: NS,
+      maxRunMs: 300,
+      emptyGraceMs: 100_000,
+      ...overrides,
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    await redis.publish(keys.in, JSON.stringify({ t: 'join', pid: 'alice', meta: { name: 'Alice' } }));
+    const result = await resultPromise;
+    return { raw: seen, result };
+  }
+
+  it('defaults to the shipped { t: meta, map } shape', async () => {
+    const { raw } = await metaRun();
+    const rosters = raw.map((s) => JSON.parse(s) as Record<string, unknown>).filter((f) => f.t === 'meta');
+    expect(rosters.length).toBeGreaterThan(0);
+    const last = rosters[rosters.length - 1] as { map: Record<string, unknown> };
+    expect(last.map).toEqual({ alice: { name: 'Alice' } });
+  });
+
+  it('lets a host keep a differently shaped roster frame', async () => {
+    // Standing in for a host whose shipped client does
+    // `if (m.t !== 'meta' || !Array.isArray(m.players)) return;`, which under
+    // the default shape blanks every name tag with nothing to see anywhere.
+    const { raw } = await metaRun({
+      metaPayload: (map: Record<string, unknown>) => ({
+        t: 'meta',
+        players: Object.entries(map).map(([pid, v]) => ({ pid, ...(v as Record<string, unknown>) })),
+      }),
+    });
+    const rosters = raw
+      .map((s) => JSON.parse(s) as Record<string, unknown>)
+      .filter((f) => f.t === 'meta' && Array.isArray(f.players));
+    expect(rosters.length).toBeGreaterThan(0);
+    const last = rosters[rosters.length - 1] as Record<string, unknown>;
+    expect(last.players).toEqual([{ pid: 'alice', name: 'Alice' }]);
+    expect(last).not.toHaveProperty('map');
+  });
+
+  it('a formatter returning undefined suppresses the broadcast instead of publishing "undefined"', async () => {
+    const { raw } = await metaRun({ metaPayload: () => undefined });
+    // The room-reject frame shares this channel, so assert on the absence of
+    // a roster rather than on an empty channel.
+    expect(raw).not.toContain('undefined');
+    expect(raw).toHaveLength(0);
+  });
+
+  it('a formatter that throws is reported and never reaches the channel, and the room survives it', async () => {
+    // This is the one meta site that runs inside the tick loop. An uncaught
+    // throw here would unwind the loop and take the whole room down, so the
+    // surviving `reason` matters as much as the missing frame.
+    const log = vi.fn();
+    const { raw, result } = await metaRun({
+      log,
+      metaPayload: () => {
+        throw new Error('bad formatter');
+      },
+    });
+    expect(raw).toHaveLength(0);
+    expect(log.mock.calls.filter((c) => (c[0] as LogEvent)?.kind === 'ticker.meta-payload-threw').length).toBeGreaterThan(0);
+    expect(result.reason).toBe('duration');
+    expect(result.ticks).toBeGreaterThan(0);
+  });
+
+  it('logs a throwing formatter once per roster change, not once per tick', async () => {
+    // `metaDirty` is cleared before the publish is attempted, so a broken
+    // formatter must not re-fire on every one of the ~15 ticks this run
+    // covers after the join. A retry-until-it-works flag here would be a
+    // 20Hz log amplifier.
+    const log = vi.fn();
+    await metaRun({
+      log,
+      metaPayload: () => {
+        throw new Error('bad formatter');
+      },
+    });
+    const threw = log.mock.calls.filter((c) => (c[0] as LogEvent)?.kind === 'ticker.meta-payload-threw');
+    // One for the dirty-on-start flush, one for the join. Never per tick.
+    expect(threw.length).toBeLessThanOrEqual(3);
+  });
+});

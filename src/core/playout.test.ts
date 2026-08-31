@@ -100,7 +100,14 @@ describe('NEVER-DROP-LATE', () => {
 describe('maxAhead eviction', () => {
   it('drops a push far enough ahead of the current floor to exceed maxAhead', () => {
     const buf = new PlayoutBuffer<string>(10);
-    buf.push(50, 'too-far'); // lastConsumedTick starts at -1, so this is 51 ticks ahead
+    // Anchored first, so the distance being measured is a real one: the
+    // consumer is at 0 and this stamp is 50 ticks past it. This case used to
+    // push into a FRESH buffer and rely on the distance from the `-1`
+    // sentinel, which is the defect the group below covers: it passed for a
+    // reason that had nothing to do with the bound doing its job, and it
+    // would have passed identically for a stamp of 5.
+    buf.consume(0);
+    buf.push(50, 'too-far');
     const { starved } = buf.consume(50);
     expect(starved).toBe(true);
   });
@@ -178,6 +185,100 @@ describe('health saturation', () => {
     buf.push(2, 2);
     buf.consume(1);
     expect(buf.health()).toBe(1);
+  });
+});
+
+/**
+ * A BUFFER CREATED IN A ROOM THAT IS ALREADY RUNNING.
+ *
+ * `lastConsumedTick` starts at -1 to mean "nothing asked for yet". Measuring
+ * the ahead bound as a distance from that sentinel made every push into a
+ * fresh buffer refused in any room past `maxAhead` ticks, which is every room
+ * that has been up for more than two seconds. Measured by a game integrating
+ * this library: dropped at room tick 100 and at 50000, kept at tick 0 and 30.
+ *
+ * A client sending an input redundancy window loses only the first copy, so
+ * the symptom there was one starved tick per buffer creation. A client that
+ * sends each input once loses the input outright.
+ */
+describe('a fresh buffer in a room that is already running', () => {
+  it('accepts its first push at a high tick instead of refusing everything until a consume', () => {
+    // The exact reported case: a player takes control of something on tick
+    // 50000, the host makes them a buffer, their client stamps a few ticks
+    // ahead of the room.
+    const buf = new PlayoutBuffer<string>();
+    buf.push(50_004, 'first');
+    expect(buf.consume(50_004).item).toBe('first');
+  });
+
+  it('does the same at every room tick, not only at the small ones', () => {
+    for (const roomTick of [0, 30, 39, 40, 41, 100, 50_000]) {
+      const buf = new PlayoutBuffer<string>();
+      buf.push(roomTick + 4, 'first');
+      expect(buf.consume(roomTick + 4).item, `room tick ${roomTick}`).toBe('first');
+    }
+  });
+
+  it('keeps the ahead bound live from the very first push, measured against that push', () => {
+    // The bound must not simply be disabled while unanchored: a runaway
+    // stamp arriving after a sane one is still refused, and the sane one it
+    // would have displaced under a size-bound-with-eviction policy survives.
+    const buf = new PlayoutBuffer<string>(10);
+    buf.push(50_004, 'sane');
+    buf.push(90_000, 'runaway');
+    expect(buf.consume(50_004).item).toBe('sane');
+    expect(buf.consume(90_000).starved).toBe(true);
+  });
+
+  it('bounds the window below the reference too, while there is no consumer position', () => {
+    // The only direction an unanchored buffer could otherwise grow without
+    // limit, since a tick below the floor normally takes the never-drop-late
+    // path and dedupes onto one slot.
+    const buf = new PlayoutBuffer<string>(10);
+    buf.push(50_004, 'sane');
+    buf.push(10, 'ancient');
+    expect(buf.consume(10).starved).toBe(true);
+    expect(buf.consume(50_004).item).toBe('sane');
+  });
+
+  it('does not treat older re-sends in the same burst as late', () => {
+    // Why the fix does not simply move `lastConsumedTick` to `tick - 1` on
+    // the first push. A redundancy window can arrive newest-first after a
+    // reorder; anchoring the FLOOR would make every older member of it late,
+    // re-stamp them all onto the one slot above the floor, and dedupe all but
+    // one away. Each of these must still land on its own tick.
+    const buf = new PlayoutBuffer<string>();
+    buf.push(50_004, 'd');
+    buf.push(50_001, 'a');
+    buf.push(50_002, 'b');
+    buf.push(50_003, 'c');
+    expect(buf.lateCount).toBe(0);
+    expect(buf.consume(50_001).item).toBe('a');
+    expect(buf.consume(50_002).item).toBe('b');
+    expect(buf.consume(50_003).item).toBe('c');
+    expect(buf.consume(50_004).item).toBe('d');
+  });
+
+  it('hands the reference over to the consumer once there is one', () => {
+    // After the first consume the bound is measured from the floor, not from
+    // whatever the first push happened to be, so a buffer that was pushed
+    // far ahead does not stay permanently strict.
+    const buf = new PlayoutBuffer<string>(10);
+    buf.push(1000, 'far');
+    buf.consume(500); // the consumer is actually way behind that first stamp
+    expect(buf.lastConsumedTick).toBe(500);
+    buf.push(510, 'in-window'); // 10 past the real floor: admissible
+    expect(buf.consume(510).item).toBe('in-window');
+    buf.push(600, 'out-of-window');
+    expect(buf.consume(600).starved).toBe(true);
+  });
+
+  it('re-arms on clear, so a reused buffer is not measured against a dead floor', () => {
+    const buf = new PlayoutBuffer<string>();
+    buf.consume(10);
+    buf.clear();
+    buf.push(50_004, 'after-clear');
+    expect(buf.consume(50_004).item).toBe('after-clear');
   });
 });
 

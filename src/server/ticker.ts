@@ -139,6 +139,31 @@ export interface TickerOptions<TState, TEvent> {
   emptyGraceMs?: number;
   /** TTL refreshed on the meta hash every stats flush, so a hard-killed ticker cannot strand a phantom roster forever. Default 120s. */
   metaTtlS?: number;
+  /**
+   * Formats the roster broadcast published on the metaout channel.
+   * Defaults to today's `{ t: 'meta', map }`.
+   *
+   * The symmetric half of the relay's `metaSeedPayload`, and for the same
+   * reason: this frame is a CLIENT-VISIBLE WIRE SHAPE that, unlike a
+   * snapshot, carries no version byte, so a host adopting this library
+   * cannot use a protocol bump to force already-loaded bundles onto the new
+   * shape. A client that parses its own established roster format typically
+   * early-returns on anything it does not recognise, which is SILENT: no
+   * throw, no console error, just an empty roster for every player (no name
+   * tags, no presence count, no join and leave notifications) and no gate
+   * anywhere that fails on it.
+   *
+   * Pair it with the relay's `metaSeedPayload`: that one shapes the SEED a
+   * socket gets on connect, this one shapes the BROADCAST every socket gets
+   * on a roster change. A host that overrides one and forgets the other
+   * ships two different shapes down the same channel, so treat them as one
+   * decision.
+   *
+   * Returning a value that does not serialise (`undefined`) suppresses the
+   * broadcast entirely rather than publishing the string "undefined", which
+   * is how a host seeding its roster by some other route opts out.
+   */
+  metaPayload?(map: Record<string, unknown>): unknown;
   /** Stamped into `RoomStats.build` for whoever reads the stats gauge. */
   buildId?: string;
   /**
@@ -281,6 +306,7 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
     maxRunMs = MAX_TICKER_MS,
     emptyGraceMs = EMPTY_GRACE_MS,
     metaTtlS = 120,
+    metaPayload,
     buildId,
     statsLabels,
     playoutMaxAhead,
@@ -629,8 +655,32 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
 
   function publishMeta(): void {
     const map: Record<string, unknown> = Object.fromEntries(metaMap);
+    let frame: string | undefined;
+    try {
+      // The host's formatter, if any, decides the client-visible shape; see
+      // `metaPayload` for why that seam exists. It is called INSIDE a try
+      // because this is the one meta site that runs from the tick loop: an
+      // uncaught throw here would not merely lose a roster frame, it would
+      // unwind the loop and take the whole room down, where the relay's
+      // equivalent only fails one socket's seed.
+      const payload = metaPayload ? metaPayload(map) : { t: 'meta', map };
+      // `JSON.stringify` returns undefined for `undefined` (and for a bare
+      // function or symbol) despite its lying type. Suppressing the frame
+      // beats publishing the four characters "undefined" onto a control
+      // channel every client parses.
+      frame = JSON.stringify(payload) as string | undefined;
+    } catch (err) {
+      // Reported, not retried. `metaDirty` was already cleared by the caller,
+      // so a formatter that throws deterministically logs once per roster
+      // CHANGE rather than once per tick: leaving the dirty flag set would
+      // turn a broken formatter into a 20Hz log amplifier, which is the same
+      // rule every client-rate path in this library follows.
+      log({ lvl: 'error', kind: 'ticker.meta-payload-threw', room: roomId, meta: { error: String(err) } });
+      return;
+    }
+    if (frame === undefined) return;
     redis
-      .publish(keys.metaout, JSON.stringify({ t: 'meta', map }))
+      .publish(keys.metaout, frame)
       .catch((err) => log({ lvl: 'error', kind: 'ticker.metaout-failed', room: roomId, meta: { error: String(err) } }));
   }
 

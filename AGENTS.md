@@ -205,6 +205,29 @@ barrel: with nothing Node-only left under `core/` the rule is a property of the
 directory, so the only way back in is a `../server/...` import inside `core/`,
 which is an obvious layering violation rather than a plausible barrel tidy-up.
 
+A `-1` MEANING "NOTHING YET" IS NOT A POSITION TO MEASURE A DISTANCE FROM.
+`PlayoutBuffer` bounded a push by its distance from `lastConsumedTick`, whose
+starting value of -1 means "nothing has been asked for yet" and NOT "the
+consumer is at tick -1". So a buffer created fresh in a room that had been up
+for more than `maxAhead` ticks (2s) refused EVERY push until some later consume
+happened to anchor the floor. Measured by an integrating game: at room tick 100
+and at room tick 50000 the first push into a new buffer was dropped, at tick 0
+and tick 30 it was kept. That cost them exactly one starved tick per buffer
+creation (in their case, the tick a player boarded a vehicle) and was the sole
+source of every divergence their differential harness found. IT WAS ONLY THAT
+CHEAP BECAUSE THEIR CLIENT SENDS A REDUNDANCY WINDOW: a later copy of the same
+record anchored the floor. A host that sends each stamped input once loses the
+FIRST INPUT OF EVERY BUFFER outright, which makes the redundancy window a
+requirement rather than the optimisation this library documents it as. Fixed by
+giving the bound its own reference (`aheadBase`): the first push establishes it,
+the first consume replaces it with the consumer's real position. NOT by moving
+`lastConsumedTick` itself, which is the tempting one-line version and is worse
+than the bug: a stamp is a producer's claim and that field is the consumer's
+position, so anchoring the FLOOR makes every slightly-older re-send in the same
+burst "late", and never-drop-late then re-stamps them onto one slot and dedupes
+all but one away. Measured: that alternative reddens three cases including the
+pre-existing `accepts out-of-order pushes and consumes them in tick order`.
+
 `readCheckpoint` MUST USE `getBuffer`, NEVER `get`. A utf8 decode of gzip bytes is
 lossy and destroys the payload before anything can sniff it.
 
@@ -237,7 +260,7 @@ real-Redis suite and skips cleanly when there is none.
 
 ## Status
 
-MEASURED ON THIS TREE, not estimated: `npx vitest run` is 403 tests across 31
+MEASURED ON THIS TREE, not estimated: `npx vitest run` is 476 tests across 32
 files, all green (with a local Redis up, so the six integration files run rather
 than skip); `npx tsc --noEmit` is clean repo-wide including `examples/`;
 `npm run build` emits `dist/` cleanly. Roughly 6,100 lines of source and 3,500 of
@@ -356,6 +379,39 @@ repo-wide. That touches production source (`balancer.ts`,
 rather than a quick pass. Left OFF in `tsconfig.json` per this finding; only
 the one example file consumers actually copy (`examples/pong/codec.ts`) was
 fixed to compile under it.
+
+### Defects found by a real game integrating this library (2026-08-31)
+
+- TR-4 WAS RECORDED AS LANDED WITH ONLY ITS RELAY HALF BUILT. `RelayOptions.
+  metaSeedPayload` shipped and shapes the roster frame a joining socket is
+  SEEDED with; the ticker still hardcoded the roster BROADCAST as
+  `{ t: 'meta', map }` and `TickerOptions` had no formatter at all. Adopting
+  the ticker as-is would have silently killed every name tag, the presence
+  count, the join and leave notifications and one host's character-look
+  channel, because their client does
+  `if (m.t !== 'meta' || !Array.isArray(m.players)) return;` and a shape it
+  does not recognise is an early return, not an error. They shipped around it
+  by wrapping the Redis client in a Proxy to rewrite the payload in flight.
+  `TickerOptions.metaPayload` now exists with `metaSeedPayload`'s semantics
+  exactly (default shape unchanged, an `undefined` return suppresses the frame
+  rather than publishing the string "undefined", a throw is reported and the
+  frame is dropped). ONE DIFFERENCE THAT IS NOT COSMETIC: the ticker's
+  formatter is called from the TICK LOOP, so its throw is caught rather than
+  left to reject a promise. Unguarded, a throwing formatter unwinds the loop
+  and takes the whole ROOM down, where the relay's equivalent only fails one
+  socket's seed; that is mutation-checked (`result.reason` stops being
+  `'duration'` the moment the call moves outside the try). It is also NOT
+  retried: `metaDirty` is already cleared when the publish is attempted, so a
+  deterministically broken formatter logs once per roster CHANGE instead of
+  becoming a 20Hz log amplifier.
+  THE LESSON IS ABOUT THE TRACKER, not the option. Half a paired seam passes
+  every gate in this repo, because the pair only exists in the shape a client
+  parses. When a change adds a formatter, a knob or a hook on one side of the
+  relay/ticker split, ask what its counterpart on the other side is before
+  ticking the item off.
+- `PlayoutBuffer` refused every push into a freshly created buffer in any room
+  past tick 40. Written up in full in the gotchas above, because the shape of
+  it (a sentinel used as a coordinate) is the reusable part.
 
 ### Verified against a real Redis and a real socket
 
