@@ -11,10 +11,9 @@ import {
   type RedisLike,
   type LogEvent,
   roomKeys,
-  readCheckpoint,
   unpackCheckpoint,
 } from '../src/core/index.js';
-import { runTicker, assignRoom, type Subscriber } from '../src/server/index.js';
+import { runTicker, assignRoom, readCheckpoint, type Subscriber } from '../src/server/index.js';
 import { createCounterRuntime } from './helpers/toyRuntime.js';
 import { TEST_REDIS_URL, probeRedisAvailable, newNamespace, flushNamespace, skipReason, waitFor } from './helpers/env.js';
 

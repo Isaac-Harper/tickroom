@@ -1,4 +1,4 @@
-// Proves the gzip checkpoint path (src/core/checkpoint.ts) against a real
+// Proves the gzip checkpoint path (src/server/checkpoint.ts) against a real
 // server, and in particular the trap its own comments warn about: reading a
 // possibly-gzipped value with `get` instead of `getBuffer` silently destroys
 // it via a lossy UTF-8 decode. The in-memory fake in src/server/testFakeRedis.ts
@@ -8,7 +8,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import Redis from 'ioredis';
 import { gzipSync } from 'node:zlib';
 import type { RedisLike } from '../src/core/index.js';
-import { writeCheckpoint, readCheckpoint, STATE_TTL_S } from '../src/core/index.js';
+import { writeCheckpoint, readCheckpoint, STATE_TTL_S } from '../src/server/index.js';
 import { TEST_REDIS_URL, probeRedisAvailable, newNamespace, flushNamespace, skipReason } from './helpers/env.js';
 
 const REDIS_AVAILABLE = await probeRedisAvailable();

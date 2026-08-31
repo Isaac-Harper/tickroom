@@ -86,6 +86,49 @@ describe('browser bundling', () => {
   );
 
   it(
+    'bundles the core barrel itself with no Node builtins in the graph',
+    () => {
+      // THE GATE THAT MAKES THE LAYER RULE REAL. The client case above only
+      // proves the paths client code happens to take today; this one proves the
+      // property `core` actually claims, that the whole barrel is importable in
+      // a browser. It is the difference between "no caller currently touches
+      // the Node-only module" (which was true right up until `netPolicy.ts`
+      // imported one constant from the barrel and broke every downstream
+      // browser build) and "there is nothing Node-only left to touch".
+      //
+      // Import * rather than a named list on purpose: a named list only pulls
+      // the modules those names live in, so a Node import added to some other
+      // core module would slip past. The namespace import forces every
+      // re-export in the barrel onto the graph.
+      const result = bundleForBrowser(
+        `import * as core from './src/core/index.js';\n` + `export const used = core;\n`,
+        'core',
+      );
+      expect(result.stderr).not.toMatch(/node:(zlib|util|crypto|fs|net|http)/);
+      expect(result.ok, `core failed to bundle for the browser:\n${result.stderr}`).toBe(true);
+    },
+    60_000,
+  );
+
+  it(
+    'bundles the root barrel for the browser',
+    () => {
+      // `src/index.ts` says in so many words that what it re-exports is "safe
+      // everywhere". It re-exports `core` and `codec` and deliberately not
+      // `server`, so that sentence is checkable, and this is the check. It also
+      // guards the boundary from the other side: adding `server` to the root
+      // barrel for convenience would redden here.
+      const result = bundleForBrowser(
+        `import * as tickroom from './src/index.js';\n` + `export const used = tickroom;\n`,
+        'root',
+      );
+      expect(result.stderr).not.toMatch(/node:(zlib|util|crypto|fs|net|http)/);
+      expect(result.ok, `root barrel failed to bundle for the browser:\n${result.stderr}`).toBe(true);
+    },
+    60_000,
+  );
+
+  it(
     'bundles the codec entrypoint for the browser too',
     () => {
       // The codec is shared: a client encodes inputs with the same helpers the

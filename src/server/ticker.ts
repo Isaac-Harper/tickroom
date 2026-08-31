@@ -17,8 +17,6 @@ import {
   renewDue,
   type OwnershipClock,
   CHECKPOINT_VERSION,
-  writeCheckpoint,
-  readCheckpoint,
   packCheckpoint,
   unpackCheckpoint,
   PlayoutBuffer,
@@ -32,6 +30,7 @@ import {
   type RoomStats,
   type Logger,
 } from '../core/index.js';
+import { writeCheckpoint, readCheckpoint } from './checkpoint.js';
 import type { Subscriber } from './redis.js';
 
 

@@ -4,6 +4,12 @@
 // adapter is a thin wrapper around these functions, not a reimplementation
 // of them.
 
+// Checkpoint STORAGE (gzip + Redis). Lives in this layer, not `core/`, because
+// it imports `node:zlib`; the PURE envelope grammar (`packCheckpoint`,
+// `unpackCheckpoint`, `graceMsFromCheckpoint`, `CHECKPOINT_VERSION`) stays in
+// `tickroom/core`. See the header of `./checkpoint.ts`.
+export { STATE_TTL_S, encodeCheckpoint, decodeCheckpoint, writeCheckpoint, readCheckpoint } from './checkpoint.js';
+
 export type { RedisFactoryOptions, Subscriber } from './redis.js';
 export { getRedis, createSubscriber, resetRedisForTests } from './redis.js';
 

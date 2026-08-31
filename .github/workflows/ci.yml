@@ -1,0 +1,103 @@
+# Two jobs, split by what they need rather than by what they are.
+#
+# `check` runs everything that works with no services at all, which is the same
+# set a contributor runs locally. The integration files under `tests/` are in
+# the default `vitest run` glob and SKIP cleanly here, by design: they are
+# covered by the second job and duplicating them would just make this one slow.
+#
+# `integration` is the job the library actually owes (AGENTS.md, "Owed before a
+# 1.0": the integration suite needs a Redis service container to run in CI). It
+# is the only place `ioredis` meets a real server, a real TTL expires on the
+# server's own clock, a lease is contested by concurrent clients, and the
+# handoff claim that is the headline of this library is executed rather than
+# asserted.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A second push to the same branch supersedes the first. Cancelling in progress
+# is safe here because nothing in either job publishes or deploys.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: typecheck, unit tests, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # `engines` says >=20; 22 is the active LTS and is what the numbers in
+          # AGENTS.md were measured on. Pinned rather than floating, so a Node
+          # release cannot turn a green branch red overnight with no commit.
+          node-version: '22'
+          cache: npm
+
+      # `npm ci` triggers the `prepare` script, so this step also proves the
+      # git-dependency install path a consumer takes actually builds. If the
+      # build is broken, install fails here rather than in the consumer's repo.
+      - run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      # No lint script exists in package.json. Deliberately not invented here:
+      # a linter added by CI rather than by the repo is a config nobody can run
+      # locally. Add `"lint"` to package.json first, then a step here.
+
+      - name: Unit tests
+        run: npx vitest run
+
+      - name: Build
+        run: npm run build
+
+  integration:
+    name: integration tests (real Redis)
+    runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:8
+        ports:
+          # Host 6399 matches the default in tests/helpers/env.ts and the
+          # `redis-server --port 6399` line AGENTS.md documents for local runs,
+          # so CI and a laptop address the same port.
+          - 6399:6379
+        # Without the healthcheck the job can start while the container is still
+        # booting; the probe would then read "unreachable" and, with the require
+        # flag set, fail the job for an infrastructure reason rather than a code
+        # one.
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Integration tests
+        env:
+          TICKROOM_TEST_REDIS_URL: redis://127.0.0.1:6399
+          # THE FLAG THAT STOPS THIS JOB PASSING VACUOUSLY. The suite skips
+          # cleanly when Redis is unreachable, which is right on a laptop and
+          # wrong here: a misnamed service or a wrong port would otherwise
+          # produce a green job that ran no assertions at all. With this set,
+          # an unreachable Redis throws from the probe at collection time and
+          # the job fails. See tests/helpers/env.ts.
+          TICKROOM_REQUIRE_REDIS: '1'
+        run: npm run test:integration

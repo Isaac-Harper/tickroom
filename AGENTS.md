@@ -32,8 +32,12 @@ the relays are a separate lifetime from the ticker.
 ## Layers, and the rule that separates them
 
 ```
-src/core/      pure. no IO, no clock, no platform. testable with zero setup.
-src/server/    talks to Redis. platform-agnostic: imports nothing from next
+src/core/      pure. no IO, no clock, no platform. testable with zero setup,
+               and importable in a browser: no file under core/ imports a
+               node builtin, which `bundling.test.ts` bundles to prove.
+src/server/    talks to Redis, and owns everything that needs a node builtin
+               (checkpoint gzip lives here for that reason alone).
+               platform-agnostic otherwise: imports nothing from next
                or @vercel/functions. these are plain functions a route calls.
 src/client/    browser. WebSocket + performance.now() are the only globals it
                needs; sessionStorage/location access is guarded.
@@ -65,8 +69,14 @@ whole timing guarantee rests on nothing in it ever awaiting.
   is interpolated into key names, which have no escaping.
 - `src/core/lease.ts` - the exactly-one-writer mechanism plus the `OwnershipClock`
   two-clock rule. The single most safety-critical file. See the gotcha below.
-- `src/core/checkpoint.ts` - gzip encode/decode with magic-byte sniffing, TTL
-  riding the SET, `graceMsFromCheckpoint`.
+- `src/core/checkpoint.ts` - the checkpoint ENVELOPE grammar, pure:
+  `CHECKPOINT_VERSION`, `packCheckpoint`, `unpackCheckpoint`,
+  `graceMsFromCheckpoint`. JSON and arithmetic only.
+- `src/server/checkpoint.ts` - checkpoint STORAGE: gzip encode/decode with
+  magic-byte sniffing and the Redis read/write pair, TTL riding the SET. Lives
+  in this layer because it imports `node:zlib`; it used to be in `core/` and
+  re-exported from the core barrel, which made the whole barrel unimportable in
+  a browser. See the browser-safety gotcha.
 - `src/core/playout.ts` - `PlayoutBuffer<T>`, the tick-stamped input buffer with
   never-drop-late re-stamping.
 - `src/core/starvation.ts` - the starvation decay policy and `StarveTracker`.
@@ -105,7 +115,10 @@ whole timing guarantee rests on nothing in it ever awaiting.
 ## Non-negotiable invariants
 
 - `src/core/` stays pure: no Redis, no sockets, no platform imports, no clock
-  reads, ever. It is what makes the whole thing testable and portable.
+  reads, ever. It is what makes the whole thing testable and portable, and it is
+  ENFORCED rather than asserted: `src/client/bundling.test.ts` bundles the core
+  barrel and the root barrel for the browser on every run, so a `node:*` import
+  reaching either one reddens locally instead of on whoever integrates next.
 - `src/server/` imports nothing from `next` or `@vercel/functions`. A hard import
   would make the library refuse to install outside one platform, and this
   architecture is not actually platform-specific, it just happens to be where it
@@ -179,6 +192,19 @@ keeps decoding messages into this client's state from a room it is no longer
 joining, runs its own reconnect ladder in parallel, and holds a slot against the
 per-user socket cap.
 
+A NODE BUILTIN REACHABLE FROM `core/` BREAKS EVERY DOWNSTREAM BROWSER BUILD,
+AND NOTHING IN A NORMAL GATE SEES IT. `tsc --noEmit`, `vitest` and `npm run
+build` all run in Node, where `node:zlib` resolves fine; the failure appears only
+when a consumer bundles for the browser, where it is a HARD ERROR (`Could not
+resolve "node:zlib"`, exit non-zero) rather than a warning or wasted bytes. Tree
+shaking does not save you either: the old `core/checkpoint.ts` ran
+`promisify(gzipCb)` at module scope, so it was never side-effect-free, and the
+import is evaluated long before a bundler decides an export is unused. The fix
+was to MOVE the offending module to `src/server/`, not merely to drop it from the
+barrel: with nothing Node-only left under `core/` the rule is a property of the
+directory, so the only way back in is a `../server/...` import inside `core/`,
+which is an obvious layering violation rather than a plausible barrel tidy-up.
+
 `readCheckpoint` MUST USE `getBuffer`, NEVER `get`. A utf8 decode of gzip bytes is
 lossy and destroys the payload before anything can sniff it.
 
@@ -196,18 +222,24 @@ From the repo root:
 
 ```
 npx tsc --noEmit     # typecheck, must be clean
-npx vitest run       # unit tests, must be green
+npx vitest run       # all tests; the tests/ files skip with no Redis reachable
 npm run build        # tsc -p tsconfig.build.json, emits dist/
+npm run test:integration   # tests/ only, needs a real Redis (see below)
 ```
 
-There is no integration harness yet and no deployed instance. Every test is a unit
-test against a fake in-memory Redis written inline in the test files, so the whole
-suite runs offline with no services.
+`.github/workflows/ci.yml` runs the first three on every push and PR to main, and
+the fourth in a second job against a Redis service container. Note `npm install`
+now runs `prepare`, hence `build`, so a broken build fails at install time.
+
+Most tests are unit tests against a fake in-memory Redis written inline in the
+test files, so the default run works offline with no services; `tests/` is the
+real-Redis suite and skips cleanly when there is none.
 
 ## Status
 
-MEASURED ON THIS TREE, not estimated: `npx vitest run` is 319 tests across 20
-files, all green; `npx tsc --noEmit` is clean repo-wide including `examples/`;
+MEASURED ON THIS TREE, not estimated: `npx vitest run` is 403 tests across 31
+files, all green (with a local Redis up, so the six integration files run rather
+than skip); `npx tsc --noEmit` is clean repo-wide including `examples/`;
 `npm run build` emits `dist/` cleanly. Roughly 6,100 lines of source and 3,500 of
 tests. Per layer: core 154, server 46, client 54, codec 65.
 
@@ -316,7 +348,8 @@ in the library whose failure mode is silent and catastrophic.
 
 `noUncheckedIndexedAccess` VERDICT: measured at 28 errors across 6 files
 (`examples/node-server/server.ts` 1, `src/codec/snapshot.test.ts` 21,
-`src/core/checkpoint.test.ts` 1, `src/server/balancer.ts` 1,
+`src/server/checkpoint.test.ts` 1 (measured while that case still lived in
+`src/core/checkpoint.test.ts`), `src/server/balancer.ts` 1,
 `tests/pubsub.redis.test.ts` 1, `tests/ticker.redis.test.ts` 3) when turned on
 repo-wide. That touches production source (`balancer.ts`,
 `node-server/server.ts`), not only test scaffolding, so it is real churn
@@ -375,4 +408,25 @@ metric. Measure something you own.
   dependency or the `RedisLike` seam is documented as the supported swap point.
 - The integration suite runs a toy runtime, not the examples. Wiring the pong
   example end to end through it would be a stronger demonstration.
-- No CI. The integration suite needs a Redis service container to run there.
+- ~~No CI.~~ LANDED: `.github/workflows/ci.yml`, two jobs. `check` runs
+  typecheck, unit tests and build with no services (the `tests/` files skip).
+  `integration` runs `npm run test:integration` against a `redis:8` service
+  container on host port 6399, the same port the local instructions use. There is
+  still no `lint` script, so CI runs no linter; add the script before adding the
+  step. THE INTEGRATION JOB CANNOT PASS VACUOUSLY: the suite's skip-when-
+  unreachable behaviour is right on a laptop and exactly wrong in the job whose
+  only purpose is to run it, so CI sets `TICKROOM_REQUIRE_REDIS=1` and
+  `probeRedisAvailable` THROWS instead of returning false. The throw happens at
+  module scope (the probe is awaited at the top level so the skip decision is
+  made at collection time), which vitest reports as a failed file with no tests
+  run. The check lives in the probe rather than in each test file so a seventh
+  integration file inherits it. Measured all three ways: flag set with no Redis
+  exits 1 having run 0 of 37 tests; no flag with no Redis exits 0 with 37
+  skipped (the unchanged local default); flag set with a real Redis exits 0 with
+  37 passed.
+- The package installs as a git dependency. `"prepare": "npm run build"` is what
+  makes that work: `dist/` is gitignored and every `exports` path points into it,
+  so without the hook a `github:` install resolves to a package with no code in
+  it at all. `prepare` also runs on a plain local `npm install`, which is
+  harmless (it is the same `tsc -p tsconfig.build.json` the `build` script runs,
+  it needs no network, and nothing in the build re-enters install).

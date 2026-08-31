@@ -4,9 +4,9 @@ import {
   type ClientInput,
   roomKeys,
   acquireLease,
-  readCheckpoint,
   unpackCheckpoint,
 } from '../core/index.js';
+import { readCheckpoint } from './checkpoint.js';
 import { FakeRedis } from './testFakeRedis.js';
 import { runTicker } from './ticker.js';
 
