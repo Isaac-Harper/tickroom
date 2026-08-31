@@ -211,8 +211,16 @@ http.on('upgrade', (req, socket, head) => {
         // JSON on the wire here for readability. Production uses the binary
         // codec: this runs at the sim rate and is delivered once PER PLAYER, so
         // it is the largest bandwidth line in the system. See src/codec/.
+        //
+        // `decodeInput`'s parameter is `unknown` (see its doc comment in
+        // `server/relay.ts`) because what actually arrives depends on the
+        // transport: this server runs on plain `ws`, which hands its
+        // `'message'` listener a `Buffer`, or an array of them for a
+        // fragmented message, never a browser-style `ArrayBuffer`. Normalise
+        // before decoding, exactly as any other host must.
         decodeInput: (buf): ClientInput[] => {
-          const parsed = JSON.parse(new TextDecoder().decode(buf)) as ClientInput | ClientInput[];
+          const bytes = Array.isArray(buf) ? Buffer.concat(buf) : (buf as Buffer);
+          const parsed = JSON.parse(new TextDecoder().decode(bytes)) as ClientInput | ClientInput[];
           return Array.isArray(parsed) ? parsed : [parsed];
         },
         spawnTicker: async (id) => {

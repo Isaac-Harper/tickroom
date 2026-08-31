@@ -353,6 +353,44 @@ describe('attachRelay', () => {
     handle.close();
   });
 
+  it('onLivenessDrop fires alongside every termination, and not before the deadline', async () => {
+    const onLivenessDrop = vi.fn();
+    const { socket, opts } = baseOptions({ onLivenessDrop });
+    const handle = attachRelay(opts);
+    await new Promise((r) => setTimeout(r, 80)); // several heartbeats past livenessTimeoutMs (40ms)
+    // The MockSocket's terminate() does not fire a 'close' event (a real
+    // transport's does, see relay.ts's onLivenessDrop doc comment), so the
+    // heartbeat keeps re-triggering here exactly as it does for the
+    // sibling `socket.terminated` counter above: the two must move together.
+    expect(socket.terminated).toBeGreaterThan(0);
+    expect(onLivenessDrop.mock.calls.length).toBe(socket.terminated);
+    handle.close();
+  });
+
+  it('does NOT fire onLivenessDrop for a socket that stays live', async () => {
+    const onLivenessDrop = vi.fn();
+    const { socket, opts } = baseOptions({ onLivenessDrop });
+    const handle = attachRelay(opts);
+    const pongInterval = setInterval(() => socket.fire('pong'), 10);
+    await new Promise((r) => setTimeout(r, 80));
+    clearInterval(pongInterval);
+    expect(socket.terminated).toBe(0);
+    expect(onLivenessDrop).not.toHaveBeenCalled();
+    handle.close();
+  });
+
+  it('a throwing onLivenessDrop hook cannot stop the socket from being terminated', async () => {
+    const onLivenessDrop = vi.fn(() => {
+      throw new Error('host counter blew up');
+    });
+    const { socket, opts } = baseOptions({ onLivenessDrop });
+    const handle = attachRelay(opts);
+    await new Promise((r) => setTimeout(r, 80));
+    expect(socket.terminated).toBeGreaterThan(0);
+    expect(onLivenessDrop.mock.calls.length).toBeGreaterThan(0);
+    expect(() => handle.close()).not.toThrow();
+  });
+
   it('does NOT terminate a socket that only ever sends pongs', async () => {
     const { socket, opts } = baseOptions();
     const handle = attachRelay(opts);

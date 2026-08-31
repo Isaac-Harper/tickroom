@@ -163,8 +163,20 @@ export interface VercelRelayRouteOptions {
    * room, carrying a freshly minted spawn token; see `RelayOptions.spawnTicker`.
    */
   tickerUrl: string;
-  /** Turns one inbound frame into zero or more inputs. Throwing or returning `[]` rejects the frame silently (it is still counted toward liveness). */
-  decodeInput(data: ArrayBuffer): ClientInput[];
+  /**
+   * Turns one inbound frame into zero or more inputs. Throwing or
+   * returning `[]` rejects the frame silently (it is still counted toward
+   * liveness).
+   *
+   * The parameter is `unknown`, not `ArrayBuffer`: `upgradeWebSocket` is
+   * `@vercel/functions`'s `experimental_upgradeWebSocket`, which runs on
+   * the `ws` package under the hood, and `ws` hands its `'message'`
+   * listener a `Buffer`, or an array of `Buffer`s for a fragmented
+   * message, never a browser-style `ArrayBuffer`. See `RelaySocket`'s own
+   * `decodeInput` doc comment in `server/relay.ts` for the full reasoning;
+   * this route forwards `data` to it unchanged. Normalise before decoding.
+   */
+  decodeInput(data: unknown): ClientInput[];
   /** Called with the verified claims; return extra join metadata (a display name, a colour). */
   joinMeta?(claims: TokenClaims, url: URL): Record<string, unknown>;
   log?: Logger;

@@ -72,8 +72,25 @@ export interface RelayOptions {
    * seed frame entirely rather than sending the string "undefined".
    */
   metaSeedPayload?(map: Record<string, unknown>): unknown;
-  /** Turns one inbound frame into zero or more inputs. Throwing or returning `[]` rejects the frame silently (it is still counted toward liveness). */
-  decodeInput(data: ArrayBuffer): ClientInput[];
+  /**
+   * Turns one inbound frame into zero or more inputs. Throwing or
+   * returning `[]` rejects the frame silently (it is still counted toward
+   * liveness).
+   *
+   * The parameter is `unknown`, not `ArrayBuffer`, and that is not a
+   * placeholder: what actually arrives here depends entirely on the
+   * host's transport, which this library never controls. A browser's own
+   * WebSocket hands a plain `addEventListener('message')` handler an
+   * `ArrayBuffer` (for a binary frame), but the `ws` package, the actual
+   * transport behind both shipped adapters (`adapters/vercel.ts` and
+   * `adapters/node.ts`), hands its `'message'` listener a `Buffer`, or an
+   * array of `Buffer`s for a fragmented message. Declaring `ArrayBuffer`
+   * here would be a lie about what a host actually receives on the one
+   * transport this library ships adapters for, so the host is
+   * responsible for normalising `data` into whatever shape its own
+   * decoder expects before decoding it.
+   */
+  decodeInput(data: unknown): ClientInput[];
   /** Starts a ticker for this room. Must carry a spawn token; see `session.ts`. */
   spawnTicker(roomId: string): Promise<unknown>;
   /** How often the join heartbeat republishes and the liveness/ping check runs. Default 1000ms. */
@@ -93,12 +110,13 @@ export interface RelayOptions {
 
   // --- observability seams ---
   //
-  // The three hooks below are the ONLY way a host can see the abuse path
-  // the rate limiter and the decoder exist for. Without them the relay is
-  // silent by design on exactly the events worth watching: the bucket
-  // rejects a frame BEFORE `decodeInput` ever runs, and a decoder that
-  // throws is swallowed by a bare catch, so neither reaches the host's own
-  // `decodeInput` and neither reaches the log (correctly, see below).
+  // The four hooks below are the ONLY way a host can see the abuse path
+  // the rate limiter and the decoder exist for, plus the one liveness event
+  // that shares this same shape. Without them the relay is silent by design
+  // on exactly the events worth watching: the bucket rejects a frame BEFORE
+  // `decodeInput` ever runs, and a decoder that throws is swallowed by a
+  // bare catch, so neither reaches the host's own log (correctly, see
+  // below) unless it reads one of these.
   //
   // THEY MUST BE CHEAP AND SYNCHRONOUS, and this is a real constraint, not
   // style advice. Each fires on a path whose rate a client controls, so the
@@ -115,6 +133,20 @@ export interface RelayOptions {
   onRateDrop?(): void;
   /** Fires when `decodeInput` THROWS. A decoder returning `[]` is a legitimate empty window, not bad input, and does not fire this. Count it; never log or persist per call. */
   onBadInput?(): void;
+  /**
+   * Fires alongside the `relay.liveness-drop` log line, every heartbeat
+   * that finds the socket still silent past `livenessTimeoutMs` and calls
+   * `terminate()` on it. Count it; never log or persist per call. Unlike
+   * the two hooks above, a client cannot drive this one's rate, and on a
+   * real transport it normally fires exactly once (`terminate()` emits a
+   * 'close' event that stops the heartbeat loop before the next tick), but
+   * nothing here assumes that: a transport slow to close would see this
+   * fire again on the next heartbeat, same as the log line does. It is
+   * guarded the same way as the two above for the same reason: a throwing
+   * host hook must never be able to stop the termination it is only
+   * supposed to be observing.
+   */
+  onLivenessDrop?(): void;
   /** Fires when a JOIN or INPUT publish to `keys.in` fails, the latter being the client-rate path. Count it; never log or persist per call. The library itself logs these COALESCED on the heartbeat, see `flushPublishFailures`. The `leave` publish in cleanup is deliberately not included: it is best-effort teardown, fires once, and there is nothing left to observe it by then. */
   onPublishFailed?(error: unknown): void;
 }
@@ -162,6 +194,7 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
     onClose,
     onRateDrop,
     onBadInput,
+    onLivenessDrop,
     onPublishFailed,
   } = opts;
 
@@ -400,6 +433,11 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
     // the ordinary cleanup path immediately.
     if (Date.now() - lastInboundAt > livenessTimeoutMs) {
       log({ lvl: 'warn', kind: 'relay.liveness-drop', room: roomId, pid });
+      try {
+        onLivenessDrop?.();
+      } catch {
+        // see the observability-seam note on RelayOptions
+      }
       if (socket.terminate) socket.terminate();
       else socket.close(1006);
     }
@@ -407,7 +445,10 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
 
   socket.on('message', (...args: unknown[]) => {
     if (closed) return;
-    const data = args[0] as ArrayBuffer;
+    // `args[0]` is already `unknown` here (the socket's `on()` signature
+    // takes `...args: unknown[]`), matching `decodeInput`'s own parameter:
+    // this relay never assumes a transport, so it never casts one in either.
+    const data = args[0];
     // ANY inbound frame refreshes liveness, INCLUDING one about to be
     // dropped by the rate limiter below (it still proves the peer is there)
     // and including a frame this handler cannot even decode. Liveness is

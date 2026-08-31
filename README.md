@@ -154,7 +154,11 @@ export const GET = createRelayRoute({
   // long as the ticker route lives in the same deployment, which is the
   // common case and what the ticker route above sets up.
   tickerUrl: '/api/ticker',
-  decodeInput: (buf) => [JSON.parse(new TextDecoder().decode(buf))],
+  // `decodeInput`'s parameter is `unknown`, not `ArrayBuffer`: the real
+  // transport behind this route is the `ws` package, which hands a
+  // `Buffer` (or an array of them for a fragmented message), so normalise
+  // before decoding rather than assuming a browser-style ArrayBuffer.
+  decodeInput: (buf) => [JSON.parse(new TextDecoder().decode(buf as Buffer))],
   upgradeWebSocket: experimental_upgradeWebSocket,
 });
 ```
