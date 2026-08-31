@@ -79,8 +79,24 @@ export function decodeCheckpoint(raw: Buffer | string | null | undefined): strin
     // A bare string can only ever be plain JSON: it already went through a
     // lossy text decode somewhere upstream, so gzip bytes could not have
     // survived it intact regardless of what wrote them.
-    return raw;
+    // A zero-length string is the same "nothing here" case the buffer branch
+    // below handles explicitly: fall through to the shared empty check
+    // rather than returning '' and forcing every caller to treat an empty
+    // string as a distinct third case alongside null.
+    return raw.length === 0 ? null : raw;
   }
+  // A ZERO-LENGTH BUFFER IS NOT A CHECKPOINT, it is the absence of one, and
+  // must return null exactly like the null/undefined branch above. Before
+  // this fix it fell through to `raw.toString('utf8')`, which for an empty
+  // buffer is `''`, not null. Every real caller feeds that string straight
+  // into `JSON.parse` (via `unpackCheckpoint` in core/checkpoint.ts) or a
+  // truthiness check that treats '' as "no checkpoint" today, so this was
+  // latent rather than actively broken, but a `JSON.parse('')` throws, and a
+  // host that ever calls `JSON.parse` directly on this return value instead
+  // of going through `unpackCheckpoint` would hit that throw on the exact
+  // input ("nothing was ever written") that should read as cleanly as
+  // `null`.
+  if (raw.length === 0) return null;
   if (raw.length >= 2 && raw[0] === GZIP_MAGIC_0 && raw[1] === GZIP_MAGIC_1) {
     return gunzipSync(raw).toString('utf8');
   }

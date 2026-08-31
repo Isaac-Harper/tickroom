@@ -216,3 +216,145 @@ describe('acquireLease / renewLease / releaseLease against a fake Redis', () => 
     expect(await acquireLease(redis, 'lease:x', 'owner-c')).toBe(false); // owner-b still holds it
   });
 });
+
+describe('TR-10: acquire/renew require the literal OK reply, a split-brain guard must fail closed', () => {
+  // A permissive check (`!== null && !== undefined`) would treat any of these
+  // as "we hold the lease". A real ioredis `SET ... NX` and the renew Lua
+  // never actually produce them, but a mock, a proxy, or a future
+  // Redis-compatible backend might, and the failure direction matters here
+  // more than anywhere else in the library: a false positive means two
+  // authoritative tickers publishing interleaved snapshots onto one channel.
+  class PermissiveReplyRedis implements Partial<RedisLike> {
+    constructor(private reply: unknown) {}
+    async set(): Promise<unknown> {
+      return this.reply;
+    }
+    async eval(): Promise<unknown> {
+      return this.reply;
+    }
+    async get(): Promise<string | null> {
+      return null;
+    }
+    async del(): Promise<number> {
+      return 0;
+    }
+  }
+
+  function fakeWithReply(reply: unknown): RedisLike {
+    return new PermissiveReplyRedis(reply) as unknown as RedisLike;
+  }
+
+  it.each([0, '', false, 'ok', 'Ok'])(
+    'acquireLease rejects a non-OK truthy-ish reply: %j',
+    async (reply) => {
+      const redis = fakeWithReply(reply);
+      expect(await acquireLease(redis, 'lease:x', 'owner-a')).toBe(false);
+    }
+  );
+
+  it.each([0, '', false, 'ok', 'Ok'])(
+    'renewLease rejects a non-OK truthy-ish reply: %j',
+    async (reply) => {
+      const redis = fakeWithReply(reply);
+      expect(await renewLease(redis, 'lease:x', 'owner-a')).toBe(false);
+    }
+  );
+
+  it('acquireLease and renewLease still accept the real reply, OK', async () => {
+    const redis = fakeWithReply('OK');
+    expect(await acquireLease(redis, 'lease:x', 'owner-a')).toBe(true);
+    expect(await renewLease(redis, 'lease:x', 'owner-a')).toBe(true);
+  });
+});
+
+describe('TR-10b: renewConfirmed must not stretch the renew period for an asynchronous renew', () => {
+  it('default (no opts): re-anchors lastRenewAt to the confirmation time, unchanged from before this fix', () => {
+    // This is deliberately the OLD behaviour, pinned so a future edit cannot
+    // silently flip the default: a caller that does not opt in must see
+    // exactly what it saw before TR-10b landed.
+    let clock = createOwnershipClock(0);
+    clock = renewAttempted(clock, 0);
+    const confirmedAt = 400; // simulates a 400ms round trip
+    clock = renewConfirmed(clock, confirmedAt);
+    expect(clock.lastRenewAt).toBe(confirmedAt);
+    expect(clock.lastOwnedAt).toBe(confirmedAt);
+  });
+
+  it('preserveAttemptTime: true keeps lastRenewAt at the attempt time, not the later confirmation time', () => {
+    let clock = createOwnershipClock(0);
+    const attemptAt = 0;
+    clock = renewAttempted(clock, attemptAt);
+    const confirmedAt = 400; // the same 400ms round trip as above
+    clock = renewConfirmed(clock, confirmedAt, { preserveAttemptTime: true });
+    // lastOwnedAt still moves to the real confirmation instant: only the
+    // PACING clock is preserved, never the ownership clock.
+    expect(clock.lastOwnedAt).toBe(confirmedAt);
+    expect(clock.lastRenewAt).toBe(attemptAt);
+  });
+
+  it('MUTATION CHECK, THE REGRESSION THIS FIX EXISTS FOR: an asynchronous renew loop under repeated RTT delay drifts the next-attempt schedule by one RTT per cycle with the default, and stays paced from the attempt with preserveAttemptTime', () => {
+    // Models the exact pattern server/ticker.ts uses: renewAttempted() is
+    // called synchronously at the moment the network call STARTS; the
+    // matching renewConfirmed() only runs once that call's promise resolves,
+    // one RTT later. Sweep several renew cycles and read where the NEXT
+    // attempt becomes due under each policy.
+    const renewIntervalMs = 1500;
+    const rttMs = 300;
+    const cycles = 5;
+
+    // DEFAULT policy (today's unchanged behaviour): each cycle's attempt
+    // fires renewIntervalMs after the PREVIOUS cycle's CONFIRMATION, so the
+    // gap between successive attempt starts is renewIntervalMs + rttMs.
+    {
+      let clock = createOwnershipClock(0);
+      let attemptAt = 0;
+      const attemptTimestamps: number[] = [attemptAt];
+      for (let i = 0; i < cycles; i++) {
+        clock = renewAttempted(clock, attemptAt);
+        const confirmedAt = attemptAt + rttMs;
+        clock = renewConfirmed(clock, confirmedAt); // no opts: the default
+        // advance a probing clock until renewDue fires again
+        let probe = confirmedAt;
+        while (!renewDue(clock, probe, renewIntervalMs)) probe += 1;
+        attemptAt = probe;
+        attemptTimestamps.push(attemptAt);
+      }
+      for (let i = 1; i < attemptTimestamps.length; i++) {
+        const gap = attemptTimestamps[i] - attemptTimestamps[i - 1];
+        // The defect: every cycle's attempt-to-attempt gap is stretched by
+        // one full RTT beyond the configured interval.
+        expect(gap).toBe(renewIntervalMs + rttMs);
+      }
+    }
+
+    // preserveAttemptTime policy: the gap between successive attempt starts
+    // stays exactly renewIntervalMs, regardless of RTT, because lastRenewAt
+    // never moves off the attempt instant.
+    {
+      let clock = createOwnershipClock(0);
+      let attemptAt = 0;
+      const attemptTimestamps: number[] = [attemptAt];
+      for (let i = 0; i < cycles; i++) {
+        clock = renewAttempted(clock, attemptAt);
+        const confirmedAt = attemptAt + rttMs;
+        clock = renewConfirmed(clock, confirmedAt, { preserveAttemptTime: true });
+        let probe = confirmedAt;
+        while (!renewDue(clock, probe, renewIntervalMs)) probe += 1;
+        attemptAt = probe;
+        attemptTimestamps.push(attemptAt);
+      }
+      for (let i = 1; i < attemptTimestamps.length; i++) {
+        const gap = attemptTimestamps[i] - attemptTimestamps[i - 1];
+        expect(gap).toBe(renewIntervalMs);
+      }
+    }
+  });
+
+  it('the two-clock rule survives the option: renewFailed still returns the clock unchanged either way', () => {
+    let clock = createOwnershipClock(0);
+    clock = renewAttempted(clock, 1000);
+    const failed = renewFailed(clock);
+    expect(failed).toEqual(clock);
+    expect(failed.lastOwnedAt).toBe(0); // still unmoved
+  });
+});

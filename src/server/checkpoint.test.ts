@@ -11,7 +11,7 @@ import {
   STATE_TTL_S,
   writeCheckpoint,
 } from './checkpoint.js';
-import { graceMsFromCheckpoint, packCheckpoint } from '../core/checkpoint.js';
+import { graceMsFromCheckpoint, packCheckpoint, unpackCheckpoint } from '../core/checkpoint.js';
 import type { RedisLike } from '../core/redisLike.js';
 import type { CheckpointEnvelope } from '../core/types.js';
 
@@ -82,6 +82,33 @@ describe('decodeCheckpoint handles a rolling deploy: plain JSON from an old writ
   it('returns null for a missing value', () => {
     expect(decodeCheckpoint(null)).toBeNull();
     expect(decodeCheckpoint(undefined)).toBeNull();
+  });
+});
+
+describe('TR-11: decodeCheckpoint treats an empty value as no checkpoint, not an empty checkpoint', () => {
+  it('returns null for a zero-length buffer, not an empty string', () => {
+    // Before the fix this fell through to `Buffer.alloc(0).toString('utf8')`,
+    // which is '' rather than null. '' is not the same thing as "nothing was
+    // ever written": unpackCheckpoint in core/checkpoint.ts feeds this
+    // straight into JSON.parse, and JSON.parse('') throws, so the empty
+    // buffer has to read exactly like the null/undefined case above rather
+    // than as a distinct empty-string case.
+    const decoded = decodeCheckpoint(Buffer.alloc(0));
+    expect(decoded).toBeNull();
+    expect(decoded).not.toBe('');
+  });
+
+  it('returns null for an empty string too, for the same reason', () => {
+    expect(decodeCheckpoint('')).toBeNull();
+  });
+
+  it('an empty buffer round-trips through unpackCheckpoint as "no checkpoint" rather than throwing', () => {
+    const decoded = decodeCheckpoint(Buffer.alloc(0));
+    // unpackCheckpoint must be able to accept whatever decodeCheckpoint
+    // hands it without throwing: this is the actual downstream consumer
+    // graceMsFromCheckpoint relies on, so pin the seam rather than only the
+    // isolated return value above.
+    expect(unpackCheckpoint(decoded)).toBeNull();
   });
 });
 

@@ -44,6 +44,49 @@ import type { RedisLike } from '../core/index.js';
 export interface RedisFactoryOptions {
   /** Defaults to `process.env.REDIS_URL`. */
   url?: string;
+  /**
+   * MERGED ON TOP of this factory's own default options and passed to
+   * `new Redis(url, options)` (ioredis's own `RedisOptions`). Typed
+   * `Record<string, unknown>` rather than importing ioredis's own options
+   * type here: this module already imports `Redis` itself, so there is no
+   * barrier to importing its types too, but keeping the surface
+   * untyped-but-passed-through means a caller can hand in whatever their
+   * installed ioredis version accepts without this file having to track
+   * that type across ioredis major versions.
+   *
+   * MERGED, NOT REPLACED, and that is a deliberate choice rather than the
+   * simpler "caller's object wins outright" you might reach for first: a
+   * caller who only wants to add, say, `tls` or `lazyConnect` should not
+   * have to also re-state the retry policy just to avoid silently losing
+   * it. A caller who genuinely wants a DIFFERENT retry policy still gets
+   * it, because their own `maxRetriesPerRequest` (if present) is spread
+   * last and wins over the default. `getRedis` and `createSubscriber` each
+   * merge against their OWN default object, never a shared one, which is
+   * what makes the asymmetry below actually asymmetric.
+   *
+   * `maxRetriesPerRequest` IS THE ONE OPTION WORTH CALLING OUT BY NAME,
+   * because the shared command client and a long-lived subscriber want
+   * OPPOSITE defaults and neither was configurable at all before this:
+   *
+   *   - The SHARED COMMAND CLIENT (`getRedis`) defaults to a FINITE retry
+   *     count (3). A command that keeps queueing forever behind a dead
+   *     connection is a command that never resolves and never rejects,
+   *     which is a silent hang rather than a caught, logged failure this
+   *     library's fire-and-forget `.catch` handlers can act on.
+   *   - A SUBSCRIBER (`createSubscriber`) defaults to
+   *     `maxRetriesPerRequest: null` (ioredis's documented way to mean
+   *     "retry the underlying connection forever, never surface a give-up
+   *     error"), because giving up on a subscriber does not fail loudly,
+   *     it fails INVISIBLY: the connection stops delivering pub/sub
+   *     messages while every other signal (the socket, the room's stats
+   *     key, the lease) keeps reading healthy. In this architecture that is
+   *     a room that LOOKS alive and receives nothing, which is strictly
+   *     worse than an error a caller can catch, because there is nothing
+   *     to catch.
+   *
+   * See both functions below for exactly what each one merges against.
+   */
+  redisOptions?: Record<string, unknown>;
 }
 
 function resolveUrl(opts?: RedisFactoryOptions): string {
@@ -85,7 +128,20 @@ export function getRedis(opts?: RedisFactoryOptions): RedisLike {
   // tickroom asks for. The cast is a deliberate, narrow escape hatch, not a
   // sign the two are actually incompatible at runtime: every method this
   // file's callers use is a direct call-through to the real ioredis client.
-  shared = new Redis(resolveUrl(opts)) as unknown as RedisLike;
+  //
+  // DEFAULT `maxRetriesPerRequest: 3` for the shared command client,
+  // MERGED with (never replaced by) whatever `redisOptions` the caller
+  // passed, so a caller adding an unrelated field (`tls`, `lazyConnect`,
+  // ...) does not silently lose this default; a caller's own
+  // `maxRetriesPerRequest` still wins, since it is spread last. A finite
+  // retry count means a command against a dead connection eventually
+  // REJECTS instead of queueing forever, which is what lets every
+  // fire-and-forget publish/checkpoint/renew in this library's hot paths
+  // reach their `.catch` handler rather than hang. See the asymmetry with
+  // `createSubscriber` below, and `RedisFactoryOptions` for why the two
+  // roles want opposite policies.
+  const redisOptions = { maxRetriesPerRequest: 3, ...opts?.redisOptions };
+  shared = new Redis(resolveUrl(opts), redisOptions) as unknown as RedisLike;
   return shared;
 }
 
@@ -96,7 +152,20 @@ export function getRedis(opts?: RedisFactoryOptions): RedisLike {
  * with it (see `disconnect`).
  */
 export function createSubscriber(opts?: RedisFactoryOptions): Subscriber {
-  return new Redis(resolveUrl(opts)) as unknown as Subscriber;
+  // DEFAULT `maxRetriesPerRequest: null`, MERGED with (never replaced by)
+  // the caller's own `redisOptions`, the same merge discipline `getRedis`
+  // uses above but against the OPPOSITE default: ioredis's documented
+  // meaning of `null` is "keep retrying the underlying connection forever,
+  // never surface a give-up error on a queued command". A subscriber that
+  // gave up on retries would not fail loudly, it would fail INVISIBLY,
+  // silently ceasing to deliver pub/sub messages while the socket, the
+  // lease, and the room's stats key all keep reading healthy: a room that
+  // looks alive and receives nothing. That failure mode is exactly the
+  // opposite of what `getRedis`'s finite default protects against, which is
+  // why the two factories default differently rather than sharing one
+  // policy; see `RedisFactoryOptions`.
+  const redisOptions = { maxRetriesPerRequest: null, ...opts?.redisOptions };
+  return new Redis(resolveUrl(opts), redisOptions) as unknown as Subscriber;
 }
 
 /**

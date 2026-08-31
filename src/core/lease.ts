@@ -119,9 +119,64 @@ export function renewAttempted(clock: OwnershipClock, now: number): OwnershipClo
   return { lastRenewAt: now, lastOwnedAt: clock.lastOwnedAt };
 }
 
-/** A renew SUCCEEDED at `now`. Moves ONLY `lastOwnedAt`; also nudges `lastRenewAt` forward to `now` since a confirmed renew is trivially also a completed attempt, and leaving it stale would make `renewDue` fire again immediately after a success. */
-export function renewConfirmed(clock: OwnershipClock, now: number): OwnershipClock {
-  return { lastRenewAt: now, lastOwnedAt: now };
+/**
+ * Options for `renewConfirmed`. See the function doc for what
+ * `preserveAttemptTime` trades off, and TR-10b in the migration notes for
+ * why it exists as an opt-in rather than a straight behaviour change.
+ */
+export interface RenewConfirmedOptions {
+  /**
+   * When true, `lastRenewAt` is left exactly where the paired
+   * `renewAttempted` call put it (the ATTEMPT time) instead of being
+   * re-anchored to `now` (the CONFIRMATION time). Default `false`: a caller
+   * that does not pass this keeps today's behaviour unchanged, so existing
+   * callers of `renewConfirmed(clock, now)` see no change at all.
+   *
+   * WHY THIS MATTERS FOR AN ASYNCHRONOUS RENEW. A host that issues
+   * `renewAttempted` at the moment it STARTS the network call and only
+   * calls `renewConfirmed` once that call's promise resolves (the pattern
+   * `server/ticker.ts` uses: `renewAttempted(clock, now)` before `await
+   * renewLease(...)`, then `renewConfirmed(clock, Date.now())` in the
+   * success branch) hands this function a `now` that is the ATTEMPT time
+   * plus one round trip, not the attempt time itself. Re-anchoring
+   * `lastRenewAt` to that later timestamp (the default) makes `renewDue`,
+   * which paces strictly off `lastRenewAt`, wait `leaseRenewMs` from the
+   * CONFIRMATION rather than from the attempt: the effective renew period
+   * becomes `leaseRenewMs + RTT` instead of `leaseRenewMs`. That stretch is
+   * small and harmless most of the time, but it is WORST exactly during a
+   * latency excursion, the one condition the renew cadence exists to stay
+   * ahead of: a slow RTT both delays this confirmation AND silently widens
+   * every renew interval that follows it, compounding in the wrong
+   * direction at the worst possible moment. Passing
+   * `{ preserveAttemptTime: true }` keeps `renewDue` paced off the instant
+   * the renew was actually ATTEMPTED, which is the number the pacing
+   * comment on `renewAttempted` already promises.
+   */
+  preserveAttemptTime?: boolean;
+}
+
+/**
+ * A renew SUCCEEDED at `now`. Always moves `lastOwnedAt` to `now`: ownership
+ * really was confirmed at this instant, and nothing about `preserveAttemptTime`
+ * changes that half of the two-clock rule.
+ *
+ * `lastRenewAt` has two behaviours depending on `opts.preserveAttemptTime`:
+ *
+ *   - DEFAULT (unset or false, today's behaviour, unchanged): nudged forward
+ *     to `now` too, since for a caller with no separate attempt timestamp a
+ *     confirmed renew is trivially also a completed attempt, and leaving it
+ *     stale would make `renewDue` fire again immediately after a success.
+ *   - OPT IN (`true`): left at `clock.lastRenewAt`, i.e. wherever the paired
+ *     `renewAttempted` call already put it. See `RenewConfirmedOptions` for
+ *     why an asynchronous host wants this.
+ */
+export function renewConfirmed(
+  clock: OwnershipClock,
+  now: number,
+  opts?: RenewConfirmedOptions
+): OwnershipClock {
+  const lastRenewAt = opts?.preserveAttemptTime ? clock.lastRenewAt : now;
+  return { lastRenewAt, lastOwnedAt: now };
 }
 
 /**
@@ -158,6 +213,20 @@ const RELEASE_SCRIPT =
  * (only set if absent) is what makes this an atomic compare-and-set rather
  * than a read-then-write race between two invocations that both saw the key
  * missing.
+ *
+ * REQUIRES THE LITERAL `'OK'`, not merely "not null/undefined". This is a
+ * SPLIT-BRAIN GUARD, the one place in the whole library where a false
+ * positive means two authoritative tickers publishing interleaved snapshots
+ * and clobbering one checkpoint (see the module comment). `redis.set(...)`
+ * is typed `Promise<any>` because ioredis's own overloads cannot be narrowed
+ * structurally, so a permissive check here (`!== null && !== undefined`)
+ * would accept `0`, `''`, or any other Redis reply that happens not to be
+ * nullish as proof of ownership. A real `SET ... NX` only ever replies `'OK'`
+ * (acquired) or `null` (someone else already holds it), so requiring the
+ * exact string costs nothing against a correct client and closes the gap
+ * against a mock, a proxy, or a future Redis-compatible backend that returns
+ * something else truthy. A guard whose failure mode is silent and
+ * catastrophic must fail CLOSED on anything it does not recognise.
  */
 export async function acquireLease(
   redis: RedisLike,
@@ -167,7 +236,7 @@ export async function acquireLease(
 ): Promise<boolean> {
   const { leaseTtlMs } = resolveConfig(cfg);
   const result = await redis.set(leaseKey, owner, 'PX', leaseTtlMs, 'NX');
-  return result !== null && result !== undefined;
+  return result === 'OK';
 }
 
 /**
@@ -185,7 +254,13 @@ export async function renewLease(
 ): Promise<boolean> {
   const { leaseTtlMs } = resolveConfig(cfg);
   const result = await redis.eval(RENEW_SCRIPT, 1, leaseKey, owner, leaseTtlMs);
-  return result !== null && result !== undefined;
+  // Same fail-closed reasoning as acquireLease above: RENEW_SCRIPT's own
+  // branches only ever return the result of a `SET` ('OK') or Lua `nil`
+  // (surfaced to JS as `null`), so `'OK'` is the only reply that means
+  // "still holds the lease, renewed". Anything else, including a reply
+  // shape this module has never seen, must be treated as renewal failure
+  // rather than success.
+  return result === 'OK';
 }
 
 /**
