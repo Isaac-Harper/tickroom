@@ -48,6 +48,30 @@ export interface RelayOptions {
   namespace?: string;
   /** Sent once (and re-sent as the join heartbeat) on the `join` envelope. */
   joinMeta?: Record<string, unknown>;
+  /**
+   * Formats the roster frame this relay seeds a joining socket with.
+   * Defaults to today's `{ t: 'meta', seed: true, map }`.
+   *
+   * This exists because the seed frame is a CLIENT-VISIBLE WIRE SHAPE, and
+   * unlike a snapshot it carries no version byte, so a host adopting this
+   * library cannot use a protocol bump to force already-loaded bundles onto
+   * the new shape. A client that parses its own established roster format
+   * typically early-returns on anything it does not recognise, which is
+   * SILENT: no throw, no console error, just an empty roster (no names, no
+   * presence count, no join/leave notifications) for every player, and no
+   * gate anywhere that fails on it. Letting the host keep its existing
+   * shape is what makes adopting the relay a deploy rather than a
+   * coordinated client-and-server migration measured in days.
+   *
+   * Pair it with the ticker's `metaPayload` formatter: this one shapes the
+   * SEED a socket gets on connect, that one shapes the BROADCAST every
+   * socket gets on a roster change. A host that overrides one and forgets
+   * the other ships two different shapes down the same channel.
+   *
+   * Returning a value that does not serialise (`undefined`) suppresses the
+   * seed frame entirely rather than sending the string "undefined".
+   */
+  metaSeedPayload?(map: Record<string, unknown>): unknown;
   /** Turns one inbound frame into zero or more inputs. Throwing or returning `[]` rejects the frame silently (it is still counted toward liveness). */
   decodeInput(data: ArrayBuffer): ClientInput[];
   /** Starts a ticker for this room. Must carry a spawn token; see `session.ts`. */
@@ -66,6 +90,33 @@ export interface RelayOptions {
   inboundRefillPerSecond?: number;
   log?: Logger;
   onClose?(code: number): void;
+
+  // --- observability seams ---
+  //
+  // The three hooks below are the ONLY way a host can see the abuse path
+  // the rate limiter and the decoder exist for. Without them the relay is
+  // silent by design on exactly the events worth watching: the bucket
+  // rejects a frame BEFORE `decodeInput` ever runs, and a decoder that
+  // throws is swallowed by a bare catch, so neither reaches the host's own
+  // `decodeInput` and neither reaches the log (correctly, see below).
+  //
+  // THEY MUST BE CHEAP AND SYNCHRONOUS, and this is a real constraint, not
+  // style advice. Each fires on a path whose rate a client controls, so the
+  // library's own invariant applies to whatever the host does inside them:
+  // count in process, flush on a cadence the client cannot drive. A hook
+  // that writes to Redis, or logs a line, turns a REFUSED frame into
+  // something more expensive than an accepted one, which makes the rate
+  // limiter an amplifier and hands an abuser the very lever it exists to
+  // take away. A throw out of one is caught and ignored here, so a buggy
+  // host hook can never take the socket down; it cannot be reported either,
+  // for the same per-message reason.
+
+  /** Fires when the inbound token bucket rejects a frame. Count it; never log or persist per call. */
+  onRateDrop?(): void;
+  /** Fires when `decodeInput` THROWS. A decoder returning `[]` is a legitimate empty window, not bad input, and does not fire this. Count it; never log or persist per call. */
+  onBadInput?(): void;
+  /** Fires when a JOIN or INPUT publish to `keys.in` fails, the latter being the client-rate path. Count it; never log or persist per call. The library itself logs these COALESCED on the heartbeat, see `flushPublishFailures`. The `leave` publish in cleanup is deliberately not included: it is best-effort teardown, fires once, and there is nothing left to observe it by then. */
+  onPublishFailed?(error: unknown): void;
 }
 
 export interface RelayHandle {
@@ -98,6 +149,7 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
     pid,
     namespace,
     joinMeta,
+    metaSeedPayload,
     decodeInput,
     spawnTicker,
     heartbeatMs = 1000,
@@ -108,6 +160,9 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
     inboundRefillPerSecond = 25,
     log = defaultLog,
     onClose,
+    onRateDrop,
+    onBadInput,
+    onPublishFailed,
   } = opts;
 
   const keys = roomKeys(roomId, namespace);
@@ -120,11 +175,54 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
 
   const sub = createSubscriber();
 
+  // A publish to `keys.in` is COUNTED here and logged coalesced on the
+  // heartbeat, never logged once per failure, and that is an invariant
+  // rather than a preference. The inbound-frame publish below sits on a
+  // path whose rate the CLIENT controls (a socket may legitimately send at
+  // 20-60Hz, and an abusive one much faster), so a log line per failure
+  // means a client that can make Redis publishes fail (or simply outrun
+  // them) writes to the platform log at its own chosen rate: a log-volume
+  // and cost amplifier handed to exactly the caller this file spends a
+  // token bucket defending against. The same rule already covers the rate
+  // limiter's own drops, which is why those were never logged.
+  //
+  // The heartbeat is the right flush cadence because it is a `setInterval`
+  // the client cannot influence, so during a genuine Redis outage an
+  // operator still sees one line per second per socket carrying an
+  // accurate count, which is strictly MORE useful than a flood: a count of
+  // 1200 says something a thousand identical lines do not.
+  //
+  // The join publish is routed through the same counter even though its own
+  // rate is already heartbeat-bounded. Two reasons: one kind of log line
+  // for one kind of failure reads better during an outage than two
+  // interleaved, and it leaves no second, uncoalesced publish path for a
+  // later refactor to accidentally move onto a client-driven cadence.
+  let publishFailures = 0;
+  let lastPublishError: string | null = null;
+
+  function notePublishFailure(err: unknown): void {
+    publishFailures++;
+    lastPublishError = String(err);
+    try {
+      onPublishFailed?.(err);
+    } catch {
+      // A host hook must never be able to take the socket down, and this
+      // path is client-rate, so the failure cannot be reported either.
+    }
+  }
+
+  function flushPublishFailures(): void {
+    if (publishFailures === 0) return;
+    const count = publishFailures;
+    const error = lastPublishError;
+    publishFailures = 0;
+    lastPublishError = null;
+    log({ lvl: 'error', kind: 'relay.publish-failed', room: roomId, pid, meta: { count, error } });
+  }
+
   function publishJoin(): void {
     const envelope: RoomEnvelope = { t: 'join', pid, meta: joinMeta };
-    redis
-      .publish(keys.in, JSON.stringify(envelope))
-      .catch((err) => log({ lvl: 'error', kind: 'relay.publish-failed', room: roomId, pid, meta: { error: String(err) } }));
+    redis.publish(keys.in, JSON.stringify(envelope)).catch(notePublishFailure);
   }
 
   function seedRoster(): void {
@@ -140,7 +238,20 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
             // a corrupt single field must not blank the whole seed
           }
         }
-        socket.send(JSON.stringify({ t: 'meta', seed: true, map }));
+        // The host's formatter, if any, decides the client-visible shape;
+        // see `metaSeedPayload` for why that seam exists. A formatter that
+        // THROWS lands in the `.catch` below and is reported as a seed
+        // failure, which is correct: this path runs at most twice per
+        // socket, so it is not client-rate and a real log line is affordable.
+        const payload = metaSeedPayload ? metaSeedPayload(map) : { t: 'meta', seed: true, map };
+        // `JSON.stringify` returns undefined for `undefined` (and for a bare
+        // function or symbol) despite its lying type. Suppressing the frame
+        // beats sending the four characters "undefined" down a control
+        // channel, and it gives a host a deliberate way to opt out of the
+        // seed entirely when it seeds the roster by some other route.
+        const frame = JSON.stringify(payload) as string | undefined;
+        if (frame === undefined) return;
+        socket.send(frame);
       })
       .catch((err) => log({ lvl: 'warn', kind: 'relay.meta-seed-failed', room: roomId, pid, meta: { error: String(err) } }));
   }
@@ -256,16 +367,21 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
   ensureTicker();
   scheduleTickerCheck();
 
-  // The heartbeat timer does THREE jobs, deliberately sharing one interval
-  // rather than three: it re-publishes the join envelope (so a message lost
+  // The heartbeat timer does FOUR jobs, deliberately sharing one interval
+  // rather than four: it re-publishes the join envelope (so a message lost
   // to the subscribe race above is not permanent, since the ticker's join
-  // handling is idempotent), it pings the socket, and it checks the
-  // liveness deadline. One timer, one Redis command's worth of amortized
-  // cost, instead of three independent schedules drifting against each
-  // other.
+  // handling is idempotent), it flushes the coalesced publish-failure
+  // count, it pings the socket, and it checks the liveness deadline. One
+  // timer, one Redis command's worth of amortized cost, instead of four
+  // independent schedules drifting against each other.
   heartbeatTimer = setInterval(() => {
     if (closed) return;
     publishJoin();
+    // Fourth job, added with the coalesced publish counter: emit one line
+    // for however many publishes failed since the last beat. This is the
+    // cadence the client cannot drive, which is the whole point of putting
+    // the flush here rather than at the failure site.
+    flushPublishFailures();
     try {
       socket.ping?.();
     } catch {
@@ -299,24 +415,44 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
     // formed.
     lastInboundAt = Date.now();
     if (!bucket.take()) {
-      // Dropped, counted nowhere per-message (client-controlled input
-      // arriving at up to 20-60Hz; logging every drop would hand an abuser
-      // a log/cost amplifier for free). A host that wants an aggregate
-      // signal should count this in its own `decodeInput`/`onClose`, or
-      // wrap `socket` to observe it.
+      // Dropped, and still never logged per message: client-controlled
+      // input arrives at up to 20-60Hz and an abusive socket much faster,
+      // so a line per drop is a log/cost amplifier handed to the caller
+      // this bucket exists to throttle. `onRateDrop` is the seam instead:
+      // an in-process synchronous callback the host aggregates itself and
+      // flushes on its own cadence. It is deliberately unreachable through
+      // `decodeInput`, because the whole point of the bucket is to reject
+      // the frame BEFORE any decode work is paid for.
+      try {
+        onRateDrop?.();
+      } catch {
+        // see the observability-seam note on RelayOptions
+      }
       return;
     }
     let inputs: ClientInput[];
     try {
       inputs = decodeInput(data);
     } catch {
+      // A decoder throw is the signature of a malformed or hostile frame
+      // (a truncated packet, a wrong protocol version, a crafted length),
+      // and it is the one abuse signal the rate limiter cannot see, since
+      // a well-paced stream of garbage never trips the bucket at all.
+      // Counted through the hook, never logged, for the same client-rate
+      // reason as the drop above.
+      try {
+        onBadInput?.();
+      } catch {
+        // see the observability-seam note on RelayOptions
+      }
       return;
     }
+    // An empty window is NOT bad input. A decoder legitimately returns
+    // nothing for a frame that carried no applicable records, so counting
+    // it as malformed would bury the real signal under ordinary traffic.
     if (inputs.length === 0) return;
     const envelope: RoomEnvelope = { t: 'in', pid, w: inputs, ts: Date.now() };
-    redis
-      .publish(keys.in, JSON.stringify(envelope))
-      .catch((err) => log({ lvl: 'error', kind: 'relay.publish-failed', room: roomId, pid, meta: { error: String(err) } }));
+    redis.publish(keys.in, JSON.stringify(envelope)).catch(notePublishFailure);
   });
 
   socket.on('pong', () => {
@@ -331,6 +467,13 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
   function cleanup(code: number): void {
     if (closed) return;
     closed = true;
+    // TAIL FLUSH, before the timer that would otherwise have carried it is
+    // cleared. Without this a socket that dies mid-outage loses every
+    // publish failure it accumulated since the last beat, which is exactly
+    // the window an operator most wants to see, and it silently
+    // under-reports the failure right at the moment the room is losing a
+    // player's input.
+    flushPublishFailures();
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (tickerCheckTimer) clearTimeout(tickerCheckTimer);
     redis.publish(keys.in, JSON.stringify({ t: 'leave', pid } satisfies RoomEnvelope)).catch(() => {});
@@ -374,9 +517,44 @@ export interface AdmissionOptions {
   /** The durable identity behind this pid (a device id, an account id): what the per-subject socket cap is keyed on. */
   subject: string;
   namespace?: string;
+  /**
+   * Namespace for the per-subject connection registry key, which is
+   * `{connNamespace}:conns:{subject}`. Defaults to `namespace`, i.e. today's
+   * behaviour byte for byte. AN EMPTY STRING MEANS NO PREFIX AND NO
+   * SEPARATOR AT ALL, producing a bare `conns:{subject}`.
+   *
+   * This is separate from `namespace` because the two are not the same kind
+   * of thing. Room keys are per-room and per-deployment, so namespacing them
+   * is free. The connection registry is keyed on a DURABLE SUBJECT (a device
+   * id, an account id) and is therefore very likely to be a key an adopting
+   * host already writes, reads, and, critically, ENUMERATES ELSEWHERE.
+   *
+   * The elsewhere is the part that is not obvious and is why this option
+   * exists at all. A host with a data-deletion path typically enumerates
+   * every key holding a subject's data by name in order to erase it, and
+   * that enumeration is usually backing a PUBLISHED PRIVACY COMMITMENT.
+   * Silently moving the socket-cap key under this library's room namespace
+   * breaks that in one of two ways, and neither announces itself:
+   *
+   *   - the deletion path keeps deleting the OLD key, which nothing writes
+   *     any more, so the new key survives erasure and a published promise
+   *     to delete a user's data is now false; or
+   *   - the deletion path is updated and the CAP moves instead, counting a
+   *     namespaced key nothing else has ever written, so it reads zero
+   *     forever and `maxSocketsPerSubject` silently enforces nothing.
+   *
+   * There is a third cost even when both are handled: during a rollout both
+   * key shapes are live at once, a subject's sockets are split across them,
+   * and the effective cap is DOUBLED for the duration.
+   *
+   * So: point this at the key shape you already have. The `conns` middle
+   * segment is fixed; only the prefix is configurable, which is enough to
+   * reproduce both a namespaced and a bare pre-existing key.
+   */
+  connNamespace?: string;
   maxPlayers: number;
   maxSocketsPerSubject?: number;
-  /** How old a `conns:{subject}` entry may be before it is pruned as abandoned. Default 30s. */
+  /** How old an entry in the connection registry (see `connNamespace` for the key) may be before it is pruned as abandoned. Default 30s. */
   connStaleMs?: number;
 }
 
@@ -427,29 +605,55 @@ export async function checkAdmission(opts: AdmissionOptions): Promise<AdmissionR
     pid,
     subject,
     namespace,
+    connNamespace,
     maxPlayers,
     maxSocketsPerSubject = DEFAULT_MAX_SOCKETS_PER_SUBJECT,
     connStaleMs = DEFAULT_CONN_STALE_MS,
   } = opts;
 
   const keys = roomKeys(roomId, namespace);
-  const ns = namespace ?? DEFAULT_NAMESPACE;
-  const connKey = `${ns}:conns:${subject}`;
+  // `?? namespace ?? DEFAULT_NAMESPACE` rather than `?? ns`, so that an
+  // explicitly empty `connNamespace` survives: `''` is not nullish, so it
+  // wins the coalesce and the ternary below then drops the separator too.
+  // Written this way deliberately, because the obvious `connNamespace || ns`
+  // would treat the empty string as "unset" and quietly hand back the
+  // namespaced key the option exists to avoid.
+  const connNs = connNamespace ?? namespace ?? DEFAULT_NAMESPACE;
+  const connKey = connNs === '' ? `conns:${subject}` : `${connNs}:conns:${subject}`;
   const connId = randomUUID();
 
   try {
     const pipe = redis.pipeline();
     pipe.get(keys.stats);
-    pipe.hgetall(keys.meta);
+    // HEXISTS, not HGETALL, and the difference is not cosmetic: this runs on
+    // the JOIN PATH OF EVERY SOCKET, and the only thing the result is used
+    // for is the boolean below. HGETALL pulls the entire roster to answer
+    // it, so on a full room this trades one integer for up to `maxPlayers`
+    // JSON blobs of name and appearance metadata, per join, on the network
+    // egress axis that managed Redis plans actually bill. It is also the
+    // cheaper answer under the pathological case, a room whose roster is
+    // large precisely because it is being hammered with joins.
+    //
+    // It removes a trust-boundary footgun as a side effect. The HGETALL
+    // version had to reach for `hasOwnProperty.call`, because a bare
+    // `pid in metaRaw` on a plain object matches INHERITED keys and a pid of
+    // `constructor` or `__proto__` would have read as present and been
+    // admitted past a full room. HEXISTS asks Redis, which has no prototype
+    // chain, so the class of bug cannot be reintroduced here by a tidy-up.
+    pipe.hexists(keys.meta, pid);
     pipe.zremrangebyscore(connKey, '-inf', Date.now() - connStaleMs);
     pipe.zcard(connKey);
     const results: Array<[Error | null, unknown]> = await pipe.exec();
 
     const statsRaw = results[0]?.[1] as string | null;
-    const metaRaw = results[1]?.[1] as Record<string, string> | null;
+    const rejoinRaw = results[1]?.[1];
     const socketCount = results[3]?.[1] as number;
 
-    const alreadyPresent = !!(metaRaw && Object.prototype.hasOwnProperty.call(metaRaw, pid));
+    // ioredis answers HEXISTS with a number; accept the string form too, so
+    // an alternative `RedisLike` that returns raw protocol replies is not
+    // silently read as "not present" (which would refuse every rejoin into
+    // a full room, the one case a rejoin must always win).
+    const alreadyPresent = rejoinRaw === 1 || rejoinRaw === '1';
 
     if (!alreadyPresent) {
       let players = 0;

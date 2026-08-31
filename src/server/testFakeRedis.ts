@@ -160,6 +160,14 @@ export class FakeRedis implements RedisLike {
     return isNew ? 1 : 0;
   }
 
+  // Answers 1/0 like the real HEXISTS, not true/false: `checkAdmission`
+  // reads the numeric reply, so a boolean fake would let a broken read pass
+  // here and fail against a real Redis.
+  async hexists(key: string, field: string): Promise<number> {
+    this.guard('hexists');
+    return this.hub.hashes.get(key)?.has(field) ? 1 : 0;
+  }
+
   async hdel(key: string, ...fields: string[]): Promise<number> {
     this.guard('hdel');
     const h = this.hub.hashes.get(key);
@@ -236,7 +244,7 @@ export class FakeRedis implements RedisLike {
     return next;
   }
 
-  // Only the four sub-commands `checkAdmission` actually issues, in the
+  // Only the sub-commands `checkAdmission` actually issues, in the
   // exact order it issues them: this is a fake built to serve tickroom's
   // own call sites, not a general pipeline emulator.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -250,6 +258,10 @@ export class FakeRedis implements RedisLike {
       },
       hgetall: (k: string) => {
         ops.push(() => this.hgetall(k));
+        return builder;
+      },
+      hexists: (k: string, f: string) => {
+        ops.push(() => this.hexists(k, f));
         return builder;
       },
       zremrangebyscore: (k: string, min: string | number, max: string | number) => {
