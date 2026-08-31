@@ -9,12 +9,14 @@ commit.
 ## What this is
 
 A TypeScript library for running authoritative realtime multiplayer rooms on
-serverless functions. Extracted from `~/Development/glade` (a shipped multiplayer
-browser game) and generalised so it works for 2D games, collaborative apps,
-multiplayer cursors, or anything realtime where several clients need to agree on
-state changing many times a second.
+serverless functions. Extracted from a shipped multiplayer browser game and
+generalised so it works for 2D games, collaborative apps, multiplayer cursors,
+or anything realtime where several clients need to agree on state changing many
+times a second.
 
-Private repo, no publish yet. MIT licensed, public by default when it ships.
+PUBLIC repo, MIT licensed. Not published to npm; consumers install it as a git
+dependency, which is what `prepare` exists for (npm builds a git dep by running
+it, and `dist/` is gitignored).
 
 ## The architecture in one paragraph
 
@@ -277,7 +279,7 @@ tests. Per layer: core 154, server 46, client 54, codec 65.
   specifically to reproduce the production incidents this design exists to
   prevent (lease theft, the subscribe race, liveness and pong, backpressure
   fairness) deterministically and without a service.
-- The upstream source (`~/Development/glade`) is the production evidence for the
+- The upstream game this was extracted from is the production evidence for the
   design: the lease, the checkpoint handoff, the playout timeline, the stall
   thresholds and the interpolation rules were all measured there under real load.
   Where a number in a comment is quoted as "measured", that is where it came from.
