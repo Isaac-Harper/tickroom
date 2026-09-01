@@ -190,10 +190,30 @@ const conn = new RoomConnection({
   onSnapshot: (raw) => {
     const snap = raw as Snapshot;
     interp.push({
+      // BOTH timestamps are required, and they do different jobs.
+      //
+      // `serverTime` is the PLAYBACK AXIS: frames are ordered by it and
+      // interpolated against it, so remote motion is replayed on the uniform
+      // grid the server emitted it on rather than on the smeared schedule the
+      // network happened to deliver it. Send a real server clock stamp here.
+      // Passing your own `performance.now()` for both fields makes this a
+      // no-op that replays every burst and every stretched gap as motion.
+      //
+      // `receivedAt` is the local arrival stamp, and it exists so the
+      // interpolator can measure the offset between your clock and the
+      // server's. It must come from the SAME clock you pass to `sample()`.
       receivedAt: performance.now(),
       serverTime: snap.serverTime,
       entities: new Map(snap.players.map(([id, p]) => [id, { x: p.x, y: p.y }])),
     });
+  },
+  onStatus: (status) => {
+    // CLEAR THE INTERPOLATOR ON EVERY DISCONNECT. `RoomConnection` holds no
+    // reference to it, so nothing else can. Skip this and the first frame of
+    // the new epoch is bracketed against a frame from seconds ago, which is a
+    // guaranteed snap on every reconnect; the stale clock offset from the old
+    // socket's path comes along with it.
+    if (status !== 'open') interp.clear();
   },
   onStallChange: (stalled) => banner.toggle(stalled),
 });
@@ -211,7 +231,7 @@ function frame(now: number, dt: number) {
 }
 ```
 
-You now have reconnect-with-backoff, session re-minting, a smoothed server clock, jitter-adaptive interpolation, never-freeze extrapolation, and a stall detector that can tell a dead room from a slow one.
+You now have reconnect-with-backoff, session re-minting, a smoothed server clock, server-timeline interpolation that adapts to measured jitter, never-freeze extrapolation, and a stall detector that can tell a dead room from a slow one.
 
 ---
 
@@ -244,7 +264,11 @@ Each of these cost real production time to learn. They are documented at length 
 
 **Capacity must be read from one key.** If the relay and the balancer read different keys, a hard-dead ticker leaves one of them permanently wrong, the balancer keeps handing out a room the relay keeps rejecting, and joiners strand on "full" with no way to heal.
 
+**Interpolate remote entities on the SERVER's clock, never on the local arrival clock.** The server emits on a uniform grid and the network smears the arrivals; timing playback against arrival stamps replays that smear as motion, so a burst of packets plays a quarter-second of the world in three milliseconds. Measured on an entity moving at a constant 100 u/s, that read as a peak of 1568 u/s and nine visible backward rewinds, against 261 and zero for the same frames played on the server clock. The arrival stamp is still required, as the sole input to the local-versus-server clock estimate.
+
 **Never freeze a remote entity on interpolation underrun.** Extrapolate for up to 150ms. A frozen entity that then teleports reads far worse than one that drifts and is corrected, and this is the single rule most likely to be optimised away by someone who has not watched it happen.
+
+**`quantizeCm` speaks METRES, and a 2D host usually does not.** The helper packs a position into a centimetre-precision `i16`, which spans **+-327.67 metres**, and out-of-range values CLAMP rather than wrap. Hand it pixels or screen coordinates and everything past 327.67 pins silently at the boundary, which reads as every distant entity piled up against an invisible wall rather than as an encoding error. Either scale your world into metres before encoding, or use `quantize(v, scale, I16.min, I16.max)` directly with a scale that covers your real range: at a scale of 1 an `i16` spans +-32,767 units, at 10 it spans +-3,276.7. Pick the smallest field that covers your world plus headroom; the scale is on the wire, so changing it later is a protocol break.
 
 **Re-send the last few inputs in every packet.** The playout buffer's push is duplicate-overwriting and out-of-order safe, so re-sends are free, and a lost packet stops mattering.
 
@@ -320,7 +344,7 @@ continues the tick count rather than resetting the room.
 - **Not a game engine.** No rendering, no physics, no ECS. You bring the simulation.
 - **Not lockstep.** State-synchronised with client prediction, not deterministic lockstep. Peers never wait on each other.
 - **Not a CRDT.** There is one authority and it is the server. For text or documents with no natural authority, use a CRDT.
-- **Not zero-latency.** Clients render other entities 80 to 250ms behind, adaptively. That delay is what buys smoothness, and it is the correct trade for everything except a competitive shooter.
+- **Not zero-latency.** Clients render other entities 80 to 500ms behind, adaptively, and near the 80ms floor on a clean connection. That delay is what buys smoothness, and it is the correct trade for everything except a competitive shooter.
 
 ---
 

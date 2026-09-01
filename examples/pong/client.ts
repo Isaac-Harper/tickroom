@@ -83,6 +83,15 @@ export function startPong(canvas: HTMLCanvasElement): () => void {
       });
     },
 
+    onStatus: (status) => {
+      // Clear the interpolator on every disconnect. `RoomConnection` holds no
+      // reference to it, so nothing else can, and a buffer carried across an
+      // epoch brackets the new socket's first frame against one from seconds
+      // ago: a guaranteed snap on every reconnect, plus a clock offset
+      // estimated over the old socket's path.
+      if (status !== 'open') interp.clear();
+    },
+
     onStallChange: (stalled) => {
       // NON-BLOCKING on purpose. A stall usually self-heals (a ticker handoff, a
       // brief network gap), so the player keeps control of a live world while it

@@ -1,41 +1,230 @@
 import { describe, it, expect, vi } from 'vitest';
-import { SnapshotInterpolator, type SnapshotFrame } from './interpolation.js';
+import { SnapshotInterpolator, OFFSET_SLEW_MAX, TIMELINE_STEP_FRAMES, type SnapshotFrame } from './interpolation.js';
 
-function frame(receivedAt: number, entities: Record<string, { x: number; y: number; heading?: number }>): SnapshotFrame<string> {
+type Pose = { x: number; y: number; heading?: number };
+
+/**
+ * `serverTime` and `receivedAt` are SEPARATE PARAMETERS here, and that is the
+ * whole point of this helper.
+ *
+ * The version this replaced took one timestamp and assigned it to both, so
+ * every test in this file ran a network where the local clock and the server
+ * clock were identical by construction, with zero one-way delay and zero
+ * jitter. On such a network arrival-clock playback and server-clock playback
+ * are indistinguishable, which is exactly why a fully green suite of twelve
+ * tests never noticed that this module timed playback against the arrival
+ * clock. The one axis that decides whether remote motion is smooth was the one
+ * axis no test ever varied.
+ */
+function frame(serverTime: number, receivedAt: number, entities: Record<string, Pose>): SnapshotFrame<string> {
   return {
+    serverTime,
     receivedAt,
-    serverTime: receivedAt,
     entities: new Map(Object.entries(entities)),
   };
+}
+
+/** Deterministic jitter source, so a "jittery network" test is reproducible rather than flaky. */
+function prng(seed: number): () => number {
+  let s = seed >>> 0 || 1;
+  return () => {
+    s ^= s << 13; s >>>= 0;
+    s ^= s >>> 17;
+    s ^= s << 5; s >>>= 0;
+    return s / 4294967296;
+  };
+}
+
+interface Arrival {
+  serverTime: number;
+  receivedAt: number;
+  entities: Record<string, Pose>;
+}
+
+/**
+ * Push arrivals and sample on a render clock, interleaved the way a real host
+ * does it (a socket callback pushing, a rAF loop sampling, both on one clock),
+ * and return the per-step rendered motion after `warmupMs`.
+ */
+function drive(
+  interp: SnapshotInterpolator<string>,
+  arrivals: Arrival[],
+  opts: { untilMs: number; warmupMs: number; hz?: number; key?: string },
+): {
+  speeds: number[];
+  xs: number[];
+  lastX: number;
+  lastNow: number;
+  /** Every rendered frame of the whole run, warmup included, so a test can measure how long a disturbance took to clear rather than only the steady state after it. */
+  track: { now: number; x: number; extrapolated: boolean }[];
+  frameMs: number;
+} {
+  const hz = opts.hz ?? 60;
+  const frameMs = 1000 / hz;
+  const dt = 1 / hz;
+  const key = opts.key ?? 'a';
+  const speeds: number[] = [];
+  const xs: number[] = [];
+  const track: { now: number; x: number; extrapolated: boolean }[] = [];
+  let next = 0;
+  let prev: { x: number; y: number } | null = null;
+  let lastX = NaN;
+  let lastNow = 0;
+
+  for (let now = 0; now <= opts.untilMs; now += frameMs) {
+    while (next < arrivals.length && arrivals[next]!.receivedAt <= now) {
+      const a = arrivals[next]!;
+      interp.push(frame(a.serverTime, a.receivedAt, a.entities));
+      next++;
+    }
+    const e = interp.sample(dt, now).get(key);
+    lastNow = now;
+    if (!e) {
+      prev = null;
+      continue;
+    }
+    lastX = e.x;
+    track.push({ now, x: e.x, extrapolated: e.extrapolated });
+    if (now >= opts.warmupMs && prev) {
+      speeds.push(Math.hypot(e.x - prev.x, e.y - prev.y) / dt);
+      xs.push(e.x);
+    }
+    prev = { x: e.x, y: e.y };
+  }
+
+  return { speeds, xs, lastX, lastNow, track, frameMs };
+}
+
+/** Longest unbroken run of extrapolated frames after `fromMs`, in ms. The measure of how long playback went without confirmed data on both sides of the playhead, which is what a stranded playhead reads as. */
+function longestExtrapolationMs(
+  track: { now: number; extrapolated: boolean }[],
+  fromMs: number,
+  frameMs: number,
+): number {
+  let worst = 0;
+  let run = 0;
+  for (const t of track) {
+    if (t.now < fromMs) continue;
+    run = t.extrapolated ? run + 1 : 0;
+    if (run > worst) worst = run;
+  }
+  return worst * frameMs;
+}
+
+/**
+ * Longest stretch after `fromMs` in which the entity was absent from the
+ * rendered output entirely, in ms. `drive` records only the frames it actually
+ * rendered, so a hole in `track`'s timeline IS a dropout: the entity popped out
+ * of existence for that long, which no other measure here notices because they
+ * all skip a frame with nothing in it.
+ */
+function longestDropoutMs(track: { now: number }[], fromMs: number, frameMs: number): number {
+  let worst = 0;
+  for (let i = 1; i < track.length; i++) {
+    if (track[i]!.now < fromMs) continue;
+    // Counted in whole render frames rather than differenced directly, because
+    // the render clock accumulates 1000/60 and a float residue is not a dropout.
+    const gap = (Math.round((track[i]!.now - track[i - 1]!.now) / frameMs) - 1) * frameMs;
+    if (gap > worst) worst = gap;
+  }
+  return worst;
+}
+
+/** Per-frame rendered position steps after `fromMs`, in units. The rendered motion itself, which is where a speed spike or a backward rewind shows up. */
+function stepsAfter(track: { now: number; x: number }[], fromMs: number): number[] {
+  const out: number[] = [];
+  for (let i = 1; i < track.length; i++) {
+    if (track[i]!.now < fromMs) continue;
+    out.push(track[i]!.x - track[i - 1]!.x);
+  }
+  return out;
+}
+
+/**
+ * A stream on a uniform arrival cadence whose `serverTime` STEPS at one tick,
+ * while the entity keeps moving at a constant speed in real time.
+ *
+ * That is a ticker handoff: `src/server/ticker.ts` stamps `serverTime` from the
+ * running instance's own `Date.now()`, so a successor on a different machine
+ * carries that machine's clock skew, in either direction. Positions are keyed
+ * to the TICK INDEX rather than to `serverTime`, because the entity's real
+ * motion is unaffected by which clock the authority happens to stamp with.
+ */
+function serverTimeStep(opts: {
+  ticks: number;
+  tickMs: number;
+  speed: number;
+  latencyMs: number;
+  stepAtTick: number;
+  stepMs: number;
+}): Arrival[] {
+  const out: Arrival[] = [];
+  let serverTime = 0;
+  for (let i = 0; i < opts.ticks; i++) {
+    if (i === opts.stepAtTick) serverTime += opts.stepMs;
+    out.push({
+      serverTime,
+      receivedAt: i * opts.tickMs + opts.latencyMs,
+      entities: { a: { x: (opts.speed * i * opts.tickMs) / 1000, y: 0 } },
+    });
+    serverTime += opts.tickMs;
+  }
+  return out;
+}
+
+/** Newest pose DELIVERED by local time `now`, for the streams above: every tick lands exactly `latencyMs` after it was emitted. */
+function newestDeliveredX(now: number, tickMs: number, speed: number, latencyMs: number): number {
+  const i = Math.floor((now - latencyMs) / tickMs);
+  return (speed * i * tickMs) / 1000;
+}
+
+/** A constant-velocity entity on a uniform server grid: the simplest world in which any rendered speed other than `speed` is an artifact of this module. */
+function straightLine(opts: {
+  ticks: number;
+  tickMs: number;
+  speed: number;
+  latency: (i: number, serverTime: number) => number;
+}): Arrival[] {
+  const out: Arrival[] = [];
+  let prev = -Infinity;
+  for (let i = 0; i < opts.ticks; i++) {
+    const serverTime = i * opts.tickMs;
+    // Arrival order is physical: nothing can land before what came before it.
+    const receivedAt = Math.max(prev, serverTime + opts.latency(i, serverTime));
+    prev = receivedAt;
+    out.push({ serverTime, receivedAt, entities: { a: { x: (opts.speed * serverTime) / 1000, y: 0 } } });
+  }
+  return out;
 }
 
 describe('SnapshotInterpolator', () => {
   it('interpolates a midpoint between two frames', () => {
     const interp = new SnapshotInterpolator<string>({ startDelayMs: 100, minDelayMs: 50, maxDelayMs: 200 });
-    interp.push(frame(0, { a: { x: 0, y: 0 } }));
-    interp.push(frame(200, { a: { x: 10, y: 0 } }));
+    // 30ms of one-way delay, so the two clocks genuinely differ and the
+    // playhead has to be corrected onto the server's timeline to land anywhere
+    // near the middle of the bracket.
+    interp.push(frame(0, 30, { a: { x: 0, y: 0 } }));
+    interp.push(frame(200, 230, { a: { x: 10, y: 0 } }));
 
-    // Playback point is localClock - delayMs. Drive the local clock to 200ms
-    // via nowMs so the playhead sits at 100ms, exactly between the frames.
-    let out = interp.sample(0.05, 100); // seed clock at 100ms, delay still ramping from startDelayMs=100
-    out = interp.sample(0.05, 200);
-    // At clock=200, delay eased from 100 toward whatever the jitter target
-    // is (no jitter samples yet since only 2 pushes with no third to confirm
-    // a ring, so target stays at start); playhead ~= 200 - ~100 = ~100.
+    // Playback point is (localClock - clockOffset) - delayMs. The offset is
+    // seeded from the first push at exactly 30ms, and with only two samples
+    // the delay target has not moved off startDelayMs, so a local clock of
+    // 230 puts the playhead at server time 100: exactly between the frames.
+    let out = interp.sample(0.05, 130);
+    out = interp.sample(0.05, 230);
     const a = out.get('a');
     expect(a).toBeDefined();
-    expect(a!.x).toBeGreaterThan(0);
-    expect(a!.x).toBeLessThan(10);
+    expect(a!.x).toBeCloseTo(5, 6);
     expect(a!.extrapolated).toBe(false);
   });
 
   it('extrapolates on underrun instead of freezing, and caps the extrapolation horizon', () => {
     const interp = new SnapshotInterpolator<string>({ startDelayMs: 50, minDelayMs: 50, maxDelayMs: 250, extrapCapMs: 150 });
-    interp.push(frame(0, { a: { x: 0, y: 0 } }));
-    interp.push(frame(50, { a: { x: 5, y: 0 } })); // velocity: 100 units/sec in x
+    interp.push(frame(0, 40, { a: { x: 0, y: 0 } }));
+    interp.push(frame(50, 90, { a: { x: 5, y: 0 } })); // velocity: 100 units/sec in x
 
     // Playhead way past the newest frame: a real gap/drop.
-    const out = interp.sample(0.05, 50 + 50 + 1000); // clock way ahead, delay ~50ms
+    const out = interp.sample(0.05, 40 + 50 + 50 + 1000);
     const a = out.get('a');
     expect(a).toBeDefined();
     expect(a!.extrapolated).toBe(true);
@@ -45,25 +234,59 @@ describe('SnapshotInterpolator', () => {
 
   it('extrapolation never freezes: position keeps advancing (bounded) rather than sticking to the last confirmed pose', () => {
     const interp = new SnapshotInterpolator<string>({ startDelayMs: 50, minDelayMs: 50, maxDelayMs: 250, extrapCapMs: 150 });
-    interp.push(frame(0, { a: { x: 0, y: 0 } }));
-    interp.push(frame(50, { a: { x: 5, y: 0 } }));
+    interp.push(frame(0, 40, { a: { x: 0, y: 0 } }));
+    interp.push(frame(50, 90, { a: { x: 5, y: 0 } }));
 
-    const early = interp.sample(0.05, 120); // playhead just past newest frame
-    const later = interp.sample(0.05, 160); // playhead further past, still under the cap
+    const early = interp.sample(0.05, 160); // playhead just past newest frame
+    const later = interp.sample(0.05, 200); // playhead further past, still under the cap
     const xEarly = early.get('a')!.x;
     const xLater = later.get('a')!.x;
     expect(xLater).toBeGreaterThan(xEarly);
   });
 
-  it('heading interpolates the shortest arc across the +-pi wrap', () => {
-    const interp = new SnapshotInterpolator<string>({ startDelayMs: 50, minDelayMs: 50, maxDelayMs: 250 });
-    const near = Math.PI - 0.1;
-    interp.push(frame(0, { a: { x: 0, y: 0, heading: near } }));
-    interp.push(frame(100, { a: { x: 0, y: 0, heading: -near } })); // wraps the short way, through pi, not back through 0
+  it('derives the extrapolation velocity from the SERVER-time span, not the arrival gap', () => {
+    // Two frames one server tick (50ms) apart that a burst delivered 5ms
+    // apart. They describe 5 units of motion over 50ms of world time, i.e.
+    // 100 u/s. Dividing by the 5ms arrival gap instead reads 1000 u/s, and a
+    // capped 150ms extrapolation at that speed overshoots by 150 units rather
+    // than 15. Measured on a bursty profile, that single error accounted for a
+    // 26-unit one-frame jump on an entity moving 5 units per tick.
+    const interp = new SnapshotInterpolator<string>({ startDelayMs: 50, minDelayMs: 50, maxDelayMs: 250, extrapCapMs: 150 });
+    interp.push(frame(0, 0, { a: { x: 0, y: 0 } }));
+    interp.push(frame(50, 5, { a: { x: 5, y: 0 } }));
 
-    interp.sample(0.05, 0);
-    const out = interp.sample(0.05, 50); // halfway
-    const heading = out.get('a')!.heading!;
+    const a = interp.sample(0.05, 1000).get('a')!;
+    expect(a.extrapolated).toBe(true);
+    expect(a.x).toBeCloseTo(5 + 100 * 0.15, 3);
+    expect(a.x).toBeLessThan(25); // the arrival-gap velocity would put this at ~155
+  });
+
+  it('heading interpolates the shortest arc across the +-pi wrap', () => {
+    // THIS TEST HAS TO LAND ON THE INTERPOLATE BRANCH, and the version it
+    // replaced did not. With only two frames buffered, a playhead at the newer
+    // one's `serverTime` is an UNDERRUN (`i === frames.length - 1`), which
+    // extrapolates position and copies the newest frame's heading through
+    // untouched: `lerpHeading` was never called, and replacing its body with a
+    // plain linear lerp (the exact bug this test names) left the whole suite
+    // green. A THIRD frame is what makes the midpoint a real bracket.
+    //
+    // The delay is pinned (min === max === start) so the adaptive target
+    // cannot ease it off 50 the moment three offset samples exist and slide
+    // the playhead off the midpoint.
+    const interp = new SnapshotInterpolator<string>({ startDelayMs: 50, minDelayMs: 50, maxDelayMs: 50 });
+    const near = Math.PI - 0.1;
+    interp.push(frame(0, 20, { a: { x: 0, y: 0, heading: near } }));
+    interp.push(frame(100, 120, { a: { x: 0, y: 0, heading: -near } })); // wraps the short way, through pi, not back through 0
+    interp.push(frame(200, 220, { a: { x: 0, y: 0, heading: -near } }));
+
+    // Offset seeded at 20, delay pinned at 50, so a local clock of 120 puts the
+    // playhead at server time 50: the true midpoint of the bracket [0, 100],
+    // with a third frame beyond it so this is an interpolation and not an
+    // extrapolation.
+    const out = interp.sample(0.05, 120);
+    const a = out.get('a')!;
+    expect(a.extrapolated).toBe(false);
+    const heading = a.heading!;
     // The short way from (pi - 0.1) to (-(pi - 0.1)) passes through +-pi, so
     // the midpoint heading's absolute value must stay large (near pi), not
     // collapse toward 0 (which is what a naive linear lerp would produce).
@@ -72,71 +295,254 @@ describe('SnapshotInterpolator', () => {
 
   it('the adaptive delay grows under injected jitter and stays clamped to [min,max]', () => {
     const interp = new SnapshotInterpolator<string>({ minDelayMs: 80, maxDelayMs: 250, startDelayMs: 80 });
-    let t = 0;
-    // Feed a sequence of increasingly jittery gaps (some tight, some wide) so
-    // the p95-ish target climbs well above the 80ms floor.
-    const gaps = [40, 220, 45, 230, 50, 240, 48, 235, 47, 245];
-    for (const g of gaps) {
-      t += g;
-      interp.push(frame(t, { a: { x: 0, y: 0 } }));
-      interp.sample(g / 1000, t);
-    }
+    // A uniform 50ms server grid whose ARRIVALS jitter by up to 200ms above a
+    // 40ms floor. The quantity the delay is sized from is that excess above
+    // the floor, so the target climbs well past the 80ms minimum.
+    const rnd = prng(0xbeef);
+    const arrivals = straightLine({ ticks: 200, tickMs: 50, speed: 100, latency: () => 40 + rnd() * 200 });
+    drive(interp, arrivals, { untilMs: 10_000, warmupMs: 10_000 });
+
     expect(interp.delayMs).toBeGreaterThan(80);
     expect(interp.delayMs).toBeLessThanOrEqual(250);
   });
 
   it('the adaptive delay never exceeds maxDelayMs even under extreme jitter', () => {
     const interp = new SnapshotInterpolator<string>({ minDelayMs: 80, maxDelayMs: 200, startDelayMs: 80 });
-    let t = 0;
-    for (let i = 0; i < 20; i++) {
-      const gap = 900; // huge, consistent gap
-      t += gap;
-      interp.push(frame(t, { a: { x: 0, y: 0 } }));
-      interp.sample(1.0, t);
-    }
+    const rnd = prng(0xf00d);
+    const arrivals = straightLine({ ticks: 200, tickMs: 50, speed: 100, latency: () => 40 + rnd() * 900 });
+    drive(interp, arrivals, { untilMs: 20_000, warmupMs: 20_000 });
+
     expect(interp.delayMs).toBeLessThanOrEqual(200);
+  });
+
+  it('the adaptive delay GROWS under a delivery burst rather than shrinking', () => {
+    // The estimator this replaced took a p95 of recent INTER-ARRIVAL GAPS. A
+    // burst is a run of near-zero gaps, so it flooded that ring with tiny
+    // samples and pulled the delay DOWN at exactly the moment more buffer was
+    // needed: measured at 87.95ms under ordinary jitter versus 80.45ms under
+    // bursts, the wrong way round. Excess above the clock-offset floor moves
+    // the right way, because a burst is a set of packets that were all held.
+    const grid = { ticks: 400, tickMs: 50, speed: 100 };
+
+    const steady = new SnapshotInterpolator<string>();
+    drive(steady, straightLine({ ...grid, latency: () => 40 }), { untilMs: 20_000, warmupMs: 20_000 });
+
+    // Every 40th tick opens a 250ms head-of-line stall covering five ticks,
+    // all five then delivered inside a 3ms window once it clears.
+    const bursty = new SnapshotInterpolator<string>();
+    drive(
+      bursty,
+      straightLine({
+        ...grid,
+        latency: (i) => {
+          const held = i - (i % 40);
+          if (held >= 40 && i - held < 5) return 40 + 250 + (held - i) * 50 + (i - held) * 0.75;
+          return 40;
+        },
+      }),
+      { untilMs: 20_000, warmupMs: 20_000 },
+    );
+
+    expect(bursty.delayMs).toBeGreaterThan(steady.delayMs);
+    expect(bursty.delayMs).toBeGreaterThan(150);
+  });
+
+  it('renders constant-velocity motion at a constant speed despite jittered arrivals', () => {
+    // THE HEADLINE PROPERTY. The server emits on a uniform grid; the network
+    // smears the arrivals. Playing back against the arrival clock replays that
+    // smear AS MOTION, so a constant 100 u/s reads as anything from 1 to 393
+    // u/s. Playing back against the server clock reproduces the grid.
+    const interp = new SnapshotInterpolator<string>();
+    const rnd = prng(0x51ee);
+    const arrivals = straightLine({ ticks: 400, tickMs: 50, speed: 100, latency: () => 40 + rnd() * 60 });
+    const { speeds } = drive(interp, arrivals, { untilMs: 20_000, warmupMs: 3000 });
+
+    expect(speeds.length).toBeGreaterThan(500);
+    const max = Math.max(...speeds);
+    const min = Math.min(...speeds);
+    const mean = speeds.reduce((s, v) => s + v, 0) / speeds.length;
+    const sd = Math.sqrt(speeds.reduce((s, v) => s + (v - mean) ** 2, 0) / speeds.length);
+
+    expect(mean).toBeCloseTo(100, 0);
+    expect(max).toBeLessThan(115);
+    expect(min).toBeGreaterThan(85);
+    expect(sd).toBeLessThan(3);
+  });
+
+  it('a delivery burst does not replay as a speed spike', () => {
+    // Five ticks held for 250ms and then delivered 0.75ms apart. On the
+    // arrival clock those five frames are a quarter of a second of world
+    // motion crammed into 3ms; on the server clock they are five ordinary
+    // ticks that happened to land together. The delay here is fixed above the
+    // stall length so the buffer covers it and the ONLY variable left is which
+    // clock the playhead runs on.
+    const interp = new SnapshotInterpolator<string>({ minDelayMs: 350, maxDelayMs: 350, startDelayMs: 350 });
+    const arrivals = straightLine({
+      ticks: 200,
+      tickMs: 50,
+      speed: 100,
+      latency: (i) => {
+        const held = i - (i % 40);
+        if (held >= 40 && i - held < 5) return 40 + 250 + (held - i) * 50 + (i - held) * 0.75;
+        return 40;
+      },
+    });
+    const { speeds, xs } = drive(interp, arrivals, { untilMs: 10_000, warmupMs: 1500 });
+
+    expect(Math.max(...speeds)).toBeLessThan(130);
+    // A REWIND is the failure this profile actually produces, and the previous
+    // assertion here (`speeds.every(s => s >= 0)`) could not see it or anything
+    // else: `speeds` are magnitudes from `Math.hypot(...) / dt` with dt > 0, so
+    // the claim was true by construction. The entity only ever moves in +x, so
+    // any decrease in the RENDERED x is the interpolator replaying the burst
+    // backwards, which is what the arrival clock did nine times on this profile.
+    const rewinds = xs.filter((x, i) => i > 0 && x < xs[i - 1]! - 1e-9).length;
+    expect(rewinds).toBe(0);
+  });
+
+  it('the clock offset slews at a capped rate, so a latency step never teleports the playhead', () => {
+    // The offset is subtracted from the playhead, so moving it IS moving
+    // playback in time. Drop the one-way delay by 200ms mid-stream: the offset
+    // floor drops instantly, and without a cap the playhead would jump 200ms
+    // forward in one frame (20 units at 100 u/s). Capped at OFFSET_SLEW_MAX it
+    // can only run 5% fast, so rendered speed stays under 105 u/s and the 200ms
+    // is absorbed over four seconds instead.
+    // The delay is pinned (min === max) so the only thing that can move the
+    // playhead relative to real time is the offset.
+    const interp = new SnapshotInterpolator<string>({ minDelayMs: 100, maxDelayMs: 100, startDelayMs: 100 });
+    const arrivals = straightLine({
+      ticks: 400,
+      tickMs: 50,
+      speed: 100,
+      latency: (i) => (i < 40 ? 240 : 40),
+    });
+    const { speeds, xs, lastX, lastNow } = drive(interp, arrivals, { untilMs: 20_000, warmupMs: 2100 });
+
+    // The cap is a RATE, so measure it as one: average speed over 200ms
+    // windows. The offset itself only moves on a push, so the render frame
+    // right after each push carries that push's whole allowance at once (2.5ms
+    // of playhead at a 50ms snapshot cadence, i.e. a quarter of a unit here);
+    // that is why the instantaneous per-frame bound below is looser than the
+    // rate bound, and it is still two orders of magnitude short of the ~1300
+    // u/s single frame an uncapped offset would produce.
+    const cap = 100 * (1 + OFFSET_SLEW_MAX);
+    const win = 12; // 200ms at 60Hz
+    let worstRate = 0;
+    for (let i = 0; i + win < xs.length; i++) {
+      worstRate = Math.max(worstRate, ((xs[i + win]! - xs[i]!) / win) * 60);
+    }
+    expect(worstRate).toBeLessThanOrEqual(cap + 0.5);
+    expect(Math.max(...speeds)).toBeLessThan(130);
+    // ...and it does converge rather than merely being slow: well after the
+    // 4 seconds the 200ms correction needs, the entity tracks the new offset.
+    expect(lastX).toBeCloseTo((100 * (lastNow - 40 - 100)) / 1000, 0);
+  });
+
+  it('an entity missing from one bracketing frame stays on its path instead of snapping to that frame', () => {
+    // `b` is omitted from the snapshot at server time 50. Rendering it at the
+    // pose of whichever bracketing frame does carry it snaps it by up to a
+    // full interval, forward or back, and unwinds again next frame: one
+    // transiently culled entity reads as visible jitter. Scanning outward for
+    // the nearest frames that do carry it keeps it on the same path, so it
+    // tracks `a`, which moves identically and is never omitted.
+    const interp = new SnapshotInterpolator<string>({ minDelayMs: 100, maxDelayMs: 100, startDelayMs: 100 });
+    const pose = (t: number) => ({ x: t / 10, y: 0 });
+    interp.push(frame(0, 100, { a: pose(0), b: pose(0) }));
+    interp.push(frame(50, 150, { a: pose(50) }));
+    interp.push(frame(100, 200, { a: pose(100), b: pose(100) }));
+    interp.push(frame(150, 250, { a: pose(150), b: pose(150) }));
+
+    // Offset is seeded at 100, delay is pinned at 100, so nowMs 225 puts the
+    // playhead at server time 25: inside the bracket [0, 50] that omits `b`.
+    interp.sample(0.05, 220);
+    const mid = interp.sample(0.05, 225);
+    expect(mid.get('b')!.x).toBeCloseTo(mid.get('a')!.x, 6);
+    expect(mid.get('b')!.x).toBeCloseTo(2.5, 6);
+
+    // And in the next bracket [50, 100], where the OLDER frame is the one
+    // missing `b`. The old code snapped forward here and backward above.
+    const later = interp.sample(0.05, 275);
+    expect(later.get('b')!.x).toBeCloseTo(later.get('a')!.x, 6);
+    expect(later.get('b')!.x).toBeCloseTo(7.5, 6);
   });
 
   it('an entity unseen past dropAfterMs is forgotten', () => {
     const interp = new SnapshotInterpolator<string>({ startDelayMs: 50, minDelayMs: 50, maxDelayMs: 250, dropAfterMs: 500 });
-    interp.push(frame(0, { a: { x: 0, y: 0 } }));
-    interp.sample(0.05, 10);
-    let out = interp.sample(0.05, 100);
+    interp.push(frame(0, 40, { a: { x: 0, y: 0 } }));
+    interp.sample(0.05, 50);
+    let out = interp.sample(0.05, 140);
     expect(out.has('a')).toBe(true);
 
-    out = interp.sample(0.05, 700); // past dropAfterMs since the entity was last seen at t=0
+    out = interp.sample(0.05, 740); // past dropAfterMs since the entity was last seen at receivedAt 40
     expect(out.has('a')).toBe(false);
   });
 
   it('forget() removes an entity immediately', () => {
     const interp = new SnapshotInterpolator<string>({ startDelayMs: 50, minDelayMs: 50, maxDelayMs: 250 });
-    interp.push(frame(0, { a: { x: 0, y: 0 } }));
-    interp.sample(0.05, 10);
+    interp.push(frame(0, 40, { a: { x: 0, y: 0 } }));
+    interp.sample(0.05, 50);
     interp.forget('a');
-    const out = interp.sample(0.05, 20);
+    const out = interp.sample(0.05, 60);
     expect(out.has('a')).toBe(false);
   });
 
   it('measures a low-passed speed from its own rendered motion', () => {
-    const interp = new SnapshotInterpolator<string>({ startDelayMs: 50, minDelayMs: 50, maxDelayMs: 250, speedTau: 0.12 });
-    for (let i = 0; i <= 10; i++) {
-      interp.push(frame(i * 50, { a: { x: i * 5, y: 0 } })); // 100 units/sec
+    const interp = new SnapshotInterpolator<string>({ startDelayMs: 100, minDelayMs: 100, maxDelayMs: 100, speedTau: 0.12 });
+    const arrivals = straightLine({ ticks: 40, tickMs: 50, speed: 100, latency: () => 40 });
+    let last = 0;
+    const hz = 60;
+    let next = 0;
+    for (let now = 0; now <= 1500; now += 1000 / hz) {
+      while (next < arrivals.length && arrivals[next]!.receivedAt <= now) {
+        const arr = arrivals[next]!;
+        interp.push(frame(arr.serverTime, arr.receivedAt, arr.entities));
+        next++;
+      }
+      const e = interp.sample(1 / hz, now).get('a');
+      if (e) last = e.speed;
     }
-    let out: ReturnType<typeof interp.sample> | undefined;
-    for (let i = 0; i < 10; i++) {
-      out = interp.sample(0.05, 100 + i * 50);
-    }
-    const speed = out!.get('a')!.speed;
-    expect(speed).toBeGreaterThan(50); // should be converging toward ~100
+    expect(last).toBeGreaterThan(90); // converged onto the true 100 units/sec
+    expect(last).toBeLessThan(110);
   });
 
-  it('clear() resets frames, entities, and the adaptive delay', () => {
+  it('clear() resets frames, entities, and the adaptive delay to its starting value', () => {
+    // The docstring always claimed this; the implementation only re-CLAMPED
+    // whatever the delay had drifted to, because the start value was never
+    // stored, and the only assertion here was `out.size === 0`, which cannot
+    // tell the two apart. A reconnect therefore inherited the dead
+    // connection's jitter estimate.
     const interp = new SnapshotInterpolator<string>({ startDelayMs: 90, minDelayMs: 50, maxDelayMs: 250 });
-    interp.push(frame(0, { a: { x: 0, y: 0 } }));
-    interp.sample(0.05, 10);
+    const rnd = prng(0xc1ea4);
+    drive(interp, straightLine({ ticks: 200, tickMs: 50, speed: 100, latency: () => 40 + rnd() * 200 }), {
+      untilMs: 10_000,
+      warmupMs: 10_000,
+    });
+    expect(interp.delayMs).toBeGreaterThan(120); // it genuinely moved off the start value
+
     interp.clear();
-    const out = interp.sample(0.05, 10);
+    expect(interp.delayMs).toBe(90);
+
+    const out = interp.sample(0.05, 10_000);
     expect(out.size).toBe(0);
+  });
+
+  it('clear() resets the clock offset, so a reconnect on a different path does not inherit the old one', () => {
+    const interp = new SnapshotInterpolator<string>({ startDelayMs: 100, minDelayMs: 100, maxDelayMs: 100 });
+    interp.push(frame(0, 500, { a: { x: 0, y: 0 } })); // epoch 1: 500ms of one-way delay
+    interp.push(frame(50, 550, { a: { x: 5, y: 0 } }));
+    interp.sample(0.05, 600);
+
+    interp.clear();
+
+    // Epoch 2 on a much faster path. With the offset reset, the playhead lands
+    // inside the new frames immediately; carrying the old 500ms offset over
+    // would put it 500ms in the future and extrapolate off the end.
+    interp.push(frame(1000, 1020, { a: { x: 100, y: 0 } }));
+    interp.push(frame(1050, 1070, { a: { x: 105, y: 0 } }));
+    interp.push(frame(1100, 1120, { a: { x: 110, y: 0 } }));
+    const a = interp.sample(0.05, 1145).get('a')!;
+    expect(a.x).toBeCloseTo(102.5, 6);
+    expect(a.extrapolated).toBe(false);
   });
 
   // Regression for the bug examples/pong/client.ts shipped with: calling
@@ -159,9 +565,12 @@ describe('SnapshotInterpolator', () => {
     try {
       const interp = new SnapshotInterpolator<string>({ startDelayMs: 50, minDelayMs: 50, maxDelayMs: 250 });
 
-      interp.push({ receivedAt: clock, serverTime: clock, entities: new Map([['a', { x: 0, y: 0 }]]) });
+      // The server's clock is its own domain, 3s behind the local one here, so
+      // this also exercises the offset estimate rather than assuming the two
+      // clocks agree.
+      interp.push(frame(clock - 3000, clock, { a: { x: 0, y: 0 } }));
       clock += 50;
-      interp.push({ receivedAt: clock, serverTime: clock, entities: new Map([['a', { x: 10, y: 0 }]]) });
+      interp.push(frame(clock - 3000, clock, { a: { x: 10, y: 0 } }));
 
       // A rendered frame some time later, calling sample() exactly the way
       // examples/pong/client.ts used to: dt only, no nowMs.
@@ -178,5 +587,410 @@ describe('SnapshotInterpolator', () => {
     } finally {
       nowSpy.mockRestore();
     }
+  });
+
+  it('ONE frame with a non-finite serverTime is refused at the door and does not poison playback', () => {
+    // The types promise `number`; the value crosses a decode boundary owned by
+    // the host, and the README quickstart hands `snap.serverTime` straight
+    // through from a host-defined codec. A codec that omits the field yields
+    // `undefined`, whose arithmetic is NaN.
+    //
+    // Before the guard, one such frame was PERMANENT. NaN reached the offset
+    // window, the jitter quantile and finally `currentDelayMs`, where
+    // `x += (NaN - x) * ease` can never leave NaN again even after the bad
+    // sample slid out of the 128-entry window. The playhead was NaN, every
+    // bracket comparison was false, and playback pinned to `frames[0]` for the
+    // rest of the connection: measured at a rendered x of 1200 against newest
+    // data of 1495, with the socket, the snapshot rate and `underrunRate` all
+    // reading perfectly healthy. Only `clear()` escaped it.
+    const interp = new SnapshotInterpolator<string>();
+    for (let i = 0; i < 300; i++) {
+      const serverTime = i === 100 ? Number.NaN : i * 50;
+      interp.push(frame(serverTime, i * 50 + 40, { a: { x: i * 5, y: 0 } }));
+      interp.sample(1 / 60, i * 50 + 45);
+    }
+
+    expect(interp.rejectedFrames).toBe(1);
+    expect(Number.isFinite(interp.delayMs)).toBe(true);
+
+    // 199 clean frames after the bad one, and the render tracks the newest
+    // data (x = 1495 at tick 299) rather than the first frame ever pushed.
+    const a = interp.sample(1 / 60, 300 * 50 + 45).get('a')!;
+    expect(a.x).toBeGreaterThan(1400);
+  });
+
+  it('a non-finite receivedAt is refused too, and a non-finite nowMs never reaches stored state', () => {
+    const interp = new SnapshotInterpolator<string>({ startDelayMs: 100, minDelayMs: 100, maxDelayMs: 100 });
+    interp.push(frame(0, 40, { a: { x: 0, y: 0 } }));
+    interp.push(frame(50, 90, { a: { x: 5, y: 0 } }));
+    interp.push(frame(100, 140, { a: { x: 10, y: 0 } }));
+
+    interp.push(frame(150, Number.NaN, { a: { x: 15, y: 0 } }));
+    expect(interp.rejectedFrames).toBe(1);
+
+    interp.sample(Number.NaN, Number.NaN);
+    expect(Number.isFinite(interp.delayMs)).toBe(true);
+
+    // The bad call left nothing behind: the next honest one still brackets.
+    const a = interp.sample(1 / 60, 165).get('a')!;
+    expect(a.x).toBeCloseTo(2.5, 6);
+    expect(Number.isFinite(a.x)).toBe(true);
+  });
+
+  it('a sustained one-way latency step re-anchors instead of degrading for tens of seconds', () => {
+    // A route change, a network switch, a congested path that stays congested:
+    // the true clock offset moves in one step. The offset estimate is a sliding
+    // window MINIMUM eased under a 5% slew cap, and neither mechanism can move
+    // until the stale floor ages out of the window, so the playhead sits past
+    // the newest frame for the whole turnover. Measured on this exact profile
+    // before the re-anchor: 22,517ms of continuous extrapolation, rendering a
+    // 20Hz stop-go staircase.
+    const interp = new SnapshotInterpolator<string>();
+    const arrivals = straightLine({
+      ticks: 1200,
+      tickMs: 50,
+      speed: 100,
+      latency: (i) => (i < 200 ? 40 : 1040), // +1000ms, permanently, at local t = 10s
+    });
+    const { track, frameMs } = drive(interp, arrivals, { untilMs: 40_000, warmupMs: 40_000 });
+
+    expect(interp.reanchors).toBe(1);
+
+    // The stream itself is silent for the 1000ms the step costs, and
+    // extrapolate-then-hold is the CORRECT behaviour with no data. What must
+    // not happen is that it carries on for another twenty seconds afterwards.
+    expect(longestExtrapolationMs(track, 10_000, frameMs)).toBeLessThan(1500);
+
+    // Two seconds after the step, playback tracks the newest delivered pose
+    // again, no more than a delay or so behind it.
+    for (const t of track) {
+      if (t.now < 12_000) continue;
+      const stale = newestDeliveredX(t.now, 50, 100, 1040) - t.x;
+      expect(stale).toBeLessThan(40); // 40 units = 400ms of world time
+      expect(stale).toBeGreaterThan(-5);
+    }
+  });
+
+  it('a large FORWARD serverTime step is adopted as a new timeline instead of stalling forever', () => {
+    // A handoff onto a machine whose clock runs 5 seconds ahead, and the case
+    // that makes the future-stamp refusal above dangerous if it has no way out.
+    // Every frame after the step carries an implied one-way delay 5 seconds
+    // below the floor, so every frame trips the same test a corrupt stamp does.
+    // Refusing them all would be a permanent stall with nothing ever reaching
+    // the buffer again, which is strictly worse than the poisoning the refusal
+    // exists to prevent. What separates the two is PERSISTENCE, and this asserts
+    // the count that measures it: exactly `TIMELINE_STEP_FRAMES` frames are
+    // refused across a forty-second run, not a number that keeps climbing.
+    //
+    // THIS TEST USED TO CLAIM IT PINNED `pruneFrames`'s front-splice fix, and it
+    // did not: reintroducing that exact bug left the whole suite green, because
+    // the step is now believed and corrected in about 150ms and the buffer never
+    // gets a chance to overfill behind a stranded playhead. The front-splice
+    // fix is pinned by its own test below, on a profile where the count cap
+    // actually binds.
+    const interp = new SnapshotInterpolator<string>();
+    const arrivals = serverTimeStep({
+      ticks: 1400,
+      tickMs: 50,
+      speed: 100,
+      latencyMs: 40,
+      stepAtTick: 200,
+      stepMs: 5000,
+    });
+    const { track } = drive(interp, arrivals, { untilMs: 40_000, warmupMs: 40_000 });
+
+    expect(interp.rejectedFrames).toBe(TIMELINE_STEP_FRAMES);
+    expect(interp.reanchors).toBe(1);
+    for (const t of track) {
+      if (t.now < 12_000) continue;
+      const stale = newestDeliveredX(t.now, 50, 100, 40) - t.x;
+      expect(stale).toBeLessThan(40);
+      expect(stale).toBeGreaterThan(-5);
+    }
+  });
+
+  it('a BACKWARD serverTime step recovers, and never renders a pose from the timeline the authority left', () => {
+    // The other direction of the same handoff. `src/server/ticker.ts` stamps
+    // `serverTime` from the running instance's own `Date.now()`, so a successor
+    // whose clock sits behind its predecessor's rewinds the axis playback runs
+    // on. The frames already buffered are then the buffer's NEWEST end forever,
+    // and the playhead eventually walks back into them and renders a pose from
+    // the dead epoch: measured as a single 285-unit jump five seconds after the
+    // handoff, far enough after it to read as an unrelated glitch.
+    const interp = new SnapshotInterpolator<string>();
+    const arrivals = serverTimeStep({
+      ticks: 1400,
+      tickMs: 50,
+      speed: 100,
+      latencyMs: 40,
+      stepAtTick: 200,
+      stepMs: -5000,
+    });
+    const { track } = drive(interp, arrivals, { untilMs: 40_000, warmupMs: 40_000 });
+
+    expect(interp.reanchors).toBe(1);
+    for (const t of track) {
+      if (t.now < 12_000) continue;
+      const stale = newestDeliveredX(t.now, 50, 100, 40) - t.x;
+      expect(stale).toBeLessThan(40);
+      expect(stale).toBeGreaterThan(-5);
+    }
+  });
+
+  it('does NOT re-anchor when the stream simply stops, because there is nothing to anchor to', () => {
+    // THE GATE. A dead ticker, or the gap between a predecessor's death and a
+    // successor's first tick, parks the playhead past the newest buffered frame
+    // exactly the way a wrong clock offset does, and looks identical from
+    // inside this class. The difference is that no new data is arriving, so
+    // re-anchoring would move the playhead onto the same stale frames and
+    // accomplish nothing; extrapolate-then-hold is correct there. Requiring at
+    // least one push() since the error window opened is what tells them apart.
+    const interp = new SnapshotInterpolator<string>();
+    const arrivals = straightLine({ ticks: 200, tickMs: 50, speed: 100, latency: () => 40 });
+    drive(interp, arrivals, { untilMs: 30_000, warmupMs: 30_000 }); // stream ends at t = 10s, 20s of silence
+
+    expect(interp.reanchors).toBe(0);
+    expect(interp.underrunRate).toBeGreaterThan(0.9);
+  });
+
+  it('ONE frame stamped in the FUTURE is refused, so it cannot switch the underrun branch off', () => {
+    // FINITE IS NOT THE SAME AS PLAUSIBLE, and the finiteness guard alone let
+    // this through. A frame stamped far ahead of the authority's real clock is
+    // always the buffer's NEWEST end, so `i === frames.length - 1` can never be
+    // true again while it leads the playhead. That single condition is the
+    // underrun branch, the `extrapolated` flag, `underrunRate` AND the
+    // re-anchor's own past-the-newest detection, all of which switch off
+    // together. Measured with one frame stamped 30 seconds ahead and the stream
+    // then stopping dead for five seconds: the entity drifted 333 units
+    // BACKWARD while reporting 0 of 300 frames extrapolated and an underrun
+    // rate of 0.000, i.e. it broke the never-freeze rule and lied about its own
+    // health in the same breath.
+    const interp = new SnapshotInterpolator<string>();
+    for (let i = 0; i < 400; i++) {
+      const local = i * 50;
+      if (i === 150) interp.push(frame(local + 30_000, local + 40, { a: { x: i * 5, y: 0 } }));
+      interp.push(frame(local, local + 40, { a: { x: i * 5, y: 0 } }));
+      for (let k = 0; k < 3; k++) interp.sample(1 / 60, local + k * (1000 / 60));
+    }
+
+    expect(interp.rejectedFrames).toBe(1);
+
+    // The stream now stops dead. Five seconds of silence must read as an
+    // underrun, and must move the entity FORWARD along its last known velocity.
+    const stopAt = 399 * 50;
+    const xAtStop = interp.sample(1 / 60, stopAt).get('a')!.x;
+    let extrapolated = 0;
+    let rendered = 0;
+    let x = xAtStop;
+    for (let now = stopAt; now < stopAt + 5000; now += 1000 / 60) {
+      const e = interp.sample(1 / 60, now).get('a')!;
+      rendered++;
+      if (e.extrapolated) extrapolated++;
+      x = e.x;
+    }
+
+    expect(extrapolated / rendered).toBeGreaterThan(0.9);
+    expect(interp.underrunRate).toBeGreaterThan(0.5);
+    expect(x).toBeGreaterThan(xAtStop);
+  });
+
+  it('ONE straggler is not enough evidence to re-anchor on', () => {
+    // The re-anchor adopts the MINIMUM of the samples that landed during the
+    // error window, with no slew. With a gate of "at least one push" that is a
+    // single packet's raw offset, whatever it happens to be, and a straggler
+    // dribbling through a congested link is exactly such a packet.
+    //
+    // Profile: a healthy 20Hz stream, then a repeating 800ms stall with ONE
+    // queued packet delivered three quarters of the way through it and the rest
+    // flushed when the stall clears. Measured on the single-sample gate: it
+    // adopted offset = 640 against a true offset of 40 and then held that 600ms
+    // error for about twelve seconds while the 5% slew walked it back, for a
+    // mean rendered position error of 16 units and a 38 unit backward step.
+    const arrivals: Arrival[] = [];
+    const pose = (serverTime: number) => ({ a: { x: (100 * serverTime) / 1000, y: 0 } });
+    let serverTime = 0;
+    for (; serverTime < 3000; serverTime += 50) arrivals.push({ serverTime, receivedAt: serverTime + 40, entities: pose(serverTime) });
+    for (let cycle = 0; cycle < 10; cycle++) {
+      const stallStart = serverTime;
+      const held: number[] = [];
+      for (; serverTime < stallStart + 800; serverTime += 50) held.push(serverTime);
+      // The one packet that dribbles through mid-stall: an ordinary serverTime
+      // carrying an enormous one-way delay.
+      arrivals.push({ serverTime: held[0]!, receivedAt: stallStart + 40 + 600, entities: pose(held[0]!) });
+      held.slice(1).forEach((s, k) => arrivals.push({ serverTime: s, receivedAt: stallStart + 800 + 40 + k, entities: pose(s) }));
+      const upEnd = serverTime + 1700;
+      for (; serverTime < upEnd; serverTime += 50) arrivals.push({ serverTime, receivedAt: serverTime + 40, entities: pose(serverTime) });
+    }
+    arrivals.sort((a, b) => a.receivedAt - b.receivedAt);
+
+    const interp = new SnapshotInterpolator<string>();
+    const { track } = drive(interp, arrivals, { untilMs: 28_000, warmupMs: 28_000 });
+
+    // Thin evidence is not evidence. Keep waiting: extrapolate-then-hold is
+    // already correct while the error window holds fewer than the threshold.
+    expect(interp.reanchors).toBe(0);
+    expect(Math.min(...stepsAfter(track, 3000))).toBeGreaterThan(-1);
+  });
+
+  it('an out-of-order arrival on the re-anchor own render frame does not destroy a newer buffered frame', () => {
+    // `push()` documents out-of-order arrivals as ordinary rather than
+    // anomalous, and the re-anchor's dead-epoch cut has to agree with it. The
+    // cut used to key on the LAST arrival, so a delayed packet landing in the
+    // very render frame the re-anchor fires on made the last arrival an older
+    // stamp than a frame already buffered, and the newer frame was destroyed as
+    // if it came from a timeline the authority had left.
+    //
+    // Made visible by giving the reordered newer frame an entity that appears
+    // in NO other frame: if the cut takes the frame, the entity is never
+    // rendered at all.
+    const arrivals: Arrival[] = [];
+    for (let i = 0; i < 80; i++) arrivals.push({ serverTime: i * 50, receivedAt: i * 50 + 40, entities: { a: { x: i * 5, y: 0 } } });
+    // A permanent +1000ms one-way latency step, which strands the playhead and
+    // opens the error window.
+    for (let i = 80; i < 200; i++) arrivals.push({ serverTime: i * 50, receivedAt: i * 50 + 1040, entities: { a: { x: i * 5, y: 0 } } });
+    // The pair that straddles the re-anchor arrives newest-first, and only the
+    // newer of the two carries `b`.
+    const older = arrivals.find((x) => x.serverTime === 4150)!;
+    const newer = arrivals.find((x) => x.serverTime === 4200)!;
+    const swap = older.receivedAt;
+    older.receivedAt = newer.receivedAt + 0.5;
+    newer.receivedAt = swap;
+    newer.entities['b'] = { x: 999, y: 0 };
+    arrivals.sort((p, q) => p.receivedAt - q.receivedAt);
+
+    const interp = new SnapshotInterpolator<string>();
+    let next = 0;
+    let reanchoredAt = -1;
+    let sawBAfterReanchor = 0;
+    for (let now = 0; now <= 14_000; now += 1000 / 60) {
+      while (next < arrivals.length && arrivals[next]!.receivedAt <= now) {
+        const a = arrivals[next]!;
+        interp.push(frame(a.serverTime, a.receivedAt, a.entities));
+        next++;
+      }
+      const out = interp.sample(1 / 60, now);
+      if (reanchoredAt < 0 && interp.reanchors > 0) reanchoredAt = now;
+      if (reanchoredAt >= 0 && now > reanchoredAt && out.has('b')) sawBAfterReanchor++;
+    }
+
+    expect(interp.reanchors).toBe(1);
+    expect(sawBAfterReanchor).toBeGreaterThan(0);
+  });
+
+  it('the count cap never evicts the frame the playhead is bracketing against', () => {
+    // A hard count cap with a delay that holds the playhead well behind the
+    // newest frame, which is the shape a delivery burst produces against the
+    // default cap: the buffer wants to be longer than the cap allows while the
+    // playhead sits deep inside it. A front-splice keyed only on length takes
+    // the bracket's left edge, playback falls off the front of the buffer and
+    // pins to `frames[0]`.
+    //
+    // Measured on this profile with the naive splice: two thirds of rendered
+    // frames completely motionless, and THIRTY-ONE re-anchors, which is the
+    // symptom the `reanchors` getter's own documentation names ("a number that
+    // keeps climbing means the offset estimate is not converging"). The
+    // re-anchor eventually rescues playback, so this is not a hang, but paying
+    // for a silent eviction with a correction every half second is not the
+    // trade it looks like from inside `pruneFrames`.
+    const interp = new SnapshotInterpolator<string>({
+      bufferCap: 6,
+      minDelayMs: 300,
+      maxDelayMs: 300,
+      startDelayMs: 300,
+    });
+    const arrivals = straightLine({ ticks: 400, tickMs: 50, speed: 100, latency: () => 40 });
+    const { track } = drive(interp, arrivals, { untilMs: 20_000, warmupMs: 20_000 });
+
+    expect(interp.reanchors).toBe(0);
+    expect(stepsAfter(track, 3000).filter((d) => Math.abs(d) < 1e-9).length).toBe(0);
+  });
+
+  it('the time prune is suspended while the playhead is under suspicion, so a re-anchor never lands on an empty buffer', () => {
+    // The prune horizon is derived from the playhead, and once the error window
+    // is open this class has already stopped believing where the playhead is.
+    // On a BACKWARD serverTime step every frame from the new timeline sits below
+    // a horizon computed from the old one, so pruning against it throws each one
+    // away as it arrives and the re-anchor lands on an empty stretch.
+    //
+    // The cost is not a jump, which is why the speed and staleness measures
+    // above cannot see it: the buffer empties, `sample()` returns nothing at
+    // all, and every remote entity POPS OUT OF EXISTENCE. Measured at 50ms of
+    // total dropout on a backward step of 5000, 2000 or 1000ms, with the buffer
+    // bottoming out at a single frame against eight with the suspension.
+    const interp = new SnapshotInterpolator<string>();
+    const arrivals = serverTimeStep({ ticks: 1400, tickMs: 50, speed: 100, latencyMs: 40, stepAtTick: 200, stepMs: -5000 });
+    const { track, frameMs } = drive(interp, arrivals, { untilMs: 40_000, warmupMs: 40_000 });
+
+    expect(interp.reanchors).toBe(1);
+    expect(longestDropoutMs(track, 9000, frameMs)).toBe(0);
+  });
+
+  it('the re-anchor snaps the delay to its target rather than leaving an ease in flight', () => {
+    // The offset and the delay are both subtracted from the playhead, so a
+    // re-anchor that moves only the offset lands half a correction: the ease
+    // still in flight keeps moving the playhead for the next second, which is
+    // the discontinuity the re-anchor exists to spend ONCE. The delay estimate
+    // was never the thing that was wrong, and it rebuilds from the fresh window
+    // within a few frames anyway.
+    //
+    // Measured on a -5000ms backward step with the snap removed: a peak rendered
+    // speed of 1996 units/second on an entity whose true speed is 100, against
+    // 360 with it.
+    const interp = new SnapshotInterpolator<string>();
+    const arrivals = serverTimeStep({ ticks: 1400, tickMs: 50, speed: 100, latencyMs: 40, stepAtTick: 200, stepMs: -5000 });
+    const { track } = drive(interp, arrivals, { untilMs: 40_000, warmupMs: 40_000 });
+
+    const peak = Math.max(...stepsAfter(track, 9000).map((d) => Math.abs(d) * 60));
+    expect(peak).toBeLessThan(800);
+  });
+
+  it('a NaN nowMs cannot smuggle a re-anchor past the REANCHOR_AFTER_MS wait', () => {
+    // The guard in `sample()` is a trust boundary from the caller's side, and
+    // the failure it prevents is not the obvious one. A NaN `nowMs` stored in
+    // `localClockMs` reaches `playheadErrorSinceMs`, and every comparison
+    // against NaN is FALSE, so `localClockMs - playheadErrorSinceMs <
+    // REANCHOR_AFTER_MS` stops being a wait and becomes a pass: the 600ms of
+    // persistence that separates a wrong clock estimate from ordinary jitter is
+    // skipped, and the only remaining gate is the sample count.
+    //
+    // The profile is a +80ms one-way delay bump, which strands the playhead for
+    // about 480ms and is then absorbed by the adaptive delay with no correction
+    // needed. More than `REANCHOR_MIN_SAMPLES` frames land inside that stretch,
+    // so the timer is the only thing holding the re-anchor off. One NaN
+    // `nowMs` 300ms in (a timestamp arithmetic slip in a rAF loop) is enough
+    // to fire it without the guard.
+    const interp = new SnapshotInterpolator<string>();
+    const arrivals = straightLine({ ticks: 400, tickMs: 50, speed: 100, latency: (i) => (i < 200 ? 40 : 120) });
+
+    let next = 0;
+    let injected = false;
+    for (let now = 0; now <= 20_000; now += 1000 / 60) {
+      while (next < arrivals.length && arrivals[next]!.receivedAt <= now) {
+        const a = arrivals[next]!;
+        interp.push(frame(a.serverTime, a.receivedAt, a.entities));
+        next++;
+      }
+      const bad = !injected && now >= 10_400;
+      if (bad) injected = true;
+      interp.sample(1 / 60, bad ? Number.NaN : now);
+    }
+
+    expect(injected).toBe(true);
+    expect(interp.reanchors).toBe(0);
+  });
+
+  it('the re-anchor re-derives the playhead in the same call, so the correction is ONE step', () => {
+    // Both the offset and the delay just moved, so the playhead computed before
+    // the re-anchor describes a clock the class no longer believes. Rendering
+    // from it anyway spends the correction over two frames instead of one, and
+    // the intermediate one is a pose from neither clock.
+    //
+    // Measured on a -5000ms backward step with the recompute removed: a single
+    // 62 unit BACKWARD step, on a profile that otherwise never rewinds at all.
+    const interp = new SnapshotInterpolator<string>();
+    const arrivals = serverTimeStep({ ticks: 1400, tickMs: 50, speed: 100, latencyMs: 40, stepAtTick: 200, stepMs: -5000 });
+    const { track } = drive(interp, arrivals, { untilMs: 40_000, warmupMs: 40_000 });
+
+    expect(Math.min(...stepsAfter(track, 9000))).toBeGreaterThan(-10);
   });
 });
