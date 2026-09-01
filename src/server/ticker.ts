@@ -934,6 +934,35 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
         } else {
           clock = renewFailed(clock);
           owns = false;
+          // THE EXIT REASON IS SET HERE BECAUSE THIS BREAK IS NOT THE ONLY
+          // WAY OUT ON A LOST LEASE, AND FOR A LONG TIME IT WAS THE ONE
+          // THAT LIED. `exitReason` is initialised to 'duration', and the
+          // only other lease-loss path (the `lostLeaseExplicitly` check at
+          // the bottom of the loop, fed by the ASYNC renew in section 11)
+          // sets it properly. This one broke straight out with the
+          // initialiser still standing, so a ticker that exited after 50ms
+          // because ownership had lapsed reported `reason: 'duration'`:
+          // "I ran to my configured lifetime cap", the one exit that means
+          // everything is healthy and a successor should simply take over.
+          //
+          // WHICH OF THE TWO DETECTORS FIRES IS A SCHEDULING RACE, which is
+          // what made it look like flakiness rather than a bug. The async
+          // renew normally notices first and reports correctly; a loop
+          // stalled past the TTL (a GC pause, a loaded host, exactly the
+          // condition this guard exists for) means the synchronous guard
+          // gets there first and reported the opposite. So the reason a
+          // caller saw depended on machine load, and the case where it was
+          // WRONG was the case where the room was in the most trouble.
+          //
+          // This string is public API. `adapters/node.ts` happens to treat
+          // 'duration' and 'lease-lost' identically (both are "go again"),
+          // but `adapters/vercel.ts` returns it as the response BODY, so it
+          // is what a host branches on and what an operator counts: with
+          // this line missing, a fleet losing leases out from under its
+          // tickers reads as a fleet of healthy duration-capped handoffs.
+          // That is the same shape as every other failure in this library
+          // that cost real time, silent and flattering.
+          exitReason = 'lease-lost';
           log({ lvl: 'error', kind: 'ticker.lease-lost', room: roomId });
           break;
         }

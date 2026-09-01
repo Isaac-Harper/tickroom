@@ -218,7 +218,7 @@ describe('runTicker', () => {
       leaseRenewMs: 20,
       checkpointMs: 1000,
       statsMs: 1000,
-      maxRunMs: 5000, // must not be what ends the test; 'lease-lost' should win the race
+      maxRunMs: 5000, // must not be what ends the test
       emptyGraceMs: 5000, // the room has no players, so this must also not be what ends it
     });
 
@@ -230,9 +230,91 @@ describe('runTicker', () => {
 
     const result = await resultPromise;
     expect(result.reason).toBe('lease-lost');
+    // AND it exited on the lease rather than on the clock. Both exits used to
+    // be reachable from this setup with different reasons, so pin the one
+    // fact that separates them independently of which detector won: a
+    // duration exit cannot happen before the 5000ms cap, and this is half of
+    // it. See the next case for why the two detectors used to disagree.
+    expect(result.uptimeMs).toBeLessThan(2500);
 
     // The thief's write must still be standing: this ticker must not have
     // released (and thereby cleared) a lease it no longer owns.
+    expect(await redis.get(keys.lease)).toBe('a-thief');
+  });
+
+  /**
+   * THE SAME LOSS, SEEN BY THE OTHER DETECTOR, AND THIS IS THE CASE THAT WAS
+   * SILENTLY BROKEN.
+   *
+   * A lost lease has two independent finders inside `runTicker`, and the one
+   * that gets there first is decided by scheduling, not by the test:
+   *
+   *   (a) the ASYNC renew fired off the hot path (section 11), whose failure
+   *       sets `lostLeaseExplicitly` and is picked up by the exit check at
+   *       the bottom of the loop; and
+   *   (b) the SYNCHRONOUS pre-publish `mayPublish` guard (section 7), which
+   *       fires when ownership has already lapsed by the time an iteration
+   *       starts, i.e. when the loop itself stalled past the lease TTL.
+   *
+   * The test above cannot choose between them, so it used to be a coin flip
+   * on machine load: (a) reported 'lease-lost' and (b) broke out of the loop
+   * leaving `exitReason` on its 'duration' initialiser, so on a loaded host
+   * the assertion flipped. That was never a timing problem in the test, it
+   * was `ticker.ts` genuinely reporting a healthy duration-capped exit for a
+   * ticker that had just had the room taken away from it.
+   *
+   * This case pins (b) on its own, and it does so by ORDERING rather than by
+   * timing: breaking `eval` means the atomic renew script can never resolve
+   * at all, so path (a) can only ever land in its `.catch` (which
+   * deliberately does NOT set `lostLeaseExplicitly`, since a thrown renew is
+   * a blip and not a confirmed loss) and the synchronous guard is the ONLY
+   * finder left. No amount of scheduling delay can hand the detection back to
+   * (a). The lease is stolen as well, so this is a real loss and not just an
+   * unreachable Redis.
+   */
+  it('reports lease-lost when the SYNCHRONOUS guard is the only finder', async () => {
+    const redis = new FakeRedis();
+    const keys = roomKeys('r1', NS);
+    const runtime = makeCounterRuntime();
+
+    const resultPromise = runTicker({
+      runtime,
+      redis,
+      createSubscriber: () => redis.fork(),
+      roomId: 'r1',
+      namespace: NS,
+      leaseTtlMs: 50,
+      leaseRenewMs: 20,
+      checkpointMs: 1000,
+      statsMs: 1000,
+      maxRunMs: 5000, // must not be what ends the test
+      emptyGraceMs: 5000, // the room has no players, so this must also not be what ends it
+      log: () => {},
+    });
+
+    // Let it acquire the lease and take a few ticks. The acquire itself is
+    // already done before this timer can fire: `runTicker` runs synchronously
+    // into its `acquireLease` await, and the fake resolves on a microtask,
+    // which drains long before any timer callback.
+    await new Promise((r) => setTimeout(r, 15));
+    // BROKEN BEFORE STOLEN, AND THAT ORDER IS THE WHOLE DETERMINISM ARGUMENT.
+    // Every renew up to this instant ran against an unstolen lease and so
+    // could only ever have SUCCEEDED, and from this instant on none of them
+    // can resolve at all. There is therefore no scheduling of the two, however
+    // delayed, in which a renew reports a confirmed loss, which is the only
+    // thing that sets `lostLeaseExplicitly`. Stealing first would leave a
+    // window (theft landed, break not yet applied) in which a renew in flight
+    // could report the loss and hand detection back to path (a).
+    redis.break('eval');
+    await redis.set(keys.lease, 'a-thief', 'PX', 5000);
+
+    const result = await resultPromise;
+    expect(result.reason).toBe('lease-lost');
+    // Well inside the 5000ms duration cap, so 'duration' could not have been
+    // the honest answer either: the exit is the lease, not the clock. The
+    // bound is deliberately loose (half the cap) because it only has to rule
+    // the clock OUT, not measure how fast the guard is.
+    expect(result.uptimeMs).toBeLessThan(2500);
     expect(await redis.get(keys.lease)).toBe('a-thief');
   });
 

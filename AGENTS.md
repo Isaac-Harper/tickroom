@@ -141,6 +141,9 @@ whole timing guarantee rests on nothing in it ever awaiting.
   handlers. One `await` on a Redis round trip inside the loop and a slow network
   stretches every tick in the room.
 - Only a CONFIRMED lease renew advances ownership. See the two-clock gotcha.
+- Every exit from the tick loop names itself. `exitReason` defaults to
+  `'duration'`, so a `break` that does not set it reports a healthy
+  lifetime-capped exit for whatever actually happened. See the gotcha below.
 - A checkpoint carries a geometry digest and a mismatch starts fresh. See the
   geometry gotcha.
 - Capacity is read from ONE key (`room:{id}:stats`) by both the relay and the
@@ -201,6 +204,17 @@ publishing: two divergent simulations interleaving on one channel at 20Hz, both
 clobbering the same checkpoint. `renewFailed` returning the clock UNCHANGED is the
 fix and it looks like a no-op function, which is exactly why somebody keeps
 deleting it.
+
+EVERY `break` OUT OF THE TICK LOOP MUST SET ITS OWN `exitReason`, BECAUSE THE
+INITIALISER IS A PLAUSIBLE ANSWER. `exitReason` starts as `'duration'`, the one
+exit that means everything is fine, so a break that forgets to set it does not
+produce an obviously wrong value, it produces a reassuring one. A lost lease has
+TWO finders inside `runTicker` (the async renew's `lostLeaseExplicitly`, and the
+synchronous pre-publish `mayPublish` guard) and which one gets there first is a
+scheduling race: the synchronous one wins exactly when the loop stalled past the
+TTL, which is the condition it exists for. That path shipped with no
+`exitReason` assignment, so the SAME event reported `'lease-lost'` on an idle
+machine and `'duration'` on a loaded one. See the dated defect below.
 
 A CHECKPOINT WITHOUT A GEOMETRY DIGEST SIMULATES A DELETED WORLD FOREVER. The
 state is opaque, so a deploy that moves a wall leaves every live room restoring
@@ -354,6 +368,19 @@ false;`), which reddens four cases: the latency-step test,
 cut test. Do this again if you touch `trackPlayheadError`, because without the
 gate the mechanism fires on an ordinary outage, where there is nothing to anchor
 to and it can only make things worse.
+
+The ticker's two lease-lost exits were checked the same way, and the third
+mutation is the interesting one. Deleting `exitReason = 'lease-lost'` from the
+SYNCHRONOUS guard (section 7) reddens only
+`reports lease-lost when the SYNCHRONOUS guard is the only finder`; changing the
+ASYNC path's assignment (section 12) to `'duration'` reddens only
+`stops publishing once the lease is stolen mid-run`. Deleting
+`lostLeaseExplicitly = true` outright leaves all 35 green, because the
+synchronous guard now catches the same loss and reports the same reason, which
+is the defence in depth the fix creates rather than a hole. Doing BOTH (the
+pre-fix code with only the synchronous finder left) reproduces the original
+flake exactly, deterministically, on both cases:
+`expected 'duration' to be 'lease-lost'`.
 
 EVERY GUARD IN `interpolation.ts` NOW HAS A MUTATION THAT REDDENS IT, and the
 matrix below is the record. Re-run it after any change to that file; a green
@@ -722,6 +749,45 @@ carrying forward:
   count is left. Measured on a +80ms one-way delay bump that the adaptive delay
   absorbs on its own with no correction needed: one NaN `nowMs` 300ms in turns
   zero re-anchors into one.
+
+### Defect found by chasing a flaky test (2026-09-01)
+
+- THE SYNCHRONOUS SPLIT-BRAIN GUARD REPORTED `'duration'` FOR A LOST LEASE, and
+  it was found as a flaky unit test rather than as a bug, which is the reusable
+  part. `ticker.test.ts`'s split-brain case failed once in a full-suite run on a
+  loaded machine with `expected 'duration' to be 'lease-lost'` and passed 3/3 in
+  isolation, which reads as a test racing wall time. It was not. `runTicker`
+  detects a lost lease two independent ways: the ASYNC renew off the hot path
+  (section 11), whose confirmed failure sets `lostLeaseExplicitly` and is picked
+  up by the exit check that sets `exitReason = 'lease-lost'`; and the
+  SYNCHRONOUS pre-publish `mayPublish` guard (section 7), which fires when
+  ownership has already lapsed by the time an iteration begins. The second one
+  set `owns = false`, logged `ticker.lease-lost`, and broke out of the loop
+  WITHOUT touching `exitReason`, so it returned the `'duration'` initialiser.
+  Which finder wins is decided by scheduling, so the reported reason depended on
+  machine load, and it was wrong in exactly the case the guard exists for: a
+  loop stalled past the lease TTL by a GC pause or a loaded host. Reproduced
+  deterministically (no timing involved) by breaking `eval` on the fake so the
+  atomic renew can never resolve at all, which closes the async path (its
+  `.catch` deliberately does not set `lostLeaseExplicitly`, since a thrown renew
+  is a blip and not a confirmed loss) and leaves the synchronous guard as the
+  only finder: `{"reason":"duration","ticks":11,"uptimeMs":52}` against a
+  5000ms `maxRunMs`. Fifty-two milliseconds reported as "I ran to my configured
+  lifetime cap".
+  WHY IT MATTERED BEYOND THE TEST. `TickerResult.reason` is public API.
+  `adapters/node.ts` happens to treat `'duration'` and `'lease-lost'`
+  identically, but `adapters/vercel.ts` returns it as the response BODY, so it
+  is what a host branches on and what an operator counts. A fleet having its
+  leases taken away read as a fleet of healthy duration-capped handoffs.
+  WHY NOTHING CAUGHT IT: the existing test could not choose which finder fired,
+  so it only ever exercised the one that was already correct, and the flake was
+  the bug leaking through about once in fifty runs. A test that cannot select
+  between two implementations of the same decision is testing whichever one the
+  scheduler happens to pick. The new sibling case
+  (`reports lease-lost when the SYNCHRONOUS guard is the only finder`) selects
+  it by ORDERING, not by widening a bound, and both lease cases now also assert
+  `uptimeMs` well under the duration cap so the two exits stay distinguishable
+  independently of the string.
 
 ### Verified against a real Redis and a real socket
 
