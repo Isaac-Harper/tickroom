@@ -85,4 +85,63 @@ describe('assignRoom', () => {
     expect(result.room).toBe('lobby');
     expect(result.index).toBe(0);
   });
+
+  // A rejection (`exclude`, the room that just bounced this client) and an
+  // unrelated Redis hiccup are independent events that can and do coincide:
+  // the retry a client fires right after a bounce is exactly the kind of
+  // request that might also catch Redis mid-blip. The failure path used to
+  // ignore `exclude` entirely and always hand back instance 0, so when the
+  // two coincided the client was routed straight back to the room that just
+  // rejected it. Found by a real consumer's own hand-rolled balancer, which
+  // got this right where tickroom did not.
+  it('skips the excluded room on a Redis read error too', async () => {
+    const redis = new FakeRedis();
+    redis.break('mget');
+    const result = await assignRoom({ redis, base: 'lobby', maxPlayers: 20, exclude: 'lobby' });
+    expect(result.room).toBe('lobby~1');
+    expect(result.index).toBe(1);
+    expect(result.full).toBeUndefined();
+  });
+
+  // Degenerate case: the excluded room is the ONLY candidate (maxRooms 1),
+  // so there is nothing else to hand back. Returning the excluded room
+  // anyway is chosen deliberately over reporting `full`: this path fails
+  // OPEN by contract (a Redis outage must never manufacture a `full` result
+  // it never actually measured, since maxPlayers/capacity were never read
+  // here at all), and being bounced from a room a second time is a better
+  // outcome for the player than being told the world is full when nobody
+  // knows that. A caller that wants better than this in the one-room case
+  // needs a real capacity read, which is exactly the read that just failed.
+  it('falls back to the excluded room itself when it is the only candidate on a Redis read error', async () => {
+    const redis = new FakeRedis();
+    redis.break('mget');
+    const result = await assignRoom({ redis, base: 'lobby', maxPlayers: 20, maxRooms: 1, exclude: 'lobby' });
+    expect(result.room).toBe('lobby');
+    expect(result.index).toBe(0);
+    expect(result.full).toBeUndefined();
+  });
+
+  it('ignores a junk/foreign exclude value on a Redis read error', async () => {
+    const redis = new FakeRedis();
+    redis.break('mget');
+    const result = await assignRoom({ redis, base: 'lobby', maxPlayers: 20, exclude: 'arena' });
+    expect(result.room).toBe('lobby');
+    expect(result.index).toBe(0);
+  });
+
+  it('never reports full on a Redis read error, excluded or not', async () => {
+    const redis = new FakeRedis();
+    redis.break('mget');
+    const logged: string[] = [];
+    const withoutExclude = await assignRoom({
+      redis,
+      base: 'lobby',
+      maxPlayers: 20,
+      log: (ev) => logged.push(ev.kind),
+    });
+    const withExclude = await assignRoom({ redis, base: 'lobby', maxPlayers: 20, exclude: 'lobby' });
+    expect(withoutExclude.full).toBeUndefined();
+    expect(withExclude.full).toBeUndefined();
+    expect(logged).toContain('balancer.mget-failed');
+  });
 });

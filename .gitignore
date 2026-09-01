@@ -7,3 +7,6 @@ dist/
 
 # Local agent tooling and its scratch worktrees. Never part of the package.
 .claude/
+
+# never commit registry credentials
+.npmrc

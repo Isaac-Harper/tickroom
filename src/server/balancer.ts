@@ -73,10 +73,39 @@ export async function assignRoom(opts: BalancerOptions): Promise<BalancerResult>
     statsRaw = await redis.mget(...statsKeys);
   } catch (err) {
     log({ lvl: 'error', kind: 'balancer.mget-failed', meta: { base, error: String(err) } });
-    // Fail toward instance 0 rather than failing the join outright: packing
-    // to the lowest index is already the steady-state behaviour, and a
-    // monitoring read failing must not strand every joiner with no room at
+    // Fail toward the lowest index rather than failing the join outright:
+    // packing to the lowest index is already the steady-state behaviour, and
+    // a monitoring read failing must not strand every joiner with no room at
     // all.
+    //
+    // BUT skip `excludedIndex` here too, not just in the normal-path loop
+    // below. A rejection (the caller was just bounced from a full room,
+    // which is what `exclude` records) and an unrelated Redis hiccup are
+    // INDEPENDENT EVENTS, so they can and do coincide: the retry that
+    // follows a bounce is exactly the kind of request that might also catch
+    // Redis mid-blip. If this path ignored `exclude`, that coincidence
+    // routes the client straight back to the room that just turned it away.
+    // Callers typically bound how many times they will re-assign after a
+    // rejection, so landing on the same excluded room here can burn that
+    // whole retry budget against one instance and surface to the player as
+    // a hard "cannot join" instead of the transparent retry this option
+    // exists to provide. We cannot consult capacity on this path (the read
+    // that would tell us just failed), so "toward the lowest index" becomes
+    // "toward the lowest index that is not the one we already know is bad".
+    //
+    // This must still fail OPEN, in every sense: a Redis outage never
+    // reports `full` just because we could not measure capacity, including
+    // in the degenerate case where the excluded room is the ONLY candidate
+    // (`maxRooms === 1`, or every other instance also happens to be
+    // excluded, which cannot happen today since only one id is ever
+    // excluded but is guarded here rather than assumed). There we have
+    // nothing else to offer, so we hand back the excluded room anyway:
+    // worse than being bounced once more, but strictly better than a
+    // manufactured "full" result that was never actually measured, which
+    // would tell the caller something false about the room's capacity.
+    for (let i = 0; i < maxRooms; i++) {
+      if (i !== excludedIndex) return { room: roomIdFor(base, i), base, index: i };
+    }
     return { room: roomIdFor(base, 0), base, index: 0 };
   }
 
