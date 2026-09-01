@@ -1,0 +1,79 @@
+# Publishing a release, without a long-lived token anywhere.
+#
+# WHY THIS EXISTS. The first publish was done by hand and it was not pleasant:
+# npm now requires two-factor auth to publish, the account had none, and the
+# fallback (a granular token) has its own trap for a package that does not exist
+# yet, since a token scoped to specific packages cannot CREATE one. That is all
+# first-publish-only pain, but the token half is not: a stored NPM_TOKEN with
+# publish rights is a standing credential, and a stolen one publishes on its own
+# whereas 2FA does not. npm is actively restricting 2FA-bypass tokens for exactly
+# this reason.
+#
+# So this uses TRUSTED PUBLISHING (OIDC): npm verifies the workflow's identity
+# against GitHub directly and mints a short-lived credential for that one run.
+# Nothing to store, nothing to leak, nothing to rotate. It also stamps the
+# package with PROVENANCE, so the npm page can show which commit and workflow
+# built it.
+#
+# ONE-TIME SETUP, on npmjs.com, otherwise this fails with a 404 or 403:
+#   Package tickroom -> Settings -> Trusted publishing -> Add GitHub Actions
+#     repository:  Isaac-Harper/tickroom
+#     workflow:    release.yml
+# It cannot be configured before the package exists, which is why 0.1.0 was
+# published manually.
+#
+# TO RELEASE: bump the version in package.json, commit, then tag and push:
+#   npm version patch -m "release %s"   (or minor/major)
+#   git push --follow-tags
+# The tag is what triggers this. The guard below refuses a tag that disagrees
+# with package.json, because a mismatch publishes a version nobody meant to.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write # required for OIDC; without it npm cannot verify the runner
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      # npm 11.5.1+ is required for trusted publishing. ubuntu-latest ships an
+      # older npm with Node 22, so pin it explicitly rather than hoping.
+      - run: npm install -g npm@latest
+
+      - run: npm ci
+
+      # The gates, same as CI. A release must never be the one build nobody
+      # checked: a broken publish cannot be un-published and its version number
+      # is burned forever.
+      - run: npm run build
+      - run: npm run typecheck
+      - run: npm test
+
+      # The tag and package.json must agree. Without this, `git tag v0.2.0` on a
+      # tree still saying 0.1.9 silently republishes nothing useful, or fails
+      # deep inside npm with a confusing error.
+      - name: tag matches package.json
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "tag $GITHUB_REF_NAME implies $TAG but package.json says $PKG"
+            exit 1
+          fi
+          echo "releasing $PKG"
+
+      - run: npm publish --access public --provenance
