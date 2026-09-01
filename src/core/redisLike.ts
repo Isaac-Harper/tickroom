@@ -20,6 +20,18 @@
 // Add a method here only when a real call site needs it; a wider surface
 // just makes the fake in tests (and any alternative implementation) do more
 // work for no benefit.
+//
+// `Uint8Array`, NEVER `Buffer`, in every binary-carrying signature below.
+// `core` (and therefore `codec`, which type-only imports from it) ships to a
+// browser bundle, and `Buffer` is a Node global: a consumer with no
+// `@types/node` gets "Cannot find name 'Buffer'" the moment their compiler
+// resolves this file's declarations, even though nothing here actually runs
+// in the browser. `Uint8Array` is the DOM/ES-standard type both environments
+// already have. This costs nothing at the real call site: `Buffer` is a
+// subclass of `Uint8Array`, so `new Redis(url)` (whose `getBuffer` really
+// does return a `Buffer` at runtime) still satisfies this interface
+// structurally with zero adapter code, exactly as the paragraph above
+// promises.
 export interface RedisLike {
   get(key: string): Promise<string | null>;
 
@@ -30,13 +42,21 @@ export interface RedisLike {
    * sniff the magic bytes to tell it was compressed. Any reader of a value
    * that might be binary must use this, never `get`.
    */
-  getBuffer(key: string): Promise<Buffer | null>;
+  getBuffer(key: string): Promise<Uint8Array | null>;
 
+  // `number` is here for the same reason `Uint8Array` is: ioredis's own
+  // `set` overloads type their `value` parameter as `string | Buffer |
+  // number` (a plain `SET key 42` is a legal command), and TypeScript's
+  // method-parameter bivariance only accepts the assignment of a real
+  // `Redis` to `RedisLike` if EVERY type ioredis's `set` might be handed
+  // is assignable into this union. Dropping `number` here would make
+  // `redis = new Redis(url)` fail to type-check again, for a reason with
+  // nothing to do with `Buffer`.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  set(key: string, value: string | Buffer, ...args: any[]): Promise<any>;
+  set(key: string, value: string | number | Uint8Array, ...args: any[]): Promise<any>;
   del(...keys: string[]): Promise<number>;
   eval(script: string, numKeys: number, ...args: (string | number)[]): Promise<unknown>;
-  publish(channel: string, message: string | Buffer): Promise<number>;
+  publish(channel: string, message: string | Uint8Array): Promise<number>;
   expire(key: string, seconds: number): Promise<number>;
   hgetall(key: string): Promise<Record<string, string>>;
   hset(key: string, field: string, value: string): Promise<number>;

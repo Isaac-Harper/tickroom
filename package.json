@@ -4,6 +4,14 @@
   "description": "Authoritative realtime rooms on serverless: a leased fixed-timestep tick loop, a WebSocket relay, and Redis pub/sub as the bus.",
   "license": "MIT",
   "author": "Isaac Harper",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Isaac-Harper/tickroom.git"
+  },
+  "homepage": "https://github.com/Isaac-Harper/tickroom#readme",
+  "bugs": {
+    "url": "https://github.com/Isaac-Harper/tickroom/issues"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

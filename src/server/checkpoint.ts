@@ -72,8 +72,16 @@ export async function encodeCheckpoint(json: string): Promise<Buffer | string> {
  * instead of letting it propagate would mean inventing a SECOND corrupt-data
  * code path that has to independently agree with the first one, for no
  * benefit: a throw already reaches the one path that exists.
+ *
+ * `raw` is typed `Uint8Array` rather than `Buffer` because it flows straight
+ * from `RedisLike.getBuffer`, whose signature had to drop `Buffer` so `core`
+ * stays typeable with no `@types/node` (see the comment on `RedisLike` in
+ * `core/redisLike.ts`). This file is Node-only regardless (it imports
+ * `node:zlib`), and at runtime `raw` really is a `Buffer` every real caller
+ * hands it, so nothing about the decoding below changes; only the declared
+ * type of the parameter does.
  */
-export function decodeCheckpoint(raw: Buffer | string | null | undefined): string | null {
+export function decodeCheckpoint(raw: Uint8Array | string | null | undefined): string | null {
   if (raw === null || raw === undefined) return null;
   if (typeof raw === 'string') {
     // A bare string can only ever be plain JSON: it already went through a
@@ -100,7 +108,17 @@ export function decodeCheckpoint(raw: Buffer | string | null | undefined): strin
   if (raw.length >= 2 && raw[0] === GZIP_MAGIC_0 && raw[1] === GZIP_MAGIC_1) {
     return gunzipSync(raw).toString('utf8');
   }
-  return raw.toString('utf8');
+  // `raw` is a `Uint8Array` here, not necessarily a `Buffer` per its declared
+  // type, and `Uint8Array.prototype.toString` has no encoding-aware
+  // overload (it stringifies as comma-separated numbers, like `Array`).
+  // `gunzipSync` above is unaffected: it always returns a real `Buffer`
+  // regardless of what it was handed, so `.toString('utf8')` on ITS result
+  // needed no change. `Buffer.from(raw)` decodes the SAME UTF-8 bytes the
+  // same way regardless of whether `raw` already is a `Buffer` (the real
+  // runtime case for every caller today, where this costs one small copy)
+  // or a plain `Uint8Array`, so this is byte-for-byte the decode
+  // `raw.toString('utf8')` used to do.
+  return Buffer.from(raw).toString('utf8');
 }
 
 /**
