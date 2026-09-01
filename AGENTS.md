@@ -117,9 +117,16 @@ whole timing guarantee rests on nothing in it ever awaiting.
   protocol-skew recovery, stall observation.
 - `src/codec/bytes.ts` - `ByteWriter` / `ByteReader`. The reader is a TRUST
   BOUNDARY and bounds-checks every read.
-- `src/codec/quantize.ts` - clamping (never wrapping) quantisation helpers.
+- `src/codec/quantize.ts` - clamping (never wrapping) quantisation helpers,
+  plus `representableRange(scale, field?)`, the startup-time check that turns
+  the silent clamp into an assertion a host can fail on. `CM_SCALE` is
+  exported so a host can name the default it is comparing against.
 - `src/codec/snapshot.ts` - a batteries-included default codec plus the input
-  redundancy window.
+  redundancy window. `encodeDefaultSnapshot`/`decodeDefaultSnapshot` take an
+  optional `DefaultSnapshotCodecOptions` carrying `positionScale`, which
+  defaults to `CM_SCALE` so the existing wire is byte-identical. A pixel host
+  passes 1 (+-32767 px at 1px); both ends must agree, and the bump that
+  agreement implies belongs to the host.
 - `src/adapters/vercel.ts` - Next.js App Router route factories. Takes
   `upgradeWebSocket` by injection; imports nothing from next or @vercel/functions.
 - `src/adapters/node.ts` - the same server core behind a plain `ws` server, no
@@ -302,6 +309,25 @@ CLAMP QUANTISED VALUES, NEVER WRAP. An out-of-range value that wraps teleports a
 entity to the opposite side of the world (reads as a catastrophic desync); the
 same value clamped pins it at a boundary (reads as an entity against a wall).
 
+AND A CLAMP AGAINST A RANGE THE HOST NEVER CHOSE IS THE OTHER HALF OF THAT
+STORY. Clamping is right; clamping SILENTLY at a boundary the host did not pick
+is the trap. `encodeDefaultSnapshot` hardcoded `quantizeCm`, so the default
+codec spanned +-327.67 METRES, and this library advertises 2D games, cursor
+layers and map overlays, which routinely count in PIXELS. A pixel host got every
+entity past 327 piled against an invisible wall, with no error, no warning and
+nothing in a metric: it reads as a snapping or teleporting bug in the CLIENT,
+which is an expensive place to go looking. Fixed additively with
+`positionScale` on both halves of the default codec (defaulting to `CM_SCALE`,
+so the default wire is byte-identical and no version bump is owed) and with
+`representableRange`, which a host asserts its world bounds against ONCE at
+startup. NOT with a per-value hook on the encode path: that runs per entity per
+tick per player, and everything on that path is a bandwidth and CPU budget, not
+a convenience. The byte-identical default is pinned against a LITERAL byte array
+in `snapshot.test.ts` rather than against a re-encode, because a re-encode
+comparison agrees with itself whatever the default is and cannot fail on the one
+change it exists to catch; mutation-checked by moving the default scale to 1000
+and confirming that test reddens.
+
 ## Gates
 
 From the repo root:
@@ -323,11 +349,11 @@ real-Redis suite and skips cleanly when there is none.
 
 ## Status
 
-MEASURED ON THIS TREE, not estimated: `npx vitest run` is 504 tests across 32
+MEASURED ON THIS TREE, not estimated: `npx vitest run` is 512 tests across 32
 files, all green (with a local Redis up, so the six integration files run rather
 than skip); `npx tsc --noEmit` is clean repo-wide including `examples/`;
 `npm run build` emits `dist/` cleanly. Roughly 6,100 lines of source and 3,500 of
-tests. Per layer: core 154, server 46, client 54, codec 65.
+tests. Per layer: core 154, server 46, client 54, codec 72.
 
 - Extracted and implemented: core, server, client, codec, adapters, plus three
   examples (a 2D game, a presence layer, a plain Node host).

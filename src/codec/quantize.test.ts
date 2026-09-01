@@ -8,6 +8,8 @@ import {
   dequantizeCm,
   quantizeAngle,
   dequantizeAngle,
+  representableRange,
+  CM_SCALE,
 } from './quantize.js';
 
 describe('quantize / dequantize round trip within tolerance', () => {
@@ -63,6 +65,40 @@ describe('out-of-range values CLAMP rather than WRAP', () => {
     const once = quantize(1_000_000, 1, I16.min, I16.max);
     const twice = quantize(once, 1, I16.min, I16.max);
     expect(twice).toBe(once);
+  });
+});
+
+describe('representableRange makes the silent clamp checkable at startup', () => {
+  it('reports the centimetre default as the +-327 metre span quantizeCm documents', () => {
+    const range = representableRange(CM_SCALE);
+    expect(range.min).toBeCloseTo(-327.68, 6);
+    expect(range.max).toBeCloseTo(327.67, 6);
+  });
+
+  it('reports a pixel host at scale 1 as +-32767 whole units', () => {
+    const range = representableRange(1);
+    expect(range.min).toBe(I16.min);
+    expect(range.max).toBe(I16.max);
+  });
+
+  it('the reported bounds are exactly where quantize starts clamping', () => {
+    // The bound is only useful if it is the true edge. Just inside it must
+    // survive; just outside it must pin.
+    const range = representableRange(CM_SCALE);
+    expect(quantize(range.max, CM_SCALE, I16.min, I16.max)).toBe(I16.max);
+    expect(quantize(range.max + 1, CM_SCALE, I16.min, I16.max)).toBe(I16.max);
+    expect(quantize(range.min, CM_SCALE, I16.min, I16.max)).toBe(I16.min);
+    expect(quantize(range.min - 1, CM_SCALE, I16.min, I16.max)).toBe(I16.min);
+    expect(dequantize(quantize(range.max, CM_SCALE, I16.min, I16.max), CM_SCALE)).toBeCloseTo(
+      range.max,
+      6
+    );
+  });
+
+  it('accepts a field other than the i16 default', () => {
+    const range = representableRange(1, U16);
+    expect(range.min).toBe(U16.min);
+    expect(range.max).toBe(U16.max);
   });
 });
 

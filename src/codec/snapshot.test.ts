@@ -11,6 +11,7 @@ import {
   type DefaultSnapshot,
   type DefaultInputRecord,
 } from './snapshot.js';
+import { I16, CM_SCALE, representableRange } from './quantize.js';
 
 describe('default snapshot codec', () => {
   it('round-trips a snapshot with several entities', () => {
@@ -90,6 +91,94 @@ describe('default snapshot codec', () => {
   it('a buffer truncated right after the header throws', () => {
     const header = new ByteWriter().u8(1).u32(0).f64(0).u16(5).finish(); // claims 5 entities, has none
     expect(() => decodeDefaultSnapshot(header)).toThrow();
+  });
+});
+
+describe('the default codec carries a host-chosen position scale', () => {
+  // The snapshot behind the pinned bytes below. Kept beside them so the two
+  // are read together.
+  const pinnedSnapshot: DefaultSnapshot = {
+    version: DEFAULT_SNAPSHOT_VERSION,
+    tick: 7,
+    serverTime: 1_700_000_000_123.5,
+    entities: [
+      { id: 1, x: 1.5, y: -2.25, heading: 0.5, state: 3 },
+      { id: 2, x: 300, y: -300, heading: Math.PI, state: 0 },
+    ],
+    extra: new Uint8Array([1, 2, 3]),
+  };
+
+  it('encoding with NO options is byte-for-byte what it was before the option existed', () => {
+    // THE POINT OF PINNING A LITERAL rather than comparing against a
+    // re-encode: this test has to be able to fail. Two calls into the same
+    // encoder agree with each other whatever the default scale happens to
+    // be, so a re-encode comparison would stay green through exactly the
+    // change it exists to catch. These bytes were captured from the tree
+    // before `positionScale` was added; if they move, the default wire moved,
+    // which is a protocol break for every existing consumer whether or not
+    // anybody meant it.
+    const expected = [
+      1, 7, 0, 0, 0, 0, 184, 135, 86, 254, 188, 120, 66, 2, 0, 1, 0, 150, 0, 31, 255, 95, 20, 3, 2,
+      0, 48, 117, 208, 138, 0, 128, 0, 3, 0, 1, 2, 3,
+    ];
+    expect(Array.from(encodeDefaultSnapshot(pinnedSnapshot))).toEqual(expected);
+    // Passing the default explicitly must also be a no-op on the wire.
+    expect(Array.from(encodeDefaultSnapshot(pinnedSnapshot, { positionScale: CM_SCALE }))).toEqual(
+      expected
+    );
+  });
+
+  it('a pixel host at scale 1 round-trips a position the metre default would destroy', () => {
+    // x = 5000 is an ordinary coordinate in a 2D game measured in pixels and
+    // is fifteen times past the far edge of what the centimetre default can
+    // represent. This is the whole defect: at the default it clamps to
+    // 327.67 with no error of any kind, and the entity parks itself against
+    // an invisible wall.
+    const snap: DefaultSnapshot = {
+      version: DEFAULT_SNAPSHOT_VERSION,
+      tick: 1,
+      serverTime: 0,
+      entities: [{ id: 1, x: 5000, y: -4200, heading: 0.25, state: 2 }],
+    };
+
+    const pixels = decodeDefaultSnapshot(encodeDefaultSnapshot(snap, { positionScale: 1 }), {
+      positionScale: 1,
+    });
+    expect(pixels.entities[0].x).toBeCloseTo(5000, 6);
+    expect(pixels.entities[0].y).toBeCloseTo(-4200, 6);
+    expect(pixels.entities[0].heading).toBeCloseTo(0.25, 3);
+    expect(pixels.entities[0].state).toBe(2);
+
+    // The same snapshot through the default, for contrast: silently pinned.
+    const metres = decodeDefaultSnapshot(encodeDefaultSnapshot(snap));
+    expect(metres.entities[0].x).toBeCloseTo(327.67, 2);
+    expect(metres.entities[0].y).toBeCloseTo(-327.68, 2);
+  });
+
+  it('a value past the configured range still CLAMPS and never wraps, at either scale', () => {
+    // The existing invariant, pinned at the new scale as well as the old: an
+    // out-of-range value must pin at the boundary it already nearly reached,
+    // never reappear at the opposite edge of the world.
+    const far: DefaultSnapshot = {
+      version: DEFAULT_SNAPSHOT_VERSION,
+      tick: 1,
+      serverTime: 0,
+      entities: [{ id: 1, x: 1_000_000, y: -1_000_000 }],
+    };
+
+    const atDefault = decodeDefaultSnapshot(encodeDefaultSnapshot(far)).entities[0];
+    expect(atDefault.x).toBeCloseTo(representableRange(CM_SCALE).max, 6);
+    expect(atDefault.y).toBeCloseTo(representableRange(CM_SCALE).min, 6);
+    expect(atDefault.x).toBeGreaterThan(0);
+    expect(atDefault.y).toBeLessThan(0);
+
+    const atPixels = decodeDefaultSnapshot(encodeDefaultSnapshot(far, { positionScale: 1 }), {
+      positionScale: 1,
+    }).entities[0];
+    expect(atPixels.x).toBe(I16.max);
+    expect(atPixels.y).toBe(I16.min);
+    expect(atPixels.x).toBeGreaterThan(0);
+    expect(atPixels.y).toBeLessThan(0);
   });
 });
 

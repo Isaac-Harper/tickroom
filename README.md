@@ -268,7 +268,16 @@ Each of these cost real production time to learn. They are documented at length 
 
 **Never freeze a remote entity on interpolation underrun.** Extrapolate for up to 150ms. A frozen entity that then teleports reads far worse than one that drifts and is corrected, and this is the single rule most likely to be optimised away by someone who has not watched it happen.
 
-**`quantizeCm` speaks METRES, and a 2D host usually does not.** The helper packs a position into a centimetre-precision `i16`, which spans **+-327.67 metres**, and out-of-range values CLAMP rather than wrap. Hand it pixels or screen coordinates and everything past 327.67 pins silently at the boundary, which reads as every distant entity piled up against an invisible wall rather than as an encoding error. Either scale your world into metres before encoding, or use `quantize(v, scale, I16.min, I16.max)` directly with a scale that covers your real range: at a scale of 1 an `i16` spans +-32,767 units, at 10 it spans +-3,276.7. Pick the smallest field that covers your world plus headroom; the scale is on the wire, so changing it later is a protocol break.
+**The default codec speaks METRES, and a 2D host usually does not.** `encodeDefaultSnapshot` packs each position into an `i16` at centimetre precision by default, which spans **+-327.67 metres**, and out-of-range values CLAMP rather than wrap. Hand it pixels or screen coordinates and everything past 327.67 pins silently at the boundary, which reads as every distant entity piled up against an invisible wall rather than as an encoding error. Set the scale instead: `encodeDefaultSnapshot(snap, { positionScale: 1 })` and the matching `decodeDefaultSnapshot(buf, { positionScale: 1 })` give a pixel host **+-32,767 pixels at 1px resolution**. Then assert your world fits, ONCE at startup, because the clamp is the only other signal you will ever get:
+
+```ts
+import { representableRange } from 'tickroom/codec';
+
+const range = representableRange(POSITION_SCALE); // { min, max }, in your units
+if (WORLD_MAX_X > range.max) throw new Error('world does not fit the wire');
+```
+
+The scale is not on the wire, so encoder and decoder must agree, and changing it changes what the bytes MEAN while moving no byte: that is a protocol version bump, and it is yours to make (the version byte is already in the frame). Pick the smallest field that covers your world plus headroom.
 
 **Re-send the last few inputs in every packet.** The playout buffer's push is duplicate-overwriting and out-of-order safe, so re-sends are free, and a lost packet stops mattering.
 

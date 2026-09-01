@@ -6,7 +6,7 @@
 // from.
 import type { ClientInput } from '../core/index.js';
 import { ByteWriter, ByteReader, CodecError } from './bytes.js';
-import { quantize, dequantize, quantizeCm, dequantizeCm, quantizeAngle, dequantizeAngle } from './quantize.js';
+import { quantize, dequantize, quantizeAngle, dequantizeAngle, CM_SCALE, I16 } from './quantize.js';
 
 export interface CodecEntity {
   id: number;
@@ -29,6 +29,38 @@ export interface DefaultSnapshot {
 
 export const DEFAULT_SNAPSHOT_VERSION = 1;
 
+export interface DefaultSnapshotCodecOptions {
+  /**
+   * Units per integer step for the two position fields, i.e. what one `i16`
+   * count MEANS in the host's world. Defaults to `CM_SCALE` (100), which
+   * reads the `x`/`y` on `CodecEntity` as METRES and spans +-327.67m at 1cm
+   * resolution.
+   *
+   * A HOST WHOSE COORDINATES ARE NOT METRES MUST SET THIS. Pixels and screen
+   * units are the common case (this library is aimed at 2D games, cursor
+   * layers and map overlays, and those rarely count in metres), and at the
+   * default scale everything past 327.67 CLAMPS to the boundary: entities
+   * pile up against a wall the host never placed, with no error, no warning
+   * and nothing in a metric to see. A pixel host wants `positionScale: 1`,
+   * which is +-32767 pixels at 1px resolution. Pass the same value to
+   * `representableRange` at startup and assert your world bounds fit, because
+   * that assertion is the only signal this ever produces.
+   *
+   * THE ENCODER AND THE DECODER MUST AGREE, and disagreement is silent:
+   * neither the scale nor the range is on the wire, so a decoder reading at
+   * 100 what an encoder wrote at 1 recovers a world 100x too small rather
+   * than failing. Changing this therefore changes what the BYTES MEAN while
+   * moving no byte at all, which by this repo's own rule is a protocol
+   * version bump (see `docs/ARCHITECTURE.md`, and the invariant in
+   * `AGENTS.md`: a wire change bumps the version when it changes MEANING, not
+   * only when it changes SHAPE). The version byte is already in the frame and
+   * `DEFAULT_SNAPSHOT_VERSION` deliberately does NOT move for this, because
+   * the default wire is unchanged and only the HOST knows it picked a
+   * different scale: owning that bump is the host's job.
+   */
+  positionScale?: number;
+}
+
 /**
  * Wire layout, all little-endian (see `bytes.ts`):
  *
@@ -43,7 +75,11 @@ export const DEFAULT_SNAPSHOT_VERSION = 1;
  * anyway, trigger a client reload) is a policy call that belongs to the
  * caller, not to the codec.
  */
-export function encodeDefaultSnapshot(s: DefaultSnapshot): Uint8Array {
+export function encodeDefaultSnapshot(
+  s: DefaultSnapshot,
+  opts?: DefaultSnapshotCodecOptions
+): Uint8Array {
+  const scale = opts?.positionScale ?? CM_SCALE;
   const w = new ByteWriter();
   w.u8(s.version);
   w.u32(s.tick);
@@ -51,8 +87,8 @@ export function encodeDefaultSnapshot(s: DefaultSnapshot): Uint8Array {
   w.u16(s.entities.length);
   for (const e of s.entities) {
     w.u16(e.id);
-    w.i16(quantizeCm(e.x));
-    w.i16(quantizeCm(e.y));
+    w.i16(quantize(e.x, scale, I16.min, I16.max));
+    w.i16(quantize(e.y, scale, I16.min, I16.max));
     w.u16(quantizeAngle(e.heading ?? 0));
     w.u8(e.state ?? 0);
   }
@@ -71,8 +107,15 @@ export function encodeDefaultSnapshot(s: DefaultSnapshot): Uint8Array {
  * from garbage bytes, or from whatever the next field in the buffer happened
  * to be, which is a worse failure than an exception a caller can catch and
  * treat as "drop this snapshot".
+ *
+ * `positionScale` must MATCH the one the encoder used. Nothing on the wire
+ * records it, so a mismatch is silent: see `DefaultSnapshotCodecOptions`.
  */
-export function decodeDefaultSnapshot(buf: ArrayBuffer | Uint8Array): DefaultSnapshot {
+export function decodeDefaultSnapshot(
+  buf: ArrayBuffer | Uint8Array,
+  opts?: DefaultSnapshotCodecOptions
+): DefaultSnapshot {
+  const scale = opts?.positionScale ?? CM_SCALE;
   const r = new ByteReader(buf);
   const version = r.u8();
   const tick = r.u32();
@@ -81,8 +124,8 @@ export function decodeDefaultSnapshot(buf: ArrayBuffer | Uint8Array): DefaultSna
   const entities: CodecEntity[] = [];
   for (let i = 0; i < entityCount; i++) {
     const id = r.u16();
-    const x = dequantizeCm(r.i16());
-    const y = dequantizeCm(r.i16());
+    const x = dequantize(r.i16(), scale);
+    const y = dequantize(r.i16(), scale);
     const heading = dequantizeAngle(r.u16());
     const state = r.u8();
     entities.push({ id, x, y, heading, state });

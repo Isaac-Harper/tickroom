@@ -36,13 +36,53 @@ export function dequantize(q: number, scale: number): number {
 export const I16 = { min: -32768, max: 32767 } as const;
 export const U16 = { min: 0, max: 65535 } as const;
 
-// One metre = 100 centimetres. A signed i16 at this scale spans -327.67m to
-// +327.67m, which covers essentially any game world's play area at a
-// precision (1cm) far finer than a player can perceive as jitter, for 2 bytes
-// per axis instead of 4 or 8 for a raw float.
-const CM_SCALE = 100;
+/**
+ * The world-unit range a given `scale` can represent in a given integer
+ * field, i.e. the exact interval outside which `quantize` starts CLAMPING.
+ *
+ * THIS EXISTS SO THE CLAMP CAN BE LOUD. Clamping is the right behaviour (see
+ * `quantize`) but it is silent by construction: an encoder handed a value
+ * past the boundary emits a perfectly well-formed snapshot with the wrong
+ * number in it, and the only symptom is entities piling up against a wall
+ * that is nowhere in the host's world definition. That reads as a snapping or
+ * teleporting bug in the client, which is an expensive thing to chase. Call
+ * this ONCE at startup with the scale you are encoding at and assert your
+ * world's real bounds fit inside it, so a host whose coordinates are not
+ * metres finds out at boot rather than in production:
+ *
+ * ```ts
+ * const range = representableRange(1); // { min: -32768, max: 32767 }
+ * if (worldWidth > range.max) throw new Error('world does not fit the wire');
+ * ```
+ *
+ * Deliberately NOT a hook on the encode path. A per-value callback or counter
+ * there runs once per entity per tick per player, which is a bandwidth and
+ * CPU budget rather than a convenience; the question "does my world fit"
+ * only has one answer per deploy, so it is asked once.
+ */
+export function representableRange(
+  scale: number,
+  field: { min: number; max: number } = I16
+): { min: number; max: number } {
+  return { min: dequantize(field.min, scale), max: dequantize(field.max, scale) };
+}
 
-/** Metres to centimetre-precision `i16`. Range is +-327.67m; values further out clamp to that boundary rather than wrapping (see `quantize`). */
+// One metre = 100 centimetres. A signed i16 at this scale spans -327.68m to
+// +327.67m at a precision (1cm) far finer than a player can perceive as
+// jitter, for 2 bytes per axis instead of 4 or 8 for a raw float.
+//
+// THAT RANGE IS A CLAIM ABOUT METRES AND NOTHING ELSE. It covers essentially
+// any game world's play area measured in metres, and it is far too small for
+// a host whose coordinates are PIXELS or screen units, where 327 is a corner
+// of the first screen rather than the far edge of the map. Such a host must
+// not reach for `quantizeCm` at all: pass `positionScale` to
+// `encodeDefaultSnapshot`/`decodeDefaultSnapshot` (a pixel host wants 1, for
+// +-32767 pixels at 1px resolution), or call `quantize` directly with its own
+// scale, and check the result of `representableRange` against its world
+// bounds at startup.
+export const CM_SCALE = 100;
+
+/** Metres to centimetre-precision `i16`. Range is +-327.67m; values further out clamp to that boundary rather than wrapping (see `quantize`). NOTE THE UNIT: a pixel-coordinate host wants `positionScale` on the default codec, not this. */
 export function quantizeCm(metres: number): number {
   return quantize(metres, CM_SCALE, I16.min, I16.max);
 }
