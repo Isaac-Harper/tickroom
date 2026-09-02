@@ -244,6 +244,86 @@ describe('checkAdmission', () => {
     });
   });
 
+  // THE PER-COMMAND ERRORS, WHICH USED TO BE DISCARDED. A pipeline resolves
+  // with a [error, reply] pair per command and does NOT reject when one of
+  // them fails, so a broken ZCARD arrived as `undefined`, slid past the
+  // `typeof === 'number'` check, and turned the per-user socket cap off for
+  // that admission with nothing said anywhere. The posture stays fail-OPEN
+  // (refusing during a Redis blip locks users out of a healthy deployment);
+  // what changed is that the caller is now told.
+  describe('the socket cap fails open OBSERVABLY, never silently', () => {
+    async function overSubscribedRedis(): Promise<FakeRedis> {
+      const redis = new FakeRedis();
+      const keys = roomKeys('r1', NS);
+      await redis.set(keys.stats, JSON.stringify({ players: 1 }));
+      for (let i = 0; i < 6; i++) {
+        await redis.zadd(`${NS}:conns:d.abc`, Date.now(), `conn-${i}`);
+      }
+      return redis;
+    }
+
+    const admissionFor = (redis: FakeRedis) =>
+      checkAdmission({
+        redis,
+        roomId: 'r1',
+        pid: 'newcomer',
+        subject: 'd.abc',
+        maxPlayers: 20,
+        namespace: NS,
+        maxSocketsPerSubject: 6,
+      });
+
+    it('CONTROL: with the pipeline healthy the cap refuses and reports itself evaluated', async () => {
+      // Without this the two cases below would pass just as well against a
+      // function that never enforces the cap at all.
+      const result = await admissionFor(await overSubscribedRedis());
+      expect(result).toMatchObject({ admit: false, reason: 'conn-limit', socketCapEvaluated: true });
+    });
+
+    it('a broken ZCARD admits (never a lockout) and says the cap was NOT evaluated', async () => {
+      const redis = await overSubscribedRedis();
+      redis.break('zcard');
+      const result = await admissionFor(redis);
+      expect(result.admit).toBe(true);
+      expect(result.socketCapEvaluated).toBe(false);
+    });
+
+    it('a broken stale-entry prune counts too, because the count it leaves behind reads HIGH', async () => {
+      // The prune is what removes members belonging to sockets that are long
+      // gone. Skip it and the count over-reports, which errs toward refusing
+      // a legitimate reconnect: a decision made on data known to be stale in
+      // the refusing direction is not one this function will make.
+      const redis = await overSubscribedRedis();
+      redis.break('zremrangebyscore');
+      const result = await admissionFor(redis);
+      expect(result.admit).toBe(true);
+      expect(result.socketCapEvaluated).toBe(false);
+    });
+
+    it('a whole-pipeline failure reports it too, not only a single broken command', async () => {
+      const redis = await overSubscribedRedis();
+      redis.break('pipeline');
+      const result = await admissionFor(redis);
+      expect(result).toMatchObject({ admit: true, socketCapEvaluated: false });
+    });
+
+    it('a room-full refusal still carries an honest cap reading', async () => {
+      // `full` is decided before the cap is consulted, so the field has to
+      // describe what the pipeline actually managed rather than defaulting.
+      const redis = new FakeRedis();
+      await redis.set(roomKeys('r1', NS).stats, JSON.stringify({ players: 20 }));
+      const result = await checkAdmission({
+        redis,
+        roomId: 'r1',
+        pid: 'newcomer',
+        subject: 'd.abc',
+        maxPlayers: 20,
+        namespace: NS,
+      });
+      expect(result).toMatchObject({ admit: false, reason: 'full', socketCapEvaluated: true });
+    });
+  });
+
   // TR-17, the other half: the rejoin probe is `hexists`, not `hgetall`.
   it('a pid naming an inherited object property is not mistaken for a rejoin', async () => {
     // The `hgetall` version answered this from a plain JS object, where a

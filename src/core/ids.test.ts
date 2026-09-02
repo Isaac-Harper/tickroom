@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { baseOf, MAX_ROOMS_PER_BASE, normalizeRoomId, parseRoomId, roomIdFor, roomKeys } from './ids.js';
+import { baseOf, MAX_ROOMS_PER_BASE, normalizeBase, normalizeRoomId, parseRoomId, roomIdFor, roomKeys } from './ids.js';
 
 const ROOMS = new Set(['lobby', 'arena', 'park']);
 const isValidBase = (b: string): boolean => ROOMS.has(b);
@@ -209,5 +209,77 @@ describe('normalizeRoomId: the trust boundary', () => {
     expect(() => normalizeRoomId(null as any, { isValidBase, fallback: FALLBACK })).not.toThrow();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     expect(normalizeRoomId(null as any, { isValidBase, fallback: FALLBACK })).toBe(FALLBACK);
+  });
+});
+
+describe('normalizeBase: the trust boundary for a BASE, which is not a room id', () => {
+  // THE REGISTRY MUST RECOGNISE THE DIRTY VALUE IN EVERY CASE BELOW, or the
+  // test says nothing about the sanitiser. That is the exact mistake the
+  // `normalizeRoomId` table above already documents: every dirty case there
+  // ALSO failed `isValidBase`, so the refusal it observed was the registry's
+  // and deleting the character filter outright left the whole group green.
+  // `isValidBase` is HOST-SUPPLIED and this module's own comment treats it as
+  // something that gets written wrong, so it can never be the thing under
+  // test here.
+  const DIRTY = [
+    ['a:b', 'a colon, which would smuggle an extra segment into every room key built from this base'],
+    ['a*b', 'a Redis glob wildcard, so a KEYS/SCAN pattern is never constructible from a query param'],
+    ['a b', 'an ASCII space'],
+    ['a\nb', 'a newline, which is log injection'],
+    ['a\x00b', 'a NUL byte'],
+    ['a\x1bb', 'an ESC, i.e. a terminal escape sequence in an operator tmux session'],
+    ['a\x9fb', 'a C1 control byte'],
+    ['a~1', 'a tilde: a base is a POOL, and roomIdFor would compose this into a~1~3 that parseRoomId cannot read back'],
+    ['constructor', 'a prototype-chain property name, which a bare `raw in WORLDS` registry would wave through'],
+    ['__proto__', 'a prototype-chain property name'],
+    ['toString', 'a prototype-chain property name'],
+  ] as const;
+  const recognisesEverything = (): boolean => true;
+
+  it.each(DIRTY)('refuses %j (%s), with a registry that recognises it', (raw) => {
+    expect(normalizeBase(raw, { isValidBase: recognisesEverything })).toBeNull();
+  });
+
+  it('CONTROL: the same all-accepting registry passes a clean base straight through', () => {
+    // Without this, the group above would pass equally well against a
+    // function that returned null for absolutely everything.
+    expect(normalizeBase('ab', { isValidBase: recognisesEverything })).toBe('ab');
+  });
+
+  it('refuses the empty string and anything past the length cap, registry notwithstanding', () => {
+    expect(normalizeBase('', { isValidBase: recognisesEverything })).toBeNull();
+    expect(normalizeBase('a'.repeat(64), { isValidBase: recognisesEverything })).toBe('a'.repeat(64));
+    expect(normalizeBase('a'.repeat(65), { isValidBase: recognisesEverything })).toBeNull();
+  });
+
+  it('still refuses a base the registry does not recognise', () => {
+    expect(normalizeBase('nope', { isValidBase })).toBeNull();
+    expect(normalizeBase('arena', { isValidBase })).toBe('arena');
+  });
+
+  it('never throws on non-string-shaped input smuggled past the type system', () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(() => normalizeBase(null as any, { isValidBase })).not.toThrow();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(normalizeBase(undefined as any, { isValidBase })).toBeNull();
+  });
+
+  it('returns null rather than a fallback, so a hostile base is REFUSED and not silently reassigned', () => {
+    // The balancer route answers 400 on this. Handing back some default room
+    // would turn an attack on a Redis key name into a quiet redirect, and the
+    // operator would never see it.
+    expect(normalizeBase('a:b', { isValidBase: recognisesEverything })).toBeNull();
+  });
+
+  it('is the ONE implementation of the base rules, shared with normalizeRoomId', () => {
+    // Both entry points must refuse the same base for the same reason, or
+    // the balancer route and the relay route disagree about what a room may
+    // be called. Measured rather than asserted: the same dirty values, run
+    // through the room-id door with a registry that recognises them.
+    const recognises = { isValidBase: recognisesEverything, fallback: FALLBACK };
+    for (const [raw] of DIRTY) {
+      if (raw.includes('~')) continue; // parseRoomId owns the suffix grammar
+      expect(normalizeRoomId(raw, recognises)).toBe(FALLBACK);
+    }
   });
 });

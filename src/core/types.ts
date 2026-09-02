@@ -312,7 +312,21 @@ export interface RoomStats {
   /** Measured against real wall time between flushes, never assumed. A stalled loop is exactly what this exists to expose. */
   tickHz: number;
   uptimeS: number;
+  /**
+   * Snapshots whose `PUBLISH` the bus CONFIRMED, counted when the publish
+   * resolves rather than when it is issued. Counting attempts is what let a
+   * room with a dead bus report a healthy publish rate; see `publishFails`,
+   * which is the other half and is meaningless read on its own.
+   */
   publishes: number;
+  /**
+   * Snapshots whose `PUBLISH` was REJECTED. Nothing else in this payload can
+   * stand in for it: a room publishing nothing at all and a room publishing
+   * everything successfully differ only in `publishes` versus `publishFails`,
+   * because a failing publish costs no bytes, produces no latency sample and
+   * moves neither the tick rate nor the player count.
+   */
+  publishFails: number;
   /** Envelopes shed by backpressure. */
   dropped: number;
   /** Playout consume misses. The single most alert-worthy number here. */
@@ -330,6 +344,7 @@ export interface RoomStats {
    * back together to save a field.
    */
   unknownEnvelopes: number;
+  /** Bytes of CONFIRMED publishes only, on the same counted-on-success rule as `publishes`: bytes that never left the process are not bandwidth. */
   bytesPublished: number;
   /**
    * `bytesPublished * players`. Every client socket holds its own Redis
@@ -337,9 +352,16 @@ export interface RoomStats {
    * That fan-out, not command count, is what a managed Redis plan bills.
    */
   bytesDelivered: number;
-  cadence: Percentiles;
-  publishAwait: Percentiles;
-  serverInternal: Percentiles;
+  /**
+   * `null` when the window held no samples at all, which is NOT the same as a
+   * window of zeros and must never be flattened into one: for a latency
+   * distribution, zero is the best possible reading, so a room that published
+   * nothing would otherwise report the healthiest `publishAwait` in the
+   * fleet. See `percentiles` in `core/metrics.ts`.
+   */
+  cadence: Percentiles | null;
+  publishAwait: Percentiles | null;
+  serverInternal: Percentiles | null;
   at: number;
   build?: string;
   /**

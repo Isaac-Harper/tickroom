@@ -611,6 +611,37 @@ export interface AdmissionResult {
    */
   connId: string;
   connKey: string;
+  /**
+   * False when the per-user socket cap could NOT be evaluated on this
+   * attempt, i.e. the connection was let through WITHOUT that cap having
+   * been applied. `admit: true` on its own does not say which of those two
+   * things happened, and the difference matters.
+   *
+   * THE CAP DEGRADES SILENTLY OTHERWISE, DURING A REDIS FAULT, WHICH IS
+   * EXACTLY WHEN IT IS LOAD BEARING. A `pipeline().exec()` resolves with a
+   * `[error, reply]` pair PER COMMAND and does not reject when one of them
+   * fails, so a `ZCARD` that errored used to arrive here as `undefined`,
+   * slide past a `typeof === 'number'` check, and disable the cap for that
+   * admission with nothing said anywhere. That cap is not a nuisance
+   * control: every socket holds its own Redis subscriber connection, so one
+   * client opening sockets without limit can exhaust a managed plan's
+   * concurrent connection ceiling and take the ROOM TICKER's subscriber
+   * down with it, which is a total outage rather than a personal one.
+   *
+   * FAILING OPEN IS STILL THE RIGHT ANSWER and this field is not a step
+   * toward changing it. Failing closed would lock every user out of a
+   * healthy deployment over a Redis blip, which is worse than the thing
+   * being prevented. What was wrong was failing open INVISIBLY. Log it,
+   * meter it, or shed load on it; a run of these is the signal that the
+   * cap is not currently enforcing anything.
+   *
+   * The stale-entry prune counts too, not only the count itself. Without
+   * it the set still holds members for sockets that are long gone, so the
+   * count reads high and would refuse a legitimate reconnect: a decision
+   * made on data known to be stale in the REFUSING direction is not one
+   * this function is willing to make.
+   */
+  socketCapEvaluated: boolean;
 }
 
 const DEFAULT_MAX_SOCKETS_PER_SUBJECT = 6;
@@ -690,6 +721,15 @@ export async function checkAdmission(opts: AdmissionOptions): Promise<AdmissionR
     const rejoinRaw = results[1]?.[1];
     const socketCount = results[3]?.[1] as number;
 
+    // THE PER-COMMAND ERRORS, READ RATHER THAN DISCARDED. `exec()` resolves
+    // with a `[error, reply]` pair per command and does NOT reject when one
+    // of them fails, so everything above is a reply that may never have
+    // happened. See `AdmissionResult.socketCapEvaluated` for what that cost
+    // and why the answer is to report it rather than to start refusing.
+    const pruneErr = results[2]?.[0] ?? null;
+    const countErr = results[3]?.[0] ?? null;
+    const socketCapEvaluated = pruneErr === null && countErr === null && typeof socketCount === 'number';
+
     // ioredis answers HEXISTS with a number; accept the string form too, so
     // an alternative `RedisLike` that returns raw protocol replies is not
     // silently read as "not present" (which would refuse every rejoin into
@@ -707,16 +747,18 @@ export async function checkAdmission(opts: AdmissionOptions): Promise<AdmissionR
         }
       }
       if (players >= maxPlayers) {
-        return { admit: false, reason: 'full', connId, connKey };
+        return { admit: false, reason: 'full', connId, connKey, socketCapEvaluated };
       }
     }
 
-    if (typeof socketCount === 'number' && socketCount >= maxSocketsPerSubject) {
-      return { admit: false, reason: 'conn-limit', connId, connKey };
+    if (socketCapEvaluated && socketCount >= maxSocketsPerSubject) {
+      return { admit: false, reason: 'conn-limit', connId, connKey, socketCapEvaluated };
     }
 
-    return { admit: true, connId, connKey };
+    return { admit: true, connId, connKey, socketCapEvaluated };
   } catch {
-    return { admit: true, connId, connKey };
+    // The whole pipeline failed rather than one command in it, so nothing was
+    // evaluated at all. Same posture, same field.
+    return { admit: true, connId, connKey, socketCapEvaluated: false };
   }
 }

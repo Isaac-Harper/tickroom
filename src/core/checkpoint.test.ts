@@ -4,7 +4,7 @@
 // builtin at all, because it covers a module the core barrel exports and the
 // core barrel is bundled for the browser (see `src/client/bundling.test.ts`).
 import { describe, expect, it } from 'vitest';
-import { graceMsFromCheckpoint, packCheckpoint, unpackCheckpoint } from './checkpoint.js';
+import { CHECKPOINT_VERSION, graceMsFromCheckpoint, inspectCheckpoint, packCheckpoint, unpackCheckpoint } from './checkpoint.js';
 import type { CheckpointEnvelope } from './types.js';
 
 function envelope(overrides: Partial<CheckpointEnvelope> = {}): CheckpointEnvelope {
@@ -49,6 +49,73 @@ describe('packCheckpoint / unpackCheckpoint', () => {
     expect(unpackCheckpoint('[]')).toBeNull();
     expect(unpackCheckpoint('42')).toBeNull();
     expect(unpackCheckpoint('"hello"')).toBeNull();
+  });
+});
+
+describe('the version check, which used to be documented and not performed', () => {
+  // THE FAILURE THIS PREVENTS IS THE GEOMETRY-DIGEST ONE, REACHED THROUGH A
+  // DIFFERENT DOOR. A checkpoint whose `v` this build does not implement is
+  // one it cannot reason about, and restoring it anyway means the room keeps
+  // simulating something the deployment no longer defines, every successor
+  // faithfully restores the same bytes, and the write that follows refreshes
+  // the key's TTL so it never ages out. Silent, permanent, and invisible in
+  // every metric, because the room ticks at a healthy rate throughout.
+
+  it('refuses a NEWER version, which this build cannot know the fields of', () => {
+    const json = packCheckpoint(envelope({ v: CHECKPOINT_VERSION + 1 }));
+    expect(unpackCheckpoint(json)).toBeNull();
+    expect(inspectCheckpoint(json)).toEqual({
+      ok: false,
+      reason: 'version',
+      foundVersion: CHECKPOINT_VERSION + 1,
+    });
+  });
+
+  it('refuses an OLDER version too, which is the dangerous direction because it PARSES', () => {
+    // Every field is present and every type checks out, so nothing else in
+    // this module would have stopped it: an envelope from a version whose
+    // `tick` counted something different, or whose `body` meant something
+    // different, is restored in full and simulated happily.
+    const json = packCheckpoint(envelope({ v: CHECKPOINT_VERSION - 1 }));
+    expect(unpackCheckpoint(json)).toBeNull();
+    expect(inspectCheckpoint(json)).toEqual({
+      ok: false,
+      reason: 'version',
+      foundVersion: CHECKPOINT_VERSION - 1,
+    });
+  });
+
+  it('CONTROL: the current version still round-trips, so the refusal is not blanket', () => {
+    const env = envelope({ v: CHECKPOINT_VERSION, geom: 'abc' });
+    expect(unpackCheckpoint(packCheckpoint(env))).toEqual(env);
+  });
+
+  it('reports the version BEFORE the field types, so a dropped field reads as the version change it is', () => {
+    // A version that renamed or removed a field this one requires would
+    // otherwise be reported as 'malformed', which sends an operator looking
+    // for corruption instead of at the deploy that just went out.
+    const json = JSON.stringify({ v: CHECKPOINT_VERSION + 1, tick: 5 });
+    expect(inspectCheckpoint(json)).toMatchObject({ reason: 'version', foundVersion: CHECKPOINT_VERSION + 1 });
+  });
+
+  it('a version that is not a number at all is malformed, not a version change', () => {
+    expect(inspectCheckpoint(JSON.stringify({ ...envelope(), v: 'one' }))).toMatchObject({ reason: 'malformed' });
+  });
+
+  it('distinguishes every reason a start-fresh can happen', () => {
+    // The whole point of the discriminator: "there was nothing there" and
+    // "there was something this build cannot read" produce the identical
+    // fresh room and are completely different events.
+    expect(inspectCheckpoint(null)).toMatchObject({ reason: 'absent' });
+    expect(inspectCheckpoint('not json{{')).toMatchObject({ reason: 'unparseable' });
+    expect(inspectCheckpoint('[]')).toMatchObject({ reason: 'malformed' });
+    expect(inspectCheckpoint(JSON.stringify({ ...envelope(), tick: 'nope' }))).toMatchObject({ reason: 'malformed' });
+    expect(inspectCheckpoint(packCheckpoint(envelope({ v: 99 })))).toMatchObject({ reason: 'version' });
+  });
+
+  it('graceMsFromCheckpoint reads 0 through the same refusal, never a grace off a version it cannot parse', () => {
+    const json = packCheckpoint(envelope({ v: 99, tick: 100, graceUntilTick: 200 }));
+    expect(graceMsFromCheckpoint(json, 50, 500)).toBe(0);
   });
 });
 

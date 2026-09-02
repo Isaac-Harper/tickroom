@@ -1100,6 +1100,154 @@ describe('runTicker: runtime contract', () => {
     expect(seen).toEqual([{ name: 'force-phase', data: { phase: 'active' }, pid: 'admin' }]);
   });
 
+  // TR-20: THE PUBLISH GAUGES REPORTED THE REASSURING ANSWER. `publishes`,
+  // `bytesPublished` and `bytesDelivered` were all incremented OUTSIDE the
+  // publish promise, so they counted attempts; only the latency histogram
+  // waited for the bus. A room whose every publish was rejected therefore
+  // reported a healthy publish rate, bytes climbing at the healthy rate, and
+  // (back when an empty window read as zeros) the BEST POSSIBLE latency.
+  describe('publish accounting counts what happened, not what was attempted', () => {
+    async function statsFrom(opts: { breakPublish: boolean }): Promise<RoomStats[]> {
+      const redis = new FakeRedis();
+      if (opts.breakPublish) redis.break('publish');
+      const stats: RoomStats[] = [];
+      await runTicker({
+        runtime: makeCounterRuntime({
+          tickHz: 50,
+          create: () => ({
+            tick: 0,
+            players: new Map([['p1', { counter: 0, playout: false }]]),
+            full: false,
+            starves: {},
+          }),
+        }),
+        redis,
+        createSubscriber: () => redis.fork(),
+        roomId: opts.breakPublish ? 'r-pubfail' : 'r-pubok',
+        namespace: NS,
+        statsMs: 30,
+        maxRunMs: 300,
+        emptyGraceMs: 100_000,
+        onStats: (st) => stats.push(st),
+        log: () => {},
+      });
+      return stats;
+    }
+
+    const total = (stats: RoomStats[], field: 'publishes' | 'publishFails' | 'bytesPublished' | 'bytesDelivered'): number =>
+      stats.reduce((n, s) => n + s[field], 0);
+
+    it('CONTROL: a healthy room counts its publishes and its bytes', async () => {
+      const stats = await statsFrom({ breakPublish: false });
+      expect(total(stats, 'publishes')).toBeGreaterThan(0);
+      expect(total(stats, 'publishFails')).toBe(0);
+      expect(total(stats, 'bytesPublished')).toBeGreaterThan(0);
+      expect(total(stats, 'bytesDelivered')).toBeGreaterThan(0);
+      // One player in the room, so delivered equals published exactly.
+      expect(total(stats, 'bytesDelivered')).toBe(total(stats, 'bytesPublished'));
+    });
+
+    it('a room whose every publish is REJECTED reports zero publishes, zero bytes, and a failure count', async () => {
+      const stats = await statsFrom({ breakPublish: true });
+      expect(total(stats, 'publishes')).toBe(0);
+      expect(total(stats, 'publishFails')).toBeGreaterThan(0);
+      // Bytes that never left the process are not bandwidth.
+      expect(total(stats, 'bytesPublished')).toBe(0);
+      expect(total(stats, 'bytesDelivered')).toBe(0);
+    });
+
+    it('publishAwait is null on a dead bus, never the best latency in the fleet', async () => {
+      // The histogram is only pushed on a CONFIRMED publish, so a failing
+      // room's window is empty. An empty window used to read
+      // `{ p50: 0, p95: 0, max: 0 }`, which for a latency distribution is the
+      // healthiest possible reading for the sickest possible state.
+      const stats = await statsFrom({ breakPublish: true });
+      expect(stats.length).toBeGreaterThan(0);
+      for (const s of stats) expect(s.publishAwait).toBeNull();
+
+      const healthy = await statsFrom({ breakPublish: false });
+      expect(healthy.some((s) => s.publishAwait !== null)).toBe(true);
+    });
+
+    it('a failing room and a healthy one are distinguishable from RoomStats alone', async () => {
+      // The whole point. Everything else about the two runs reads the same:
+      // the tick rate, the player count, the uptime and the starve, drop and
+      // renew counters are all identical, because a publish that fails costs
+      // no bytes, produces no latency sample and does not disturb the loop.
+      const healthy = await statsFrom({ breakPublish: false });
+      const failing = await statsFrom({ breakPublish: true });
+      const shape = (stats: RoomStats[]): { published: boolean; failed: boolean; await0: boolean } => ({
+        published: total(stats, 'publishes') > 0,
+        failed: total(stats, 'publishFails') > 0,
+        await0: stats.every((s) => s.publishAwait === null),
+      });
+      expect(shape(healthy)).toEqual({ published: true, failed: false, await0: false });
+      expect(shape(failing)).toEqual({ published: false, failed: true, await0: true });
+    });
+  });
+
+  // TR-21: a checkpoint this build cannot understand must START FRESH, and
+  // must SAY SO. "There was nothing there" and "there was something written
+  // by a version this build does not implement" produce the identical fresh
+  // room and are completely different events.
+  describe('a checkpoint from an unknown version starts fresh, audibly', () => {
+    async function runOver(stateJson: string | null, room: string): Promise<{ logs: LogEvent[]; tick: number }> {
+      const redis = new FakeRedis();
+      const keys = roomKeys(room, NS);
+      if (stateJson !== null) await redis.set(keys.state, stateJson);
+      const logs: LogEvent[] = [];
+      let observed = -1;
+      await runTicker({
+        runtime: makeCounterRuntime({ tickHz: 50 }),
+        redis,
+        createSubscriber: () => redis.fork(),
+        roomId: room,
+        namespace: NS,
+        statsMs: 30,
+        maxRunMs: 120,
+        emptyGraceMs: 100_000,
+        onStats: (s) => {
+          if (observed === -1) observed = s.tick;
+        },
+        log: (ev) => logs.push(ev),
+      });
+      return { logs, tick: observed };
+    }
+
+    const body = JSON.stringify({ tick: 5000, players: [], full: false });
+
+    it('CONTROL: the current version restores, so the refusal below is not a blanket start-fresh', async () => {
+      const env: CheckpointEnvelope = { v: 1, tick: 5000, graceUntilTick: 0, incarnation: 'inc', body };
+      const { logs, tick } = await runOver(JSON.stringify(env), 'r-cpv-ok');
+      expect(tick).toBeGreaterThan(5000);
+      expect(logs.filter((l) => l.kind === 'ticker.checkpoint-refused')).toHaveLength(0);
+    });
+
+    it('a FUTURE version is refused, the room starts from zero, and the log names the version', async () => {
+      const env = { v: 2, tick: 5000, graceUntilTick: 0, incarnation: 'inc', body };
+      const { logs, tick } = await runOver(JSON.stringify(env), 'r-cpv-new');
+      expect(tick).toBeLessThan(100); // fresh, not continuing from 5000
+      const refused = logs.filter((l) => l.kind === 'ticker.checkpoint-refused');
+      expect(refused).toHaveLength(1);
+      expect(refused[0]?.meta).toMatchObject({ reason: 'version', foundVersion: 2, expectedVersion: 1 });
+    });
+
+    it('a PAST version is refused too, which is the direction that would otherwise parse cleanly', async () => {
+      const env = { v: 0, tick: 5000, graceUntilTick: 0, incarnation: 'inc', body };
+      const { logs, tick } = await runOver(JSON.stringify(env), 'r-cpv-old');
+      expect(tick).toBeLessThan(100);
+      expect(logs.filter((l) => l.kind === 'ticker.checkpoint-refused')[0]?.meta).toMatchObject({
+        reason: 'version',
+        foundVersion: 0,
+      });
+    });
+
+    it('an ordinary cold room says NOTHING, so the refusal above is a signal and not noise', async () => {
+      const { logs } = await runOver(null, 'r-cpv-cold');
+      expect(logs.filter((l) => l.kind === 'ticker.checkpoint-refused')).toHaveLength(0);
+    });
+  });
+
   it('counts and summarises an envelope type it has no branch for', async () => {
     const redis = new FakeRedis();
     const keys = roomKeys('r-unknown', NS);

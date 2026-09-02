@@ -6,18 +6,27 @@ export const METRIC_CAP = 256;
 /**
  * p50/p95/max over `values`, rounded to whole integers (these are timing and
  * byte-size figures destined for a stats gauge or a log line, where
- * sub-integer precision is noise). An empty input returns all zeros rather
- * than `NaN`: a gauge reading 0 during a quiet interval is meaningful and
- * sortable, a gauge reading `NaN` breaks anything downstream that expects a
- * number (a Prometheus exposition line, a chart's y-axis).
+ * sub-integer precision is noise).
+ *
+ * AN EMPTY WINDOW RETURNS `null`, NOT ZEROS, AND THAT IS THE WHOLE POINT OF
+ * THE RETURN TYPE. This used to answer `{ p50: 0, p95: 0, max: 0 }`, on the
+ * reasoning that a gauge reading 0 is sortable where a `NaN` is not. For a
+ * LATENCY distribution that reasoning is exactly backwards: zero is not a
+ * neutral placeholder, it is the BEST POSSIBLE value, so "no samples at all"
+ * and "every sample was instantaneous" reported the same three numbers. A
+ * room whose every publish was rejected therefore reported
+ * `publishAwait {p50:0, p95:0, max:0}`, the healthiest reading the gauge can
+ * produce, for the sickest state the room can be in. `null` is the honest
+ * answer to a question nothing was measured for, and it is a return type a
+ * caller has to acknowledge rather than a value it can quietly plot.
  *
  * Sorts a COPY of `values`: callers routinely hand this the same array they
  * are about to keep pushing into, and sorting in place would silently
  * reorder a caller's own buffer out from under them.
  */
-export function percentiles(values: number[]): Percentiles {
+export function percentiles(values: number[]): Percentiles | null {
   if (values.length === 0) {
-    return { p50: 0, p95: 0, max: 0 };
+    return null;
   }
   const sorted = [...values].sort((a, b) => a - b);
   const at = (fraction: number): number => {
@@ -55,7 +64,8 @@ export class RollingHistogram {
     }
   }
 
-  percentiles(): Percentiles {
+  /** `null` while the window is empty: see `percentiles` for why an unmeasured window must not read as a perfect one. */
+  percentiles(): Percentiles | null {
     return percentiles(this.values);
   }
 

@@ -180,6 +180,18 @@ http.on('upgrade', (req, socket, head) => {
         return;
       }
 
+      // The per-user socket cap fails OPEN on a Redis fault, which is right
+      // (refusing during a blip would lock users out of a healthy deployment)
+      // but it must never do so quietly: a degraded Redis disables the cap in
+      // exactly the conditions the cap is load-bearing, since every socket
+      // holds its own subscriber connection. See
+      // `AdmissionResult.socketCapEvaluated`.
+      if (!admission.socketCapEvaluated) {
+        console.log(
+          `[relay ${room}] warn relay.socket-cap-unevaluated admitted without applying maxSocketsPerSubject: the connection set could not be read`,
+        );
+      }
+
       // CLAIM THE SLOT. `checkAdmission` is a QUERY and deliberately writes
       // nothing, so that a REFUSED connection never has to be un-registered.
       // That means registration is the caller's job, and skipping it does not

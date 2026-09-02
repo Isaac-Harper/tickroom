@@ -105,6 +105,58 @@ const FORBIDDEN_CHARS = /[:*\s\x00-\x1f\x7f-\x9f]/;
 
 const MAX_ROOM_ID_LENGTH = 64;
 
+/** The `isValidBase` half of `NormalizeOptions`, on its own, because a caller holding a BASE has no room id to fall back to. */
+export type NormalizeBaseOptions = Pick<NormalizeOptions, 'isValidBase'>;
+
+/**
+ * The trust boundary for anything reading an untrusted BASE id, which is a
+ * different value from a room id and needs its own entry point: a base names
+ * a POOL of instances (`assignRoom` builds `base`, `base~1`, `base~2` ... out
+ * of it and turns every one of them into a Redis key), where a room id names
+ * exactly one. Handing a base to `normalizeRoomId` would waive the one check
+ * that matters here, since `normalizeRoomId` accepts `lobby~3` and a base
+ * that already carries an instance suffix composes into `lobby~3~7`, which is
+ * not an id anything in this module can parse back.
+ *
+ * Returns the base unchanged when it passes every check, or `null` when it
+ * does not. NULL RATHER THAN A FALLBACK, deliberately: the caller that needs
+ * this (`createBalancerRoute`) already answers 400 for a base its registry
+ * does not recognise, and quietly redirecting a hostile `?base=` to some
+ * default room would turn a refusal into a silent reassignment. `parseRoomId`
+ * in this same module already refuses the same way.
+ *
+ * The checks are the same ones `normalizeRoomId` runs, in the same order and
+ * from the same constants, because they are protecting the same thing: a
+ * value interpolated into Redis key names, which have no escaping. It is one
+ * implementation rather than two on purpose. `normalizeRoomId` delegates its
+ * whole base half here, so a rule added in one place cannot go missing from
+ * the other, which is exactly how the balancer route came to be the one route
+ * of three with no sanitiser on it at all.
+ *
+ * Never throws.
+ */
+export function normalizeBase(raw: string, opts: NormalizeBaseOptions): string | null {
+  if (typeof raw !== 'string' || raw.length === 0 || raw.length > MAX_ROOM_ID_LENGTH) {
+    return null;
+  }
+  if (FORBIDDEN_CHARS.test(raw)) {
+    return null;
+  }
+  // A base is never an instance id. `roomIdFor` appends `~N` to whatever it
+  // is given, so a base carrying its own '~' produces a room id `parseRoomId`
+  // then refuses, and a room whose key names nothing can ever read back.
+  if (raw.includes('~')) {
+    return null;
+  }
+  if (DANGEROUS_BASE_NAMES.has(raw)) {
+    return null;
+  }
+  if (!opts.isValidBase(raw)) {
+    return null;
+  }
+  return raw;
+}
+
 /**
  * The one function anything reading an untrusted `?room=` query parameter
  * should call before that value ever reaches a Redis key, a log line, or a
@@ -128,10 +180,9 @@ export function normalizeRoomId(raw: string, opts: NormalizeOptions): string {
   }
   const { base, index } = parsed;
 
-  if (base.length === 0 || DANGEROUS_BASE_NAMES.has(base)) {
-    return opts.fallback;
-  }
-  if (!opts.isValidBase(base)) {
+  // The base half is `normalizeBase`'s job, so the two entry points cannot
+  // drift apart: every rule about what a base may contain lives there.
+  if (normalizeBase(base, opts) === null) {
     return opts.fallback;
   }
   // Index 0 (the bare base id, reached when `raw` had no '~' at all) needs no

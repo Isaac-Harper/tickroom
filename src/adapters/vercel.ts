@@ -4,7 +4,7 @@
 // (leasing, checkpointing, admission, relaying). Nothing in this file makes a
 // decision `src/server` did not already make; it only speaks HTTP.
 import type { ClientInput, Logger, RedisLike, RoomRuntime } from '../core/index.js';
-import { normalizeRoomId } from '../core/index.js';
+import { normalizeBase, normalizeRoomId } from '../core/index.js';
 import type { RelaySocket, TickerOptions, TokenClaims } from '../server/index.js';
 import {
   assignRoom,
@@ -323,6 +323,24 @@ export function createRelayRoute(opts: VercelRelayRouteOptions): (req: Request) 
       maxSocketsPerSubject,
     });
 
+    // The per-user socket cap failing open is correct and must stay that way
+    // (refusing during a Redis blip locks users out of a healthy
+    // deployment), but it must never do so quietly: see
+    // `AdmissionResult.socketCapEvaluated`. One line per admission is fine
+    // here because it only ever fires while Redis is degraded, and a run of
+    // them is the only warning an operator gets that the cap protecting the
+    // ticker's own subscriber connection is not currently enforcing
+    // anything.
+    if (!admission.socketCapEvaluated) {
+      log?.({
+        lvl: 'warn',
+        kind: 'relay.socket-cap-unevaluated',
+        room: roomId,
+        pid: claims.pid,
+        msg: 'admitted without applying maxSocketsPerSubject: the connection set could not be read',
+      });
+    }
+
     return upgradeWebSocket((ws: any) => { // eslint-disable-line @typescript-eslint/no-explicit-any
       // The one sanctioned cast: `ws` arrives untyped from the injected
       // `upgradeWebSocket`, and this is the single seam where it is adapted
@@ -425,8 +443,18 @@ export function createBalancerRoute(
 
   return async function balancerRoute(req: Request): Promise<Response> {
     const url = new URL(req.url);
-    const base = url.searchParams.get('base') ?? fallbackBase;
-    if (!isValidBase(base)) {
+    // THE SAME TRUST BOUNDARY THE OTHER TWO ROUTES ALREADY APPLY, and this
+    // was the one route of three that skipped it. `isValidBase` alone is not
+    // the boundary: it is HOST-SUPPLIED, the `ids.ts` module comment already
+    // treats it as something that gets written wrong (a bare `raw in WORLDS`
+    // matches inherited properties, so `constructor` and `__proto__` pass),
+    // and it says nothing at all about the character filter or the length
+    // cap. This value is interpolated into Redis key names, which have no
+    // escaping, once per instance in the pool, so a ':' would smuggle extra
+    // key segments and a '*' would build a glob pattern out of a query
+    // parameter. `normalizeBase` runs those checks and `isValidBase` too.
+    const base = normalizeBase(url.searchParams.get('base') ?? fallbackBase, { isValidBase });
+    if (base === null) {
       return jsonResponse({ error: 'unknown room base' }, 400);
     }
 

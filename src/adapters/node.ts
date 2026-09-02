@@ -99,6 +99,20 @@ export function attachNodeRelay(wss: any, opts: NodeRelayServerOptions): void { 
         maxSocketsPerSubject,
       });
 
+      // Same posture as the Vercel adapter, and for the same reason: the
+      // per-user socket cap fails OPEN on a Redis fault, which is right, but
+      // an operator has to be told it happened. See
+      // `AdmissionResult.socketCapEvaluated`.
+      if (!admission.socketCapEvaluated) {
+        log?.({
+          lvl: 'warn',
+          kind: 'relay.socket-cap-unevaluated',
+          room: roomId,
+          pid: claims.pid,
+          msg: 'admitted without applying maxSocketsPerSubject: the connection set could not be read',
+        });
+      }
+
       const socket = ws as RelaySocket;
 
       if (!admission.admit) {

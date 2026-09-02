@@ -18,7 +18,7 @@ import {
   type OwnershipClock,
   CHECKPOINT_VERSION,
   packCheckpoint,
-  unpackCheckpoint,
+  inspectCheckpoint,
   PlayoutBuffer,
   StarveTracker,
   Inbox,
@@ -395,7 +395,29 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
     } catch (err) {
       log({ lvl: 'warn', kind: 'ticker.checkpoint-read-failed', room: roomId, meta: { error: String(err) } });
     }
-    const envelope = unpackCheckpoint(rawBody);
+    // `inspectCheckpoint` rather than `unpackCheckpoint`, so a start-fresh
+    // can SAY WHY. "There was no checkpoint" and "there was one this build
+    // cannot read" produce the identical fresh room and are completely
+    // different events: the first is an ordinary cold start, the second is a
+    // deploy that just wiped the in-progress state of every live room in the
+    // fleet, and an operator has to be able to tell them apart from the log
+    // alone. Reported at `warn` for a real checkpoint that was refused and
+    // said nothing at all for an absent one, so a cold room stays silent.
+    const inspected = inspectCheckpoint(rawBody);
+    const envelope = inspected.ok ? inspected.envelope : null;
+    if (!inspected.ok && inspected.reason !== 'absent') {
+      log({
+        lvl: 'warn',
+        kind: 'ticker.checkpoint-refused',
+        room: roomId,
+        msg: 'starting this room fresh: the stored checkpoint could not be used',
+        meta: {
+          reason: inspected.reason,
+          foundVersion: inspected.foundVersion,
+          expectedVersion: CHECKPOINT_VERSION,
+        },
+      });
+    }
     const expectedGeom = geomKey?.();
     // OMITTING `geomKey` IS A SILENT FOOTGUN, so say so once, loudly, rather
     // than letting it pass unremarked.
@@ -581,6 +603,7 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
 
   // --- counters, reset every stats flush (see the stats block) ---
   let publishes = 0;
+  let publishFails = 0;
   let dropped = 0;
   let starves = 0;
   let renewFails = 0;
@@ -975,17 +998,39 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
         const message: string | Buffer = typeof payload === 'string' ? payload : Buffer.from(payload);
         const bytes = typeof payload === 'string' ? Buffer.byteLength(payload) : payload.byteLength;
         const publishStartedAt = Date.now();
+        // EVERY ONE OF THESE COUNTERS IS MOVED WHEN THE PUBLISH RESOLVES,
+        // NEVER WHEN IT IS ISSUED, and that placement is the difference
+        // between this block reporting what the room DID and reporting what
+        // it INTENDED. Incrementing outside the promise counted an attempt:
+        // a room whose every publish was rejected reported 20 publishes a
+        // second and a bytes figure climbing at the healthy rate, while the
+        // only signal that actually waited for the bus (`publishAwaitHist`)
+        // stayed empty and, back when an empty window read as zeros, then
+        // reported the BEST POSSIBLE latency. Three gauges agreeing that a
+        // dead room was the healthiest in the fleet.
+        //
+        // The one honest cost of counting on resolution is that a publish
+        // still in flight when a stats window closes lands in the NEXT
+        // window, and a publish still in flight when the ticker exits is
+        // never counted at all. Both are correct: an unconfirmed publish is
+        // not a delivered one, and at 20Hz against a healthy bus the
+        // straggler is at most a tick's worth of one window's total.
+        //
+        // `playerCount` and `bytes` are captured out here on purpose: they
+        // describe the frame that was sent, and the room's population may
+        // well have changed by the time the reply lands.
         redis
           .publish(keys.out, message)
           .then(() => {
             publishAwaitHist.push(Date.now() - publishStartedAt);
+            publishes++;
+            bytesPublished += bytes;
+            bytesDelivered += bytes * playerCount;
           })
           .catch((err) => {
+            publishFails++;
             log({ lvl: 'error', kind: 'ticker.publish-failed', room: roomId, meta: { error: String(err) } });
           });
-        publishes++;
-        bytesPublished += bytes;
-        bytesDelivered += bytes * playerCount;
 
         // 9. checkpoint, gated on still owning the lease
         if (now - lastCheckpointAt >= checkpointMs) {
@@ -1013,6 +1058,7 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
           tickHz: measuredHz,
           uptimeS: (now - startedAt) / 1000,
           publishes,
+          publishFails,
           dropped,
           starves,
           renewFails,
@@ -1042,6 +1088,7 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
         // snapshot being taken and the reset, silently losing them.
         const json = JSON.stringify(stats);
         publishes = 0;
+        publishFails = 0;
         dropped = 0;
         starves = 0;
         renewFails = 0;
