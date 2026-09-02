@@ -45,6 +45,13 @@ import type { RedisLike } from './redisLike.js';
  * every tick would spam Redis); `mayPublish(lastOwnedAt)` decides whether it
  * is still safe to have published anything, and only a CONFIRMED renew may
  * push that decision forward.
+ *
+ * ONE FUNCTION PER CLOCK, and that separation is enforced by the signatures
+ * rather than by care: `renewAttempted` moves `lastRenewAt` and nothing else,
+ * `renewConfirmed` moves `lastOwnedAt` and nothing else, `renewFailed` moves
+ * neither. Any function that can move both is a step back toward the single
+ * collapsed timestamp described above. See `renewConfirmed` for the traced
+ * split-brain that having it re-anchor the PACING clock actually produces.
  */
 
 export interface LeaseConfig {
@@ -120,63 +127,58 @@ export function renewAttempted(clock: OwnershipClock, now: number): OwnershipClo
 }
 
 /**
- * Options for `renewConfirmed`. See the function doc for what
- * `preserveAttemptTime` trades off, and the `TR-10b` block in `lease.test.ts` for
- * why it exists as an opt-in rather than a straight behaviour change.
- */
-export interface RenewConfirmedOptions {
-  /**
-   * When true, `lastRenewAt` is left exactly where the paired
-   * `renewAttempted` call put it (the ATTEMPT time) instead of being
-   * re-anchored to `now` (the CONFIRMATION time). Default `false`: a caller
-   * that does not pass this keeps today's behaviour unchanged, so existing
-   * callers of `renewConfirmed(clock, now)` see no change at all.
-   *
-   * WHY THIS MATTERS FOR AN ASYNCHRONOUS RENEW. A host that issues
-   * `renewAttempted` at the moment it STARTS the network call and only
-   * calls `renewConfirmed` once that call's promise resolves (the pattern
-   * `server/ticker.ts` uses: `renewAttempted(clock, now)` before `await
-   * renewLease(...)`, then `renewConfirmed(clock, Date.now())` in the
-   * success branch) hands this function a `now` that is the ATTEMPT time
-   * plus one round trip, not the attempt time itself. Re-anchoring
-   * `lastRenewAt` to that later timestamp (the default) makes `renewDue`,
-   * which paces strictly off `lastRenewAt`, wait `leaseRenewMs` from the
-   * CONFIRMATION rather than from the attempt: the effective renew period
-   * becomes `leaseRenewMs + RTT` instead of `leaseRenewMs`. That stretch is
-   * small and harmless most of the time, but it is WORST exactly during a
-   * latency excursion, the one condition the renew cadence exists to stay
-   * ahead of: a slow RTT both delays this confirmation AND silently widens
-   * every renew interval that follows it, compounding in the wrong
-   * direction at the worst possible moment. Passing
-   * `{ preserveAttemptTime: true }` keeps `renewDue` paced off the instant
-   * the renew was actually ATTEMPTED, which is the number the pacing
-   * comment on `renewAttempted` already promises.
-   */
-  preserveAttemptTime?: boolean;
-}
-
-/**
- * A renew SUCCEEDED at `now`. Always moves `lastOwnedAt` to `now`: ownership
- * really was confirmed at this instant, and nothing about `preserveAttemptTime`
- * changes that half of the two-clock rule.
+ * A renew SUCCEEDED at `now`. Moves ONLY `lastOwnedAt`, the mirror image of
+ * `renewAttempted` moving only `lastRenewAt`: one function per clock, so the
+ * two-clock rule is a property of the SHAPE of this module rather than of a
+ * convention somebody has to remember. A function that moves both clocks is
+ * one tidy-up away from being the single collapsed timestamp the module
+ * comment above exists to prevent, which is why this deliberately cannot
+ * pace: a caller that uses `renewDue` MUST call `renewAttempted`.
  *
- * `lastRenewAt` has two behaviours depending on `opts.preserveAttemptTime`:
+ * IT DOES NOT RE-ANCHOR `lastRenewAt` TO THE CONFIRMATION TIME, AND THAT IS
+ * A SAFETY PROPERTY, NOT A TIDINESS ONE. A host issues `renewAttempted` at
+ * the moment it STARTS the network call and only reaches here once that
+ * call's promise resolves (`server/ticker.ts` section 11: `renewAttempted`,
+ * then `renewLease(...).then(() => renewConfirmed(clock, Date.now()))`), so
+ * `now` is the attempt time plus one round trip. Re-anchoring `lastRenewAt`
+ * onto it makes `renewDue`, which paces strictly off `lastRenewAt`, wait
+ * `leaseRenewMs` from the CONFIRMATION rather than from the attempt.
  *
- *   - DEFAULT (unset or false, today's behaviour, unchanged): nudged forward
- *     to `now` too, since for a caller with no separate attempt timestamp a
- *     confirmed renew is trivially also a completed attempt, and leaving it
- *     stale would make `renewDue` fire again immediately after a success.
- *   - OPT IN (`true`): left at `clock.lastRenewAt`, i.e. wherever the paired
- *     `renewAttempted` call already put it. See `RenewConfirmedOptions` for
- *     why an asynchronous host wants this.
+ * The ordinary cost of that is a renew period of `leaseRenewMs + RTT`
+ * instead of `leaseRenewMs`, which quietly halves the margin
+ * `leaseRenewMs` was chosen to buy ("well under `leaseTtlMs`, so a single
+ * missed attempt does not lose the lease"): at `LEASE_RENEW_MS` 1500 and
+ * `LEASE_TTL_MS` 5000 that promise holds up to an RTT of 2000ms paced from
+ * the attempt, and only to 1000ms paced from the confirmation.
+ *
+ * THE REAL COST IS A HOLE IN THE RENEW SCHEDULE, and it can lose the lease
+ * outright while `mayPublish` still says yes. Once RTT exceeds
+ * `leaseRenewMs` the attempts overlap, so several in-flight renews resolve
+ * in a row and each one drags `lastRenewAt` forward again; the next attempt
+ * is then due `leaseRenewMs` after the LAST of those resolutions, and
+ * nothing reaches Redis for up to `RTT + leaseRenewMs`. Traced at
+ * RTT 4000 / renew 1500 / TTL 5000: attempts leave at 1500, 3000 and 4500
+ * and then not again until 10000, the key's own TTL lapses at about 11500,
+ * a successor legitimately acquires it, and this ticker's `lastOwnedAt`
+ * (8500, the last confirmation) keeps `mayPublish` true until 13500. Two
+ * seconds of exactly the split-brain the two-clock rule exists to prevent,
+ * reached without either clock ever being collapsed. Paced from the attempt
+ * the same profile issues a renew every 1500ms regardless of RTT, Redis
+ * extends the key on that cadence, and the lease never lapses at all.
+ *
+ * OVERLAPPING RENEWS ARE THE ACCEPTED PRICE AND ARE NOT NEW. They already
+ * happen whenever RTT exceeds `leaseRenewMs` (the trace above overlaps three
+ * deep before the hole opens); pacing from the attempt makes them regular
+ * rather than bursty, with the same bound of `ceil(RTT / leaseRenewMs)` in
+ * flight. They are safe by construction: `renewLease` is an owner-checked
+ * compare-and-extend, so two concurrent renews both simply extend; every
+ * resolution sets `lastOwnedAt` to its own wall clock, which is
+ * non-decreasing across resolutions; and a `false` reply means Redis
+ * evaluated the key and it was no longer ours, which no later reply can
+ * take back.
  */
-export function renewConfirmed(
-  clock: OwnershipClock,
-  now: number,
-  opts?: RenewConfirmedOptions
-): OwnershipClock {
-  const lastRenewAt = opts?.preserveAttemptTime ? clock.lastRenewAt : now;
-  return { lastRenewAt, lastOwnedAt: now };
+export function renewConfirmed(clock: OwnershipClock, now: number): OwnershipClock {
+  return { lastRenewAt: clock.lastRenewAt, lastOwnedAt: now };
 }
 
 /**

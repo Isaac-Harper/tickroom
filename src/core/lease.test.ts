@@ -14,6 +14,7 @@ import {
   renewLease,
   shouldSpawnTicker,
   tickerShouldExit,
+  type OwnershipClock,
 } from './lease.js';
 import type { RedisLike } from './redisLike.js';
 
@@ -111,12 +112,19 @@ describe('the two-clock rule', () => {
     expect(after.lastOwnedAt).toBe(0); // unchanged: an attempt is not a confirmation
   });
 
-  it('renewConfirmed moves both clocks to now', () => {
+  // ONE FUNCTION PER CLOCK, and this case has to confirm at a DIFFERENT time
+  // than it attempted or it proves nothing. It used to attempt and confirm at
+  // the same `now`, so `lastRenewAt` was already the expected value before
+  // `renewConfirmed` was called at all: a version that re-anchored the pacing
+  // clock passed it unchanged. That is the exact regression this pins, and it
+  // is not hypothetical, it is the hole that let renews overlap until the
+  // schedule opened a gap wider than the lease TTL.
+  it('renewConfirmed moves ONLY lastOwnedAt, leaving the pacing clock where the attempt put it', () => {
     const clock = createOwnershipClock(0);
     const attempted = renewAttempted(clock, 1000);
-    const confirmed = renewConfirmed(attempted, 1000);
+    const confirmed = renewConfirmed(attempted, 1500);
     expect(confirmed.lastRenewAt).toBe(1000);
-    expect(confirmed.lastOwnedAt).toBe(1000);
+    expect(confirmed.lastOwnedAt).toBe(1500);
   });
 
   it('renewFailed leaves the clock completely unchanged', () => {
@@ -279,90 +287,139 @@ describe('TR-10: acquire/renew require the literal OK reply, a split-brain guard
   });
 });
 
-describe('TR-10b: renewConfirmed must not stretch the renew period for an asynchronous renew', () => {
-  it('default (no opts): re-anchors lastRenewAt to the confirmation time, unchanged from before this fix', () => {
-    // This is deliberately the OLD behaviour, pinned so a future edit cannot
-    // silently flip the default: a caller that does not opt in must see
-    // exactly what it saw before TR-10b landed.
-    let clock = createOwnershipClock(0);
-    clock = renewAttempted(clock, 0);
-    const confirmedAt = 400; // simulates a 400ms round trip
-    clock = renewConfirmed(clock, confirmedAt);
-    expect(clock.lastRenewAt).toBe(confirmedAt);
-    expect(clock.lastOwnedAt).toBe(confirmedAt);
-  });
-
-  it('preserveAttemptTime: true keeps lastRenewAt at the attempt time, not the later confirmation time', () => {
+describe('TR-10b: renewConfirmed paces from the ATTEMPT, never from the confirmation', () => {
+  it('moves ONLY lastOwnedAt, leaving the pacing clock exactly where renewAttempted put it', () => {
     let clock = createOwnershipClock(0);
     const attemptAt = 0;
     clock = renewAttempted(clock, attemptAt);
-    const confirmedAt = 400; // the same 400ms round trip as above
-    clock = renewConfirmed(clock, confirmedAt, { preserveAttemptTime: true });
-    // lastOwnedAt still moves to the real confirmation instant: only the
-    // PACING clock is preserved, never the ownership clock.
+    const confirmedAt = 400; // a 400ms round trip
+    clock = renewConfirmed(clock, confirmedAt);
+    // The OWNERSHIP clock moves to the real confirmation instant, because
+    // that is when Redis actually said yes. The PACING clock does not move
+    // at all: one function per clock, see the module comment.
     expect(clock.lastOwnedAt).toBe(confirmedAt);
     expect(clock.lastRenewAt).toBe(attemptAt);
   });
 
-  it('MUTATION CHECK, THE REGRESSION THIS FIX EXISTS FOR: an asynchronous renew loop under repeated RTT delay drifts the next-attempt schedule by one RTT per cycle with the default, and stays paced from the attempt with preserveAttemptTime', () => {
-    // Models the exact pattern server/ticker.ts uses: renewAttempted() is
-    // called synchronously at the moment the network call STARTS; the
-    // matching renewConfirmed() only runs once that call's promise resolves,
-    // one RTT later. Sweep several renew cycles and read where the NEXT
-    // attempt becomes due under each policy.
-    const renewIntervalMs = 1500;
-    const rttMs = 300;
-    const cycles = 5;
+  // THE SPLIT BRAIN THIS PREVENTS, MODELLED END TO END RATHER THAN ASSERTED.
+  //
+  // The unit case above cannot fail on anything that matters: re-anchoring
+  // `lastRenewAt` to the confirmation time looks like an off-by-one-round-trip
+  // and reads as harmless. It is not. Once RTT exceeds `renewMs` the attempts
+  // overlap, several in-flight renews resolve back to back, and each
+  // resolution drags the pacing clock forward again, so the NEXT attempt is
+  // due `renewMs` after the LAST of them and nothing reaches Redis for up to
+  // `RTT + renewMs`. The key's own TTL lapses inside that hole, a successor
+  // legitimately acquires it, and `mayPublish` keeps saying yes because
+  // `lastOwnedAt` was confirmed recently: two authoritative tickers on one
+  // channel, reached without either clock ever being collapsed.
+  //
+  // So the simulation below runs the real `server/ticker.ts` renew pattern
+  // against a modelled Redis (a renew reaches the server at half RTT and
+  // replies at full RTT; an arriving renew extends the key only if the key is
+  // still there) and measures what the loop would actually do.
+  interface RenewSim {
+    /** Every wall-clock instant at which a renew was issued. */
+    attempts: number[];
+    /** The widest hole between two consecutive attempts. */
+    maxAttemptGapMs: number;
+    /** When the modelled Redis key expired, or null if it never did. */
+    leaseLapsedAtMs: number | null;
+    /** How long this ticker would have gone on publishing after that. */
+    splitBrainMs: number;
+  }
 
-    // DEFAULT policy (today's unchanged behaviour): each cycle's attempt
-    // fires renewIntervalMs after the PREVIOUS cycle's CONFIRMATION, so the
-    // gap between successive attempt starts is renewIntervalMs + rttMs.
-    {
-      let clock = createOwnershipClock(0);
-      let attemptAt = 0;
-      const attemptTimestamps: number[] = [attemptAt];
-      for (let i = 0; i < cycles; i++) {
-        clock = renewAttempted(clock, attemptAt);
-        const confirmedAt = attemptAt + rttMs;
-        clock = renewConfirmed(clock, confirmedAt); // no opts: the default
-        // advance a probing clock until renewDue fires again
-        let probe = confirmedAt;
-        while (!renewDue(clock, probe, renewIntervalMs)) probe += 1;
-        attemptAt = probe;
-        attemptTimestamps.push(attemptAt);
+  const GRID_MS = 50; // the 20Hz tick grid runTicker schedules on
+
+  function simulateAsyncRenewLoop(opts: {
+    confirm(clock: OwnershipClock, now: number): OwnershipClock;
+    rttMs: number;
+    renewMs: number;
+    ttlMs: number;
+    runMs: number;
+  }): RenewSim {
+    const { confirm, rttMs, renewMs, ttlMs, runMs } = opts;
+    let clock = createOwnershipClock(0);
+    // The modelled Redis side: when the key would expire if nothing renews it.
+    let leaseExpiresAt = ttlMs;
+    let leaseLapsedAtMs: number | null = null;
+    let splitBrainMs = 0;
+    const attempts: number[] = [];
+    const inFlight: Array<{ redisAt: number; resolveAt: number; arrived: boolean }> = [];
+
+    for (let now = 0; now <= runMs; now += GRID_MS) {
+      // a renew that has reached the server extends the key, but only if the
+      // key is still ours to extend: past the TTL a successor holds it and
+      // the owner-checked script replies false instead.
+      for (const r of inFlight) {
+        if (!r.arrived && r.redisAt <= now) {
+          r.arrived = true;
+          if (r.redisAt < leaseExpiresAt) leaseExpiresAt = r.redisAt + ttlMs;
+        }
       }
-      for (let i = 1; i < attemptTimestamps.length; i++) {
-        const gap = attemptTimestamps[i] - attemptTimestamps[i - 1];
-        // The defect: every cycle's attempt-to-attempt gap is stretched by
-        // one full RTT beyond the configured interval.
-        expect(gap).toBe(renewIntervalMs + rttMs);
+      // replies land, in issue order, and confirm ownership as of their own
+      // arrival instant
+      while (inFlight.length > 0 && (inFlight[0] as { resolveAt: number }).resolveAt <= now) {
+        const done = inFlight.shift() as { redisAt: number; resolveAt: number };
+        if (done.redisAt < leaseExpiresAt || leaseLapsedAtMs === null) {
+          clock = confirm(clock, done.resolveAt);
+        }
+      }
+      if (leaseLapsedAtMs === null && now >= leaseExpiresAt) leaseLapsedAtMs = now;
+      // publishing past the moment the key lapsed is the split brain
+      if (leaseLapsedAtMs !== null && mayPublish(clock, now, ttlMs)) splitBrainMs += GRID_MS;
+
+      if (renewDue(clock, now, renewMs)) {
+        clock = renewAttempted(clock, now);
+        attempts.push(now);
+        inFlight.push({ redisAt: now + rttMs / 2, resolveAt: now + rttMs, arrived: false });
       }
     }
 
-    // preserveAttemptTime policy: the gap between successive attempt starts
-    // stays exactly renewIntervalMs, regardless of RTT, because lastRenewAt
-    // never moves off the attempt instant.
-    {
-      let clock = createOwnershipClock(0);
-      let attemptAt = 0;
-      const attemptTimestamps: number[] = [attemptAt];
-      for (let i = 0; i < cycles; i++) {
-        clock = renewAttempted(clock, attemptAt);
-        const confirmedAt = attemptAt + rttMs;
-        clock = renewConfirmed(clock, confirmedAt, { preserveAttemptTime: true });
-        let probe = confirmedAt;
-        while (!renewDue(clock, probe, renewIntervalMs)) probe += 1;
-        attemptAt = probe;
-        attemptTimestamps.push(attemptAt);
-      }
-      for (let i = 1; i < attemptTimestamps.length; i++) {
-        const gap = attemptTimestamps[i] - attemptTimestamps[i - 1];
-        expect(gap).toBe(renewIntervalMs);
-      }
+    let maxAttemptGapMs = 0;
+    for (let i = 1; i < attempts.length; i++) {
+      maxAttemptGapMs = Math.max(maxAttemptGapMs, (attempts[i] as number) - (attempts[i - 1] as number));
     }
+    return { attempts, maxAttemptGapMs, leaseLapsedAtMs, splitBrainMs };
+  }
+
+  /** The pre-fix body of `renewConfirmed`, kept only so the contrast below is measured rather than described. */
+  const reAnchorPacingClock = (clock: OwnershipClock, now: number): OwnershipClock => ({
+    lastRenewAt: now,
+    lastOwnedAt: now,
   });
 
-  it('the two-clock rule survives the option: renewFailed still returns the clock unchanged either way', () => {
+  it('THE REGRESSION CASE: re-anchoring the pacing clock opens a hole in the renew schedule that loses the lease while mayPublish still says yes', () => {
+    const profile = { rttMs: 4000, renewMs: 1500, ttlMs: 5000, runMs: 20_000 };
+
+    const broken = simulateAsyncRenewLoop({ ...profile, confirm: reAnchorPacingClock });
+    // Attempts at 1500, 3000 and 4500, then nothing until 10000: a 5500ms
+    // hole, one RTT plus one renew interval.
+    expect(broken.attempts.slice(0, 4)).toEqual([1500, 3000, 4500, 10_000]);
+    expect(broken.maxAttemptGapMs).toBe(profile.rttMs + profile.renewMs);
+    // The key lapses inside that hole and this ticker publishes on past it.
+    expect(broken.leaseLapsedAtMs).toBe(11_500);
+    expect(broken.splitBrainMs).toBe(2000);
+
+    const fixed = simulateAsyncRenewLoop({ ...profile, confirm: renewConfirmed });
+    // Paced from the attempt, a renew leaves every renewMs no matter what the
+    // round trip is doing, so Redis keeps extending the key on that cadence.
+    expect(fixed.maxAttemptGapMs).toBe(profile.renewMs);
+    expect(fixed.leaseLapsedAtMs).toBeNull();
+    expect(fixed.splitBrainMs).toBe(0);
+  });
+
+  it('the ordinary cost, on an RTT far too small to open a hole: the renew period is stretched by exactly one round trip', () => {
+    // The everyday shape of the same defect. It loses no lease at 300ms of
+    // RTT, it just quietly spends the margin `leaseRenewMs` was chosen to
+    // buy: a period of renewMs + rtt halves how much of `leaseTtlMs` is left
+    // to absorb a single missed attempt.
+    const profile = { rttMs: 300, renewMs: 1500, ttlMs: 5000, runMs: 20_000 };
+    expect(simulateAsyncRenewLoop({ ...profile, confirm: reAnchorPacingClock }).maxAttemptGapMs).toBe(1800);
+    expect(simulateAsyncRenewLoop({ ...profile, confirm: renewConfirmed }).maxAttemptGapMs).toBe(1500);
+  });
+
+  it('the two-clock rule survives the change: renewFailed still returns the clock unchanged', () => {
     let clock = createOwnershipClock(0);
     clock = renewAttempted(clock, 1000);
     const failed = renewFailed(clock);
