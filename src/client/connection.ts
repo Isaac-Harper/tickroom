@@ -6,7 +6,8 @@
 // path, every one of them guarded so this class does not throw when used
 // outside a browser tab (a test runner, a headless worker).
 
-import { ClientTick } from './clientTick.js';
+import { ClientTick, type ClientTickView } from './clientTick.js';
+import type { SnapshotInterpolator, EntitySample, InterpolatedEntity } from './interpolation.js';
 import { stallDecision, shouldReanchor, STALL_COLD_MS, type StallDecision, type NetStatus } from './netPolicy.js';
 
 export type { NetStatus } from './netPolicy.js';
@@ -19,11 +20,58 @@ export interface SessionInfo {
   [k: string]: unknown;
 }
 
+/**
+ * The THREE fields this class reads out of a decoded snapshot, and the whole
+ * contract a host's own snapshot type has to satisfy. `tick` and `serverTime`
+ * run the tick timeline and the smoothed clock; `version` drives the
+ * protocol-skew check when the host opts into one. Everything else in a
+ * snapshot is the host's and is carried through untouched.
+ *
+ * THERE IS NO INDEX SIGNATURE HERE, AND REMOVING IT WAS A FIX. It used to
+ * carry `[k: string]: unknown`, which bought nothing (nothing in this class
+ * reads a fourth field) and cost the library its own composability: an
+ * `interface` gets no implicit index signature, so `DefaultSnapshot`, this
+ * repo's own shipped decoder output, was not assignable to it and
+ * `decodeSnapshot: (buf) => decodeDefaultSnapshot(buf)` failed with TS2322.
+ * The index signature also erased the payload type on the way back out, so
+ * `onSnapshot` handed back a shape whose own fields were `unknown` and every
+ * consumer, including `examples/pong/client.ts`, recovered it with the
+ * `as unknown as` double cast TypeScript's own error text calls a mistake.
+ * The payload type is now threaded generically from `decodeSnapshot`'s return
+ * type to `onSnapshot`'s parameter instead, so neither cast is needed at
+ * either end.
+ */
 export interface DecodedSnapshotLike {
   version?: number;
   tick: number;
   serverTime: number;
-  [k: string]: unknown;
+}
+
+/**
+ * The roster control frame the relay seeds a joining socket with and the
+ * ticker broadcasts on every roster change. Exported because a browser-only
+ * consumer has no reason to open the SERVER declarations, which is where this
+ * shape was documented and nowhere else: `onText` is `unknown`, so narrowing
+ * to the WRONG shape typechecks perfectly and yields an empty roster forever,
+ * i.e. no names, no presence count and no join or leave notifications, with
+ * nothing anywhere reporting a problem.
+ *
+ * `map` is keyed by pid. Its values are whatever the host wrote into that
+ * player's join metadata, so they stay `unknown`: this library cannot know
+ * that shape and must not pretend to.
+ */
+export interface RosterFrame {
+  t: 'meta';
+  /** True only on the ONE-SHOT frame a socket is seeded with on join. Absent on the broadcasts that follow. A client that renders both identically can ignore it. */
+  seed?: boolean;
+  map: Record<string, unknown>;
+}
+
+/** Narrow an `onText` payload to a `RosterFrame`. Returns false for every other control frame the host may send on the same channel, so a caller can `if (!isRosterFrame(msg)) return;` and be sure of the fields it then reads. */
+export function isRosterFrame(msg: unknown): msg is RosterFrame {
+  if (typeof msg !== 'object' || msg === null) return false;
+  const frame = msg as { t?: unknown; map?: unknown };
+  return frame.t === 'meta' && typeof frame.map === 'object' && frame.map !== null;
 }
 
 export type TerminalReason = 'closed-by-server' | 'capacity' | 'rate-limited' | 'version-skew' | 'stopped';
@@ -48,20 +96,57 @@ export interface WebSocketLike {
 
 export type WebSocketConstructor = new (url: string) => WebSocketLike;
 
-export interface RoomConnectionOptions {
+/**
+ * The interpolator this connection OWNS, and the one function that says where
+ * the entities live in a decoded snapshot. Both halves in one option, so it is
+ * not possible to supply either without the other.
+ *
+ * THE CONNECTION HOLDS THE INTERPOLATOR BECAUSE THE INTERPOLATOR IS
+ * EPOCH-SCOPED AND THE CONNECTION IS WHAT OWNS THE EPOCH. Every host used to
+ * hand-write the same bridge into `push()`, and the two fields that never vary
+ * across any writing of it (`receivedAt`, which must come from the same clock
+ * `sample()` reads, and `serverTime`, which must be the authority's stamp and
+ * not a second local one) are precisely the two the docs spent fifteen lines of
+ * capitalised warning on. Worse, a reconnect has to `clear()` the buffer, and
+ * only the caller could: skipping it brackets the first frame of the new epoch
+ * against one from seconds ago at `frac ~= 1`, a guaranteed snap on every
+ * reconnect, with the previous socket's path delay carried into the new
+ * estimate. The connection already does the identical thing for the one other
+ * epoch-scoped component it holds, one line away, in `markUnanchored()`.
+ */
+export interface SnapshotInterpolationOptions<TSnap, K extends string | number> {
+  /** The interpolator to push into and to clear on every epoch change. Its key type decides `K`, and `SnapshotInterpolator` has no default key type, so the host states it once here. */
+  into: SnapshotInterpolator<K>;
+  /** Pull the entities that MOVE out of one decoded snapshot. Everything else in the snapshot (scores, a winner, a serve countdown) is discrete state that has no meaning half way between two values, so it belongs in `onSnapshot` rather than here. */
+  entities(snap: TSnap): Map<K, EntitySample>;
+}
+
+export interface RoomConnectionOptions<TSnap extends DecodedSnapshotLike, K extends string | number> {
   /** Mint or fetch a session. Called on the first connect attempt and again whenever a re-mint is triggered (see the pre-open-failure rule below); an ordinary reconnect reuses the session already on hand. */
   mint(): Promise<SessionInfo>;
   /** Build the ws URL from a session. Defaults to `${wsProto}//${location.host}${path}?token=..&pid=..&h=..&room=..`, which needs a `location` global; supply this explicitly anywhere that is not a browser tab. */
   socketUrl?(session: SessionInfo): string;
   /** Path component of the default socket URL. Ignored if `socketUrl` is supplied. */
   path?: string;
-  /** Fixed simulation rate this room runs at. Must match the host's `RoomRuntime.tickHz`. */
-  tickHz?: number;
-  /** Decode a binary snapshot. Return null to ignore the frame (a malformed or not-yet-understood payload should never throw the connection). */
-  decodeSnapshot(buf: ArrayBuffer): DecodedSnapshotLike | null;
+  /**
+   * Fixed simulation rate this room runs at. MUST match the host's
+   * `RoomRuntime.tickHz`, and is REQUIRED rather than defaulted for that
+   * reason: it used to default to 20, so a 10Hz room whose client simply did
+   * not mention it ran every derived quantity at twice the right basis (the
+   * tick counter's step, `estimateServerTick`'s slope, and the underrun
+   * threshold in `stats()`), silently. The host always knows this number, so
+   * asking for it costs one line and a missing one is now a compile error
+   * rather than a 2x error nothing reports.
+   */
+  tickHz: number;
+  /** Decode a binary snapshot. Return null to ignore the frame (a malformed or not-yet-understood payload should never throw the connection). Its return type is what fixes `TSnap` for `onSnapshot` and for `interpolate.entities`, so no cast is needed at either end. */
+  decodeSnapshot(buf: ArrayBuffer): TSnap | null;
   /** Protocol version this bundle speaks. Omit to disable the skew check entirely (useful before a codec exists yet). */
   protocolVersion?: number;
-  onSnapshot?(snap: DecodedSnapshotLike): void;
+  /** Drive an interpolator from this connection's own snapshot stream and epoch. See `SnapshotInterpolationOptions`. Omit it to keep a `SnapshotInterpolator` by hand, which is still supported and is what a host with several buffers, or with a render layer that owns its own playback, will want. */
+  interpolate?: SnapshotInterpolationOptions<TSnap, K>;
+  /** Every decoded snapshot, in the concrete type `decodeSnapshot` returned. For the discrete state interpolation cannot smooth; the moving entities are `interpolate`'s job. */
+  onSnapshot?(snap: TSnap): void;
   /** JSON control frames the host relay sends: a roster update, a capacity notice, a quota warning. Parsed for you; handed back as the parsed value, or the raw string if it did not parse as JSON. */
   onText?(msg: unknown): void;
   onStatus?(status: NetStatus): void;
@@ -87,6 +172,8 @@ const UNDERRUN_GAP_FACTOR = 1.5;
 const UNDERRUN_EMA_TAU_MS = 3000;
 const RTT_EMA_ALPHA = 0.2;
 const SERVER_CLOCK_EMA_ALPHA = 0.05;
+/** Ceiling on the frame delta `frame()` derives from its own clock, seconds. A backgrounded tab returns with a gap of whatever the browser felt like, and every consumer of that delta (the tick counter's step budget, the interpolator's delay ease and speed low-pass) wants a plausible frame rather than a truthful one. The tick counter caps its own step count on top of this. */
+const FRAME_DT_CAP_S = 0.25;
 
 function now(): number {
   return typeof performance !== 'undefined' ? performance.now() : Date.now();
@@ -99,12 +186,37 @@ function stddev(values: number[]): number {
   return Math.sqrt(variance);
 }
 
-export class RoomConnection {
-  private readonly opts: RoomConnectionOptions;
+/** What one rendered frame produced: the poses to draw, the stall state, and the delta the connection measured for itself. */
+export interface FrameView<K extends string | number> {
+  /**
+   * The interpolated pose of every tracked entity, ready to draw. EMPTY when
+   * no `interpolate` option was given, because there is then no buffer for
+   * this connection to sample.
+   */
+  entities: Map<K, InterpolatedEntity>;
+  /** Same value `stallView().stalled` reports; `onStallChange` has already fired if this call changed it. */
+  stalled: boolean;
+  /** Seconds since the previous `frame()` call, clamped to `FRAME_DT_CAP_S`. Zero on the first call. Returned because a host's own per-frame work usually wants the same delta rather than a second, differently clamped one. */
+  dt: number;
+}
+
+export class RoomConnection<
+  TSnap extends DecodedSnapshotLike = DecodedSnapshotLike,
+  K extends string | number = string,
+> {
+  private readonly opts: RoomConnectionOptions<TSnap, K>;
   private readonly tickMs: number;
-  readonly tick: ClientTick;
+  private readonly clock: ClientTick;
+
+  /**
+   * This client's own stamping tick counter, read-only. Stamp an input's
+   * `targetTick` with `tick.value`, and check `tick.initialized` before
+   * trusting it. Advancing it is `frame()`'s job: see `ClientTickView`.
+   */
+  readonly tick: ClientTickView;
 
   private ws: WebSocketLike | null = null;
+  private lastFrameAt: number | null = null;
   private _status: NetStatus = 'idle';
   private stopped = true;
   private terminalReason: TerminalReason | null = null;
@@ -135,11 +247,11 @@ export class RoomConnection {
   private rttMsEma = 0;
   private rttSeeded = false;
 
-  constructor(opts: RoomConnectionOptions) {
+  constructor(opts: RoomConnectionOptions<TSnap, K>) {
     this.opts = opts;
-    const tickHz = opts.tickHz ?? 20;
-    this.tickMs = 1000 / tickHz;
-    this.tick = new ClientTick({ tickMs: this.tickMs });
+    this.tickMs = 1000 / opts.tickHz;
+    this.clock = new ClientTick({ tickMs: this.tickMs });
+    this.tick = this.clock;
   }
 
   get status(): NetStatus {
@@ -157,7 +269,7 @@ export class RoomConnection {
     this.connectStartedAt = now();
     this.lastSnapAt = 0;
     this.epochDelivered = false;
-    this.tick.markUnanchored();
+    this.beginEpoch();
     await this.connectOnce(false);
   }
 
@@ -211,10 +323,70 @@ export class RoomConnection {
     return this.lastSnapTick + elapsedMs / this.tickMs;
   }
 
-  /** Call once per rendered frame. Returns the current stall state (same as `stallView().stalled`); fires `onStallChange` on edges. */
-  pollStall(): boolean {
+  /**
+   * THE ONE PER-FRAME CALL. Drive it from `requestAnimationFrame` and draw
+   * what it returns.
+   *
+   * It advances the tick counter, polls the stall detector (firing
+   * `onStallChange` on edges) and samples the interpolator, from ONE delta
+   * this class measures itself.
+   *
+   * IT IS ONE CALL BECAUSE IT USED TO BE THREE, AND THE MOST IMPORTANT OF THE
+   * THREE WAS DOCUMENTED NOWHERE. A host had to call `pollStall()`,
+   * `tick.advance(dt)` and `interp.sample(dt, now)` every frame; the middle one
+   * appeared in no README, no architecture doc and not even in this repo's own
+   * shipped client example, and omitting it is silent and expensive. Measured:
+   * `tick.value` pinned at 4 while the server reached 20.2, so every input was
+   * stamped 1.6 seconds in the past and drifting without bound, and because
+   * `shouldReanchor` gates on `initialized` (which only `advance()` sets) the
+   * omission ALSO permanently disabled the recovery that would have masked it.
+   * The room connects, remote entities move beautifully, and only the player's
+   * own input is wrong, in a way that reads as latency rather than a bug.
+   * Folding all three into the call that returns the poses to draw is what
+   * makes forgetting one of them impossible: a host that does not call this
+   * renders nothing at all, which is loud.
+   *
+   * `nowMs` defaults to the same clock this class stamps `receivedAt` with, so
+   * playback and the arrival stamps agree by construction. Pass the
+   * `requestAnimationFrame` timestamp if you would rather name it: that is the
+   * same `performance.now()` domain. DO NOT pass a `Date.now()` reading, which
+   * is a different domain by about 1.7e12, and differencing the two is what
+   * puts the playhead somewhere no frame will ever bracket.
+   */
+  frame(nowMs: number = now()): FrameView<K> {
+    const dt =
+      this.lastFrameAt === null ? 0 : Math.max(0, Math.min(FRAME_DT_CAP_S, (nowMs - this.lastFrameAt) / 1000));
+    this.lastFrameAt = nowMs;
+
+    this.clock.advance(dt);
+    const stalled = this.pollStall(nowMs);
+    const entities = this.opts.interpolate
+      ? this.opts.interpolate.into.sample(dt, nowMs)
+      : new Map<K, InterpolatedEntity>();
+
+    return { entities, stalled, dt };
+  }
+
+  /**
+   * Reset everything scoped to one CONNECTION EPOCH, at the moment a fresh
+   * attempt begins.
+   *
+   * The tick counter must re-anchor from the next snapshot rather than trust a
+   * value it kept advancing through a gap where no server owned the room, and
+   * the interpolator must drop a buffer whose frames and whose measured clock
+   * offset both belong to the previous socket's path. Those two facts have
+   * always been the same fact; only the first of them used to live here, and
+   * the second was left to every caller to remember from `onStatus`.
+   */
+  private beginEpoch(): void {
+    this.clock.markUnanchored();
+    this.opts.interpolate?.into.clear();
+  }
+
+  /** The stall half of `frame()`, kept separate so the decision is made from one place and so a host driving its own clock can still reach it. */
+  private pollStall(nowMs: number): boolean {
     const decision = stallDecision({
-      now: now(),
+      now: nowMs,
       lastSnapAt: this.lastSnapAt,
       connectStartedAt: this.connectStartedAt,
       status: this._status,
@@ -299,7 +471,7 @@ export class RoomConnection {
     this.ws = socket;
 
     this.epochDelivered = false;
-    this.tick.markUnanchored();
+    this.beginEpoch();
     let openedThisSocket = false;
 
     socket.onopen = () => {
@@ -459,7 +631,7 @@ export class RoomConnection {
   private processSnapshot(buf: ArrayBuffer): void {
     if (this.versionSkewStopped) return;
 
-    let decoded: DecodedSnapshotLike | null;
+    let decoded: TSnap | null;
     try {
       decoded = this.opts.decodeSnapshot(buf);
     } catch {
@@ -523,17 +695,32 @@ export class RoomConnection {
     this.lastSnapServerTime = decoded.serverTime;
 
     const estimate = this.estimateServerTick();
-    if (!this.tick.anchored) {
-      this.tick.anchorTo(estimate);
+    if (!this.clock.anchored) {
+      this.clock.anchorTo(estimate);
     } else if (
       shouldReanchor({
-        anchored: this.tick.anchored,
-        initialized: this.tick.initialized,
-        clientTick: this.tick.value,
+        anchored: this.clock.anchored,
+        initialized: this.clock.initialized,
+        clientTick: this.clock.value,
         serverTick: estimate,
       })
     ) {
-      this.tick.anchorTo(estimate);
+      this.clock.anchorTo(estimate);
+    }
+
+    // BEFORE `onSnapshot`, deliberately. `onSnapshot` is host code and this
+    // class does not wrap it, so a throw in it escapes into the socket's
+    // message handler; putting the push first means a host callback that
+    // throws costs one callback rather than also silently starving playback of
+    // every frame after it.
+    //
+    // `receivedAt` is `t`, the same reading `frame()` measures its own delta
+    // from and passes to `sample()`, so the two clocks the offset estimate
+    // differences are one clock by construction rather than by a caller
+    // remembering to use `performance.now()` in both places.
+    const interpolate = this.opts.interpolate;
+    if (interpolate) {
+      interpolate.into.push({ receivedAt: t, serverTime: decoded.serverTime, entities: interpolate.entities(decoded) });
     }
 
     this.opts.onSnapshot?.(decoded);

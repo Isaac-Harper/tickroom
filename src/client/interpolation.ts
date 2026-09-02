@@ -180,8 +180,8 @@ export const REANCHOR_MIN_SAMPLES = 5;
 export const OFFSET_FLOOR_SLACK_MS = 1000;
 
 /**
- * Consecutive floor-refused frames after which the refusal STOPS and the new
- * timeline is adopted instead.
+ * Floor-refused frames WITHIN `TIMELINE_STEP_WINDOW` after which the refusal
+ * STOPS and the new timeline is adopted instead.
  *
  * Refusing forever would be worse than the bug it prevents. A server clock
  * that genuinely steps forward (a handoff onto a machine whose clock runs
@@ -189,8 +189,7 @@ export const OFFSET_FLOOR_SLACK_MS = 1000;
  * frame trips it too, so a permanent refusal is a permanent stall: no frame
  * ever reaches the buffer again. A corrupt frame is a ONE-OFF by nature (the
  * next frame from the same stream is normal again); a clock step is SUSTAINED.
- * Counting consecutive refusals is what tells them apart, and the count resets
- * on the first frame that lands back near the floor.
+ * Counting refusals is what tells them apart.
  *
  * Three is one and a half snapshot intervals at 20Hz, so believing the step
  * costs about 150ms of refused frames rather than the 600ms
@@ -199,10 +198,36 @@ export const OFFSET_FLOOR_SLACK_MS = 1000;
  */
 export const TIMELINE_STEP_FRAMES = 3;
 
+/**
+ * How many judged frames the `TIMELINE_STEP_FRAMES` count is taken over. THE
+ * COUNT IS WINDOWED, NOT CONSECUTIVE, AND THAT DISTINCTION IS A FIX RATHER
+ * THAN A REFINEMENT.
+ *
+ * It used to be a run of CONSECUTIVE refusals, reset by the first frame that
+ * landed back near the floor. That is not invariant to arrival ORDER, and
+ * `push()` documents out-of-order arrivals as ordinary. The event that most
+ * needs the escape hatch reorders the stream BY DEFINITION: a latency DROP
+ * larger than the slack leaves packets already in flight arriving on the old
+ * schedule, so old and new interleave, and every old one reset the counter.
+ * Measured on a 3000ms base one-way delay dropping by 1001ms: 23 legitimate
+ * frames refused across the overlap with `reanchors` still 0, then a 6106 u/s
+ * spike once the overlap finally cleared, where the same drop one millisecond
+ * smaller refused nothing at all and peaked at 133.
+ *
+ * A window keeps both properties the consecutive count had. A one-off corrupt
+ * stamp is one refusal in twelve frames and never approaches the threshold
+ * however many times it recurs, as long as it recurs sparsely; a genuine step
+ * refuses every frame and reaches the threshold in four. Twelve frames is
+ * 600ms at 20Hz, comfortably longer than the reorder overlap a slack-sized
+ * latency drop can produce and comfortably shorter than the interval at which
+ * an isolated bad stamp would have to arrive to accumulate.
+ */
+export const TIMELINE_STEP_WINDOW = 12;
+
 /** Raw clock-offset samples retained for the local-to-server clock estimate. Sized so the tail of a jitter distribution is actually representable (a one-in-fifty spike exists in the window rather than being averaged out of it) and so that at a 20Hz snapshot rate the window spans a few seconds, which is short enough for the estimate to track genuine clock drift. */
 export const OFFSET_WINDOW = 128;
 
-/** Maximum fraction of real elapsed time the clock offset may slew by. Identical reasoning to `STEP_DILATION_MAX` in `clientTick.ts`: the offset is subtracted from the playhead, so moving it IS moving playback in time, and moving it faster than a few percent of wall time is perceptible as remote entities briefly running fast or slow. 5% is below that threshold and still closes a 100ms clock correction in two seconds. */
+/** Maximum fraction of real elapsed time the clock offset may slew by. The offset is subtracted from the playhead, so moving it IS moving playback in time, and moving it faster than a few percent of wall time is perceptible as remote entities briefly running fast or slow. 5% is below that threshold and still closes a 100ms clock correction in two seconds. */
 export const OFFSET_SLEW_MAX = 0.05;
 
 /** Quantile of the measured jitter-above-the-floor that the adaptive delay covers. Chosen by measurement, not by taste: see the note on `recomputeTargetDelay`. */
@@ -257,7 +282,7 @@ export interface InterpolatedEntity extends EntitySample {
   extrapolated: boolean;
 }
 
-export interface SnapshotFrame<K extends string | number = number> {
+export interface SnapshotFrame<K extends string | number> {
   /**
    * Local clock (matching whatever clock `sample()`'s `nowMs` uses) at the
    * moment this frame was received. REQUIRED, and it is the sole input to the
@@ -364,7 +389,22 @@ function medianAsc(sorted: number[]): number {
   return n % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
 }
 
-export class SnapshotInterpolator<K extends string | number = number> {
+/**
+ * `K` HAS NO DEFAULT, DELIBERATELY, and it used to default to `number`.
+ *
+ * The key is whatever the host's snapshot identifies an entity by, and this
+ * library ships two paths that disagree about what that is: every pid it hands
+ * a simulation is a `string` (join, leave, applyInput, RoomStats), while the
+ * default codec's `CodecEntity.id` is a `number`. So there is no answer that is
+ * right by default, only an answer that is silently wrong for one of the two.
+ * A default of `number` also meant a JSON host keyed by pid got a `Map<number,
+ * ...>` it then failed to look anything up in, and the fix shipped for it was
+ * fifteen lines of README telling the reader off for a mistake the compiler was
+ * already able to catch, plus advice that is actively wrong on the codec path.
+ * Naming the key type at every call site costs eight characters and turns the
+ * whole class of mistake into one compile error.
+ */
+export class SnapshotInterpolator<K extends string | number> {
   private readonly minDelayMs: number;
   private readonly maxDelayMs: number;
   private readonly startDelayMs: number;
@@ -393,8 +433,10 @@ export class SnapshotInterpolator<K extends string | number = number> {
   private lastServerTime: number | null = null;
   /** Highest `serverTime` among the frames that have landed SINCE the error window opened, or null while none has. Not the same as `lastServerTime` (the highest ever seen): the two differ exactly when the authority's clock steps backwards, which is the case the re-anchor's dead-epoch cut has to tell apart. */
   private errorWindowNewestServerTime: number | null = null;
-  /** Raw offsets of the run of consecutive frames refused for sitting below the offset floor. Empty whenever the last frame landed near the floor, which is what makes the run CONSECUTIVE. See `refuseSteppedFrame`. */
+  /** Raw offsets of the frames refused for sitting below the offset floor, within the current window. See `refuseSteppedFrame`. */
   private steppedOffsets: number[] = [];
+  /** Frames judged since the FIRST refusal in `steppedOffsets` landed, so the count above can be aged out as a window rather than reset by one in-floor arrival. See `TIMELINE_STEP_WINDOW`. */
+  private steppedWindowFrames = 0;
   /** Raw offset of the frame that SEEDED the estimate, while that seed is still provisional, or null once it has been corroborated or discarded. See `refuteSeedFrame`. */
   private seedOffsetMs: number | null = null;
   /** Raw offsets of the run of consecutive frames that have CONTRADICTED the provisional seed, and the newest `serverTime` among them. */
@@ -537,11 +579,17 @@ export class SnapshotInterpolator<K extends string | number = number> {
    * (a handoff onto a machine running ahead) looks identical on the first
    * frame, and on every frame after it, so a refusal with no way out is a
    * total stall. What separates them is persistence: a corrupt stamp is a
-   * one-off and the next frame lands back near the floor, while a stepped
-   * clock keeps arriving. Past `TIMELINE_STEP_FRAMES` consecutive refusals the
-   * evidence is a timeline, not a glitch, so the collected offsets become the
-   * new anchor through the same escape hatch a stranded playhead uses, and the
-   * frame that proved it is accepted normally.
+   * one-off, while a stepped clock keeps arriving. Past `TIMELINE_STEP_FRAMES`
+   * refusals WITHIN `TIMELINE_STEP_WINDOW` judged frames the evidence is a
+   * timeline, not a glitch, so the collected offsets become the new anchor
+   * through the same escape hatch a stranded playhead uses, and the frame that
+   * proved it is accepted normally.
+   *
+   * THE COUNT IS OVER A WINDOW RATHER THAN OVER A CONSECUTIVE RUN, because a
+   * run is not invariant to arrival order and `push()` documents out-of-order
+   * arrivals as ordinary. See `TIMELINE_STEP_WINDOW` for the latency-drop
+   * profile that reorders the stream by construction and for what a
+   * consecutive count measured on it.
    */
   private refuseSteppedFrame(frame: SnapshotFrame<K>): boolean {
     // Nothing to be implausible against until the estimate has been seeded:
@@ -554,12 +602,22 @@ export class SnapshotInterpolator<K extends string | number = number> {
     // alone leaves the non-finite tests green and deleting both reddens them.
     if (!this.offsetSeeded) return false;
 
-    const rawOffset = frame.receivedAt - frame.serverTime;
-    if (rawOffset >= this.offsetFloor() - OFFSET_FLOOR_SLACK_MS) {
+    // Age the window BEFORE judging this frame, so the count always describes
+    // the last `TIMELINE_STEP_WINDOW` frames judged. An in-floor frame no
+    // longer clears the count on its own: under a slack-sized latency drop the
+    // stream reorders and old, still-below-floor frames interleave with new
+    // in-floor ones, so a clear-on-first-good rule can never accumulate the
+    // evidence the escape hatch needs, and it is exactly the profile that
+    // needs it most.
+    if (this.steppedOffsets.length > 0 && ++this.steppedWindowFrames > TIMELINE_STEP_WINDOW) {
       this.steppedOffsets.length = 0;
-      return false;
+      this.steppedWindowFrames = 0;
     }
 
+    const rawOffset = frame.receivedAt - frame.serverTime;
+    if (rawOffset >= this.offsetFloor() - OFFSET_FLOOR_SLACK_MS) return false;
+
+    if (this.steppedOffsets.length === 0) this.steppedWindowFrames = 1;
     this.steppedOffsets.push(rawOffset);
     if (this.steppedOffsets.length <= TIMELINE_STEP_FRAMES) {
       this.rejectedFrameCount++;
@@ -574,6 +632,7 @@ export class SnapshotInterpolator<K extends string | number = number> {
     this.pushesSinceErrorStart = this.steppedOffsets.length;
     this.reanchor();
     this.steppedOffsets.length = 0;
+    this.steppedWindowFrames = 0;
     return false;
   }
 
@@ -888,6 +947,7 @@ export class SnapshotInterpolator<K extends string | number = number> {
     this.lastServerTime = null;
     this.errorWindowNewestServerTime = null;
     this.steppedOffsets = [];
+    this.steppedWindowFrames = 0;
     this.seedOffsetMs = null;
     this.seedRefutations = [];
     this.seedRefutationNewest = -Infinity;

@@ -19,12 +19,8 @@ export {
   ClientTick,
   ANCHOR_MARGIN,
   TICK_STEP_CAP,
-  STEP_DILATION_MAX,
-  MARGIN_TARGET,
-  MARGIN_SPAN,
-  HEALTH_EASE_TAU,
-  DILATION_EASE_TAU,
   type ClientTickOptions,
+  type ClientTickView,
 } from './clientTick.js';
 
 export {
@@ -38,6 +34,7 @@ export {
   REANCHOR_MIN_SAMPLES,
   OFFSET_FLOOR_SLACK_MS,
   TIMELINE_STEP_FRAMES,
+  TIMELINE_STEP_WINDOW,
   OFFSET_WINDOW,
   OFFSET_SLEW_MAX,
   DELAY_JITTER_QUANTILE,
@@ -52,10 +49,14 @@ export {
 
 export {
   RoomConnection,
+  isRosterFrame,
   type SessionInfo,
   type DecodedSnapshotLike,
+  type RosterFrame,
   type TerminalReason,
   type WebSocketLike,
   type WebSocketConstructor,
   type RoomConnectionOptions,
+  type SnapshotInterpolationOptions,
+  type FrameView,
 } from './connection.js';

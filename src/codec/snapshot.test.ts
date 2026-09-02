@@ -1,17 +1,18 @@
 import { describe, it, expect } from 'vitest';
-import { ByteWriter } from './bytes.js';
+import { ByteWriter, CodecError } from './bytes.js';
 import {
   DEFAULT_SNAPSHOT_VERSION,
   encodeDefaultSnapshot,
   decodeDefaultSnapshot,
   INPUT_WINDOW_MAX,
+  AXIS_SCALE,
   encodeInputWindow,
   decodeInputWindow,
   inputWindowToClientInputs,
   type DefaultSnapshot,
   type DefaultInputRecord,
 } from './snapshot.js';
-import { I16, CM_SCALE, representableRange } from './quantize.js';
+import { I16, U16, CM_SCALE, representableRange } from './quantize.js';
 
 describe('default snapshot codec', () => {
   it('round-trips a snapshot with several entities', () => {
@@ -312,5 +313,94 @@ describe('default input window codec', () => {
     expect(ci.seq).toBe(5);
     expect(ci.targetTick).toBe(50);
     expect(ci.data).toEqual({ axes: [0.25, -0.75], buttons: 3 });
+  });
+});
+
+describe('an out-of-range entity id is refused rather than wrapped', () => {
+  function snapWith(id: number): DefaultSnapshot {
+    return {
+      version: DEFAULT_SNAPSHOT_VERSION,
+      tick: 1,
+      serverTime: 1_700_000_000_000,
+      entities: [{ id, x: 0, y: 0 }],
+    };
+  }
+
+  it('throws CodecError on an id past the u16 ceiling, instead of aliasing two players onto one entity', () => {
+    // THE ONE FIELD IN THIS CODEC THAT BYPASSED THE QUANTISER, in a library
+    // whose quantiser docs shout CLAMP, NEVER WRAP. `ByteWriter.u16` wraps, so
+    // an id of 70000 was written as 4464 and decoded as 4464: two players
+    // sharing one entity for the rest of the room's life, with no error and
+    // nothing in a metric. A host derives an entity id from something
+    // monotonic (a join counter, a database row id) often enough that 65536 is
+    // reachable in ordinary use.
+    //
+    // CLAMPING WOULD BE NO BETTER HERE, which is why this throws rather than
+    // borrowing the position fields' answer: 65535 is not an approximation of
+    // 70000, it is a different player, and a clamped id aliases exactly the
+    // same way a wrapped one does. There is no nearby value for an identity.
+    expect(() => encodeDefaultSnapshot(snapWith(70000))).toThrow(CodecError);
+    expect(() => encodeDefaultSnapshot(snapWith(U16.max + 1))).toThrow(CodecError);
+    expect(() => encodeDefaultSnapshot(snapWith(-1))).toThrow(CodecError);
+    expect(() => encodeDefaultSnapshot(snapWith(1.5))).toThrow(CodecError);
+    expect(() => encodeDefaultSnapshot(snapWith(NaN))).toThrow(CodecError);
+  });
+
+  it('accepts both ends of the representable range, so the guard is a bound and not a narrowing', () => {
+    // The refusal has to leave every legal id alone, including the boundary
+    // values a naive `<`/`>` slip would take out.
+    for (const id of [U16.min, 1, 255, 256, 65534, U16.max]) {
+      const round = decodeDefaultSnapshot(encodeDefaultSnapshot(snapWith(id)));
+      expect(round.entities[0]!.id).toBe(id);
+    }
+  });
+});
+
+describe('the default input window carries a host-chosen axis scale', () => {
+  function rec(axes: [number, number]): DefaultInputRecord {
+    return { seq: 1, targetTick: 10, axes, buttons: 0 };
+  }
+
+  it('CLAMPS out-of-range axes at the default scale, which is what a positional payload silently hits', () => {
+    // The sibling of the position clamp the snapshot half documents at length,
+    // in an API that had no scale knob at all. `axes` is an i8 normalised to
+    // [-1, 1], so a host that reached for the shipped input window to carry
+    // cursor COORDINATES got this: every remote cursor stacked in one corner,
+    // no error, nothing in a metric. Pinned as behaviour rather than only
+    // described, because the clamp is the only signal it ever produces.
+    const [out] = decodeInputWindow(encodeInputWindow([rec([640, 480])]));
+    expect(out!.axes[0]).toBe(1);
+    expect(out!.axes[1]).toBe(1);
+
+    const [neg] = decodeInputWindow(encodeInputWindow([rec([-640, -480])]));
+    expect(neg!.axes[0]).toBe(-1);
+    expect(neg!.axes[1]).toBe(-1);
+  });
+
+  it('axisScale moves the boundary, so a host whose axes are not a normalised stick is not silently clipped', () => {
+    // The mirror of `positionScale`. At scale 1 one integer step is one whole
+    // axis unit, so the same field spans +-127 instead of +-1: a host counting
+    // in percent, or in a small integer range of its own, round-trips instead
+    // of pinning at 1.
+    const opts = { axisScale: 1 };
+    const [out] = decodeInputWindow(encodeInputWindow([rec([64, -48])], opts), opts);
+    expect(out!.axes[0]).toBe(64);
+    expect(out!.axes[1]).toBe(-48);
+
+    // And the boundary still clamps, at the new place rather than the old one.
+    const [past] = decodeInputWindow(encodeInputWindow([rec([640, -640])], opts), opts);
+    expect(past!.axes[0]).toBe(127);
+    expect(past!.axes[1]).toBe(-127);
+  });
+
+  it('the DEFAULT wire is unchanged: omitting the option is exactly AXIS_SCALE', () => {
+    // The option must not have moved the default, for the same reason
+    // `positionScale` did not: the bytes would mean something new while moving
+    // no byte, which is a protocol break that nothing on the wire could report.
+    const records = [rec([0.5, -0.25])];
+    expect(encodeInputWindow(records)).toEqual(encodeInputWindow(records, { axisScale: AXIS_SCALE }));
+    const [out] = decodeInputWindow(encodeInputWindow(records));
+    expect(out!.axes[0]).toBeCloseTo(0.5, 2);
+    expect(out!.axes[1]).toBeCloseTo(-0.25, 2);
   });
 });

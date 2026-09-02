@@ -6,21 +6,21 @@
 // That is what the library is for.
 //
 // The one idea worth internalising: WE DO NOT DRAW WHAT THE SERVER SAID. We
-// draw what the interpolator says, which is the server's state replayed on a
+// draw what `conn.frame()` returns, which is the server's state replayed on a
 // deliberate delay so that jitter has somewhere to hide. See section 5 of
 // docs/ARCHITECTURE.md for why that delay is the correct trade.
 
-import { RoomConnection, SnapshotInterpolator } from '../../src/client/index.js';
+import { RoomConnection, SnapshotInterpolator, type EntitySample } from '../../src/client/index.js';
 import { FIELD_H, FIELD_W } from './sim.js';
 
-// The index signature is required by `DecodedSnapshotLike`, and it is not
-// bureaucracy: the connection guarantees only `tick` and `serverTime` (it needs
-// those two to run the clock and the tick timeline) and treats everything else
-// as opaque payload it must not assume the shape of. Declaring the extra fields
-// alongside an index signature is how a caller says "these are mine, you carry
-// them".
+// A plain interface, with no index signature and no relationship to any
+// tickroom type. `decodeSnapshot`'s return type is what fixes the payload type
+// for `onSnapshot` and for `interpolate.entities`, so this shape flows through
+// the connection and comes back out intact. It used to have to extend
+// `DecodedSnapshotLike` for the index signature, and `onSnapshot` still handed
+// it back erased, which is why this file used to open its callback with the
+// `as unknown as` double cast TypeScript's own error text calls a mistake.
 interface PongSnapshot {
-  [k: string]: unknown;
   tick: number;
   serverTime: number;
   ball: { x: number; y: number };
@@ -42,6 +42,11 @@ export function startPong(canvas: HTMLCanvasElement): () => void {
   let selfPid = '';
 
   const conn = new RoomConnection({
+    // Must match `pong.tickHz` in sim.ts. Required rather than defaulted,
+    // because a client silently running on the wrong basis skews the tick
+    // counter, the server-tick estimate and the underrun threshold at once.
+    tickHz: 20,
+
     mint: async () => {
       const res = await fetch('/api/session?room=pong', { method: 'POST' });
       // A mint has more than one failure shape and only one of them is JSON. A
@@ -56,40 +61,31 @@ export function startPong(canvas: HTMLCanvasElement): () => void {
 
     decodeSnapshot: (buf) => JSON.parse(new TextDecoder().decode(buf)) as PongSnapshot,
 
-    onSnapshot: (raw) => {
-      const snap = raw as unknown as PongSnapshot;
-      winner = snap.winner;
-      serveIn = snap.serveIn;
-
-      // Hand the interpolator only the things that MOVE, keyed stably. The ball
-      // and each paddle are entities; the score is not.
-      const entities = new Map<string, { x: number; y: number }>();
-      entities.set('ball', { x: snap.ball.x, y: snap.ball.y });
-      const next = new Map<string, number>();
-      for (const p of snap.paddles) {
-        entities.set(p.pid, { x: p.side === 'left' ? 6 : FIELD_W - 6, y: p.y });
-        next.set(p.pid, p.score);
-      }
-      scores = next;
-
-      interp.push({
-        receivedAt: performance.now(),
-        // The SERVER's clock stamp, not ours. The interpolator runs its playhead
-        // on server time so that a client whose local clock drifts, or which
-        // receives a burst of packets after a stall, still replays the world at
-        // the rate the server produced it.
-        serverTime: snap.serverTime,
-        entities,
-      });
+    // The connection owns the interpolator: it pushes every decoded snapshot in
+    // with the right two timestamps and clears the buffer on every epoch
+    // change. All this side has to say is which parts of a snapshot MOVE.
+    interpolate: {
+      into: interp,
+      entities: (snap) => {
+        // The ball and each paddle are entities; a score is not. Interpolating
+        // discrete state is meaningless (there is no half a point), so it is
+        // read in `onSnapshot` instead.
+        const entities = new Map<string, EntitySample>();
+        entities.set('ball', { x: snap.ball.x, y: snap.ball.y });
+        for (const p of snap.paddles) {
+          entities.set(p.pid, { x: p.side === 'left' ? 6 : FIELD_W - 6, y: p.y });
+        }
+        return entities;
+      },
     },
 
-    onStatus: (status) => {
-      // Clear the interpolator on every disconnect. `RoomConnection` holds no
-      // reference to it, so nothing else can, and a buffer carried across an
-      // epoch brackets the new socket's first frame against one from seconds
-      // ago: a guaranteed snap on every reconnect, plus a clock offset
-      // estimated over the old socket's path.
-      if (status !== 'open') interp.clear();
+    // `snap` arrives as `PongSnapshot`, not as an erased shape needing a cast.
+    onSnapshot: (snap) => {
+      winner = snap.winner;
+      serveIn = snap.serveIn;
+      const next = new Map<string, number>();
+      for (const p of snap.paddles) next.set(p.pid, p.score);
+      scores = next;
     },
 
     onStallChange: (stalled) => {
@@ -132,26 +128,25 @@ export function startPong(canvas: HTMLCanvasElement): () => void {
   window.addEventListener('keydown', keydown);
   window.addEventListener('keyup', keyup);
 
+  // UNSTAMPED, deliberately: no `targetTick`, so the server applies each input
+  // on arrival and the playout buffer never engages. Pong predicts nothing
+  // locally, and a tick of skew on a paddle is invisible. Stamp it with
+  // `conn.tick.value` (and check `conn.tick.initialized` first) the moment you
+  // add local prediction, so the client and the server run the identical input
+  // on the identical tick; see `examples/cursors/client.ts` for that shape.
   const sendTimer = setInterval(() => {
     conn.send(new TextEncoder().encode(JSON.stringify({ seq: Date.now(), data: { dir } })));
   }, 50);
 
-  let last = performance.now();
   let raf = 0;
   const frame = (now: number) => {
-    const dt = Math.min(0.1, (now - last) / 1000);
-    last = now;
-
-    // Once per rendered frame. This is what drives the stall detector's edges,
-    // and it is cheap: two timestamp comparisons and no allocation.
-    conn.pollStall();
-
-    // Pass the rAF timestamp explicitly rather than relying on the
-    // interpolator's default: it happens to be the same clock
-    // (performance.now()) as what onSnapshot() stamps receivedAt with above,
-    // but naming it here keeps the two call sites visibly tied to one clock
-    // instead of one of them reaching for a default and hoping it matches.
-    const view = interp.sample(dt, now);
+    // THE ONE PER-FRAME CALL. It advances the tick counter inputs are stamped
+    // against, polls the stall detector, and samples the interpolator, all from
+    // one delta the connection measures for itself. This used to be three
+    // separate calls and one of them was documented nowhere, so a client that
+    // looked completely healthy could be stamping every input a second and a
+    // half into the past.
+    const { entities: view } = conn.frame(now);
     const sx = canvas.width / FIELD_W;
     const sy = canvas.height / FIELD_H;
 

@@ -1,5 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
-import { SnapshotInterpolator, OFFSET_SLEW_MAX, TIMELINE_STEP_FRAMES, type SnapshotFrame } from './interpolation.js';
+import {
+  SnapshotInterpolator,
+  OFFSET_SLEW_MAX,
+  OFFSET_FLOOR_SLACK_MS,
+  TIMELINE_STEP_FRAMES,
+  type SnapshotFrame,
+} from './interpolation.js';
 
 type Pose = { x: number; y: number; heading?: number };
 
@@ -908,6 +914,62 @@ describe('SnapshotInterpolator', () => {
       expect(stale).toBeLessThan(40); // 40 units = 400ms of world time
       expect(stale).toBeGreaterThan(-5);
     }
+  });
+
+  it('the floor-refusal escape hatch counts over a WINDOW, so a reordering latency drop cannot stall it', () => {
+    // THE ONE PROFILE A CONSECUTIVE COUNT CANNOT ESCAPE, and it is the profile
+    // that most needs the escape hatch. A latency DROP larger than
+    // `OFFSET_FLOOR_SLACK_MS` reorders the stream BY DEFINITION: packets
+    // already in flight keep arriving on the old schedule while packets sent
+    // after the drop overtake them, so old and new interleave one for one
+    // across the whole overlap. Every old one sits at the established floor and
+    // is accepted; every new one sits a full second below it and is refused.
+    //
+    // A run of CONSECUTIVE refusals is therefore reset by every second frame
+    // and can never reach `TIMELINE_STEP_FRAMES` while the overlap lasts, even
+    // though the evidence for the new timeline is overwhelming and arriving
+    // twice a tick. Measured on this exact profile with the consecutive count:
+    // 23 legitimate frames refused across the overlap with `reanchors` still 0,
+    // then a 6106 u/s spike once the old stream finally ran out. `push()`
+    // documents out-of-order arrivals as ORDINARY, so a discriminator built on
+    // arrival order was contradicting the class's own contract; it is the same
+    // lesson the dead-epoch cut learned when it keyed on the LAST arrival
+    // rather than the newest.
+    //
+    // Windowed, the count survives the interleave: three refusals inside
+    // `TIMELINE_STEP_WINDOW` judged frames, then the fourth adopts the new
+    // timeline, which is the same cost a non-reordering step already pays.
+    const interp = new SnapshotInterpolator<string>();
+    const tickMs = 50;
+    const oldDelay = 3000;
+    const newDelay = oldDelay - (OFFSET_FLOOR_SLACK_MS + 1);
+    const dropAtTick = 100;
+
+    const arrivals: Arrival[] = [];
+    for (let i = 0; i < 300; i++) {
+      const serverTime = i * tickMs;
+      arrivals.push({
+        serverTime,
+        receivedAt: serverTime + (i < dropAtTick ? oldDelay : newDelay),
+        entities: { a: { x: i * 5, y: 0 } },
+      });
+    }
+    // Delivery order is ARRIVAL order, which is what the drop scrambles.
+    arrivals.sort((p, q) => p.receivedAt - q.receivedAt);
+
+    let renderAt = 0;
+    for (const a of arrivals) {
+      interp.push(frame(a.serverTime, a.receivedAt, a.entities));
+      while (renderAt < a.receivedAt) {
+        interp.sample(1 / 60, renderAt);
+        renderAt += 1000 / 60;
+      }
+    }
+
+    // Exactly the persistence the mechanism is specified to demand, and no
+    // more: the consecutive count paid 23 here for the same event.
+    expect(interp.rejectedFrames).toBe(TIMELINE_STEP_FRAMES);
+    expect(interp.reanchors).toBeGreaterThanOrEqual(1);
   });
 
   it('a large FORWARD serverTime step is adopted as a new timeline instead of stalling forever', () => {

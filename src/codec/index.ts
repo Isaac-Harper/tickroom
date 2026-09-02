@@ -16,12 +16,14 @@ export type {
   DefaultSnapshot,
   DefaultSnapshotCodecOptions,
   DefaultInputRecord,
+  DefaultInputWindowOptions,
 } from './snapshot.js';
 export {
   DEFAULT_SNAPSHOT_VERSION,
   encodeDefaultSnapshot,
   decodeDefaultSnapshot,
   INPUT_WINDOW_MAX,
+  AXIS_SCALE,
   encodeInputWindow,
   decodeInputWindow,
   inputWindowToClientInputs,

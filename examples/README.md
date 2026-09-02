@@ -9,6 +9,16 @@ sitting.
 | [`cursors/sim.ts`](cursors/sim.ts) | Realtime presence, no game at all. A slower tick, unstamped inputs, an idle fade. |
 | [`node-server/`](node-server) | The same runtimes on a plain Node `ws` server, no serverless involved. |
 
+Both simulations have a browser half beside them, [`pong/client.ts`](pong/client.ts) and
+[`cursors/client.ts`](cursors/client.ts), and the pair is the point: read a
+`sim.ts` and its `client.ts` together and you have seen a whole application.
+The two clients differ in three places (`tickHz`, the send cadence that matches
+it, and what `interpolate.entities` pulls out of a snapshot) and are otherwise
+the same twenty lines of wiring, which is the claim the transport makes about
+itself. Both leave `targetTick` at 0 and both key the interpolator by pid;
+neither predicts anything locally, and each says in a comment what stamping
+would look like if it did.
+
 ## What to notice
 
 **Neither simulation imports a socket, Redis, or a platform.** They import one

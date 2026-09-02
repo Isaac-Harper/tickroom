@@ -6,9 +6,18 @@
 // from.
 import type { ClientInput } from '../core/index.js';
 import { ByteWriter, ByteReader, CodecError } from './bytes.js';
-import { quantize, dequantize, quantizeAngle, dequantizeAngle, CM_SCALE, I16 } from './quantize.js';
+import { quantize, dequantize, quantizeAngle, dequantizeAngle, CM_SCALE, I16, U16 } from './quantize.js';
 
 export interface CodecEntity {
+  /**
+   * A stable per-entity handle, `0..65535`. A `u16` on the wire, and OUT OF
+   * RANGE THROWS rather than wrapping: see `encodeDefaultSnapshot`.
+   *
+   * It is a NUMBER while every pid this library hands a simulation is a
+   * `string`, so a host using this codec needs a pid-to-small-int mapping.
+   * `SessionInfo.handle` is that integer and is what the default socket URL
+   * already carries as `h=..`.
+   */
   id: number;
   x: number;
   y: number;
@@ -82,6 +91,19 @@ export interface DefaultSnapshotCodecOptions {
  * what to do about a version mismatch (drop the snapshot, best-effort decode
  * anyway, trigger a client reload) is a policy call that belongs to the
  * caller, not to the codec.
+ *
+ * AN OUT-OF-RANGE ENTITY ID THROWS, and it is the one field here that does not
+ * go through the quantiser. `x` and `y` clamp, which is right for a coordinate
+ * (an entity pinned at a boundary it nearly reached reads as an entity against
+ * a wall) and is exactly wrong for an identity: `ByteWriter.u16` WRAPS, so an
+ * id of 70000 was written as 4464 and two players silently shared one entity
+ * for the rest of the room's life, in a library whose own quantiser docs shout
+ * CLAMP, NEVER WRAP. Neither answer works for an identity, because there is no
+ * such thing as a nearby id: 65535 is not an approximation of 70000, it is a
+ * different player. A host derives these from something monotonic (a join
+ * counter, a row id) often enough that the wrap is reachable in ordinary use,
+ * so this refuses the frame the way `encodeInputWindow` already refuses a
+ * window with too many records.
  */
 export function encodeDefaultSnapshot(
   s: DefaultSnapshot,
@@ -94,6 +116,9 @@ export function encodeDefaultSnapshot(
   w.f64(s.serverTime);
   w.u16(s.entities.length);
   for (const e of s.entities) {
+    if (!Number.isInteger(e.id) || e.id < U16.min || e.id > U16.max) {
+      throw new CodecError(`entity id must be an integer in ${U16.min}..${U16.max}, got ${e.id}`);
+    }
     w.u16(e.id);
     w.i16(quantize(e.x, scale, I16.min, I16.max));
     w.i16(quantize(e.y, scale, I16.min, I16.max));
@@ -146,10 +171,45 @@ export function decodeDefaultSnapshot(
 export interface DefaultInputRecord {
   seq: number;
   targetTick: number;
-  /** Two floats in roughly [-1, 1] (a movement stick, a steer/throttle pair). Quantized to `i8` on the wire, so values are recovered to ~1/127 precision, not bit-exact. */
+  /**
+   * Two floats (a movement stick, a steer/throttle pair). Quantized to `i8` on
+   * the wire, so at the default `axisScale` they span [-1, 1] and are recovered
+   * to ~1/127 precision, not bit-exact.
+   *
+   * OUT-OF-RANGE VALUES CLAMP, SILENTLY, exactly as positions do in the
+   * snapshot half of this file. `[640, 480]` encodes and decodes as `[1, 1]`,
+   * so a host that reached for this window to carry cursor COORDINATES got
+   * every remote cursor stacked in one corner with no error and nothing in a
+   * metric. `axisScale` moves the boundary (see `DefaultInputWindowOptions`),
+   * but note what it cannot move: the field is an `i8`, so the whole range is
+   * 254 steps however it is scaled. A stick is what that resolution is for. A
+   * position wants its own record shape on `ByteWriter`, at `i16` or wider.
+   */
   axes: [number, number];
   /** A held-buttons bitmask: run, interact, an emote key, whatever the caller's input shape needs. */
   buttons: number;
+}
+
+export interface DefaultInputWindowOptions {
+  /**
+   * Integer steps per axis unit, i.e. what one `i8` count MEANS in the host's
+   * input space. Defaults to `AXIS_SCALE` (127), which reads `axes` as a
+   * normalised stick and spans [-1, 1] at 1/127.
+   *
+   * The mirror of `positionScale` on the snapshot half, and it exists for the
+   * same reason: the range is not on the wire, the quantiser CLAMPS at the
+   * boundary, and a clamp against a range the host never chose is silent. A
+   * host whose axes are percentages wants `axisScale: 1` (+-127 at 1 whole
+   * unit); one whose axes are already normalised should leave it alone.
+   *
+   * THE ENCODER AND THE DECODER MUST AGREE. Nothing records the scale, so a
+   * decoder reading at 127 what an encoder wrote at 1 recovers inputs 127x too
+   * small rather than failing, and that is a change in what the BYTES MEAN
+   * while moving no byte, which by this repo's rule is a protocol version bump
+   * the HOST owns. `INPUT_WINDOW_VERSION` deliberately does not move for it,
+   * because the default wire is unchanged.
+   */
+  axisScale?: number;
 }
 
 /** How many stamped inputs one window may carry. See the module comment below for why a client sends more than one. */
@@ -165,14 +225,18 @@ const INPUT_RECORD_TYPE = 1;
 // seq(u32) + targetTick(u32) + axisX(i8) + axisY(i8) + buttons(u8)
 const INPUT_RECORD_SIZE = 4 + 4 + 1 + 1 + 1;
 
-const AXIS_SCALE = 127;
+/** Default `axisScale`: 127 integer steps per axis unit, i.e. a normalised stick spanning [-1, 1] in an `i8`. Exported so a host can name the default it is comparing its own scale against, the same way `CM_SCALE` is. */
+export const AXIS_SCALE = 127;
 
-function quantizeAxis(v: number): number {
-  return quantize(v, AXIS_SCALE, -AXIS_SCALE, AXIS_SCALE);
+/** The clamp bound for an axis, and the reason `axisScale` can move the boundary without ever buying more than 255 steps of resolution: the field is an `i8`. SYMMETRIC, giving up the `i8`'s one extra negative step, so full deflection means the same magnitude in both directions; an asymmetric stick reads as a controller that pulls slightly to one side. */
+const AXIS_LIMIT = 127;
+
+function quantizeAxis(v: number, scale: number): number {
+  return quantize(v, scale, -AXIS_LIMIT, AXIS_LIMIT);
 }
 
-function dequantizeAxis(q: number): number {
-  return dequantize(q, AXIS_SCALE);
+function dequantizeAxis(q: number, scale: number): number {
+  return dequantize(q, scale);
 }
 
 /**
@@ -199,7 +263,11 @@ function dequantizeAxis(q: number): number {
  * this: at a 20Hz send rate that is 300ms of redundancy, which absorbs
  * several consecutive drops, not just one.
  */
-export function encodeInputWindow(records: DefaultInputRecord[]): Uint8Array {
+export function encodeInputWindow(
+  records: DefaultInputRecord[],
+  opts?: DefaultInputWindowOptions
+): Uint8Array {
+  const scale = opts?.axisScale ?? AXIS_SCALE;
   if (records.length < 1 || records.length > INPUT_WINDOW_MAX) {
     throw new CodecError(
       `input window must carry 1..${INPUT_WINDOW_MAX} records, got ${records.length}`
@@ -212,8 +280,8 @@ export function encodeInputWindow(records: DefaultInputRecord[]): Uint8Array {
   for (const rec of records) {
     w.u32(rec.seq);
     w.u32(rec.targetTick);
-    w.i8(quantizeAxis(rec.axes[0]));
-    w.i8(quantizeAxis(rec.axes[1]));
+    w.i8(quantizeAxis(rec.axes[0], scale));
+    w.i8(quantizeAxis(rec.axes[1], scale));
     w.u8(rec.buttons);
   }
   return w.finish();
@@ -252,7 +320,11 @@ export function encodeInputWindow(records: DefaultInputRecord[]): Uint8Array {
  * client's raw frame) should never need a try/catch around this call for it
  * to be safe to run every tick against arbitrary network input.
  */
-export function decodeInputWindow(buf: ArrayBuffer | Uint8Array): DefaultInputRecord[] {
+export function decodeInputWindow(
+  buf: ArrayBuffer | Uint8Array,
+  opts?: DefaultInputWindowOptions
+): DefaultInputRecord[] {
+  const scale = opts?.axisScale ?? AXIS_SCALE;
   const r = new ByteReader(buf);
   if (!r.has(3)) return [];
   const version = r.u8();
@@ -268,8 +340,8 @@ export function decodeInputWindow(buf: ArrayBuffer | Uint8Array): DefaultInputRe
   for (let i = 0; i < count; i++) {
     const seq = r.u32();
     const targetTick = r.u32();
-    const axisX = dequantizeAxis(r.i8());
-    const axisY = dequantizeAxis(r.i8());
+    const axisX = dequantizeAxis(r.i8(), scale);
+    const axisY = dequantizeAxis(r.i8(), scale);
     const buttons = r.u8();
     records.push({ seq, targetTick, axes: [axisX, axisY], buttons });
   }

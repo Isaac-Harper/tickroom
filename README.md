@@ -168,70 +168,81 @@ export const GET = createRelayRoute({
 ### 3. Connect from the browser
 
 ```ts
-import { RoomConnection, SnapshotInterpolator, type DecodedSnapshotLike } from 'tickroom/client';
+import { RoomConnection, SnapshotInterpolator } from 'tickroom/client';
 
-// Players are keyed by pid, a string, everywhere else in tickroom (join,
-// leave, applyInput, RoomStats), so the interpolator is typed to match:
-// SnapshotInterpolator() with no type argument defaults to a NUMBER key,
-// which is the wrong key type for anything this library hands you a pid for.
-const interp = new SnapshotInterpolator<string>();
-
-// decodeSnapshot's return type carries an index signature (`[k: string]:
-// unknown`) precisely so tickroom never assumes the shape of your payload;
-// name your own fields on top of it once, here, the same way
-// examples/pong/client.ts's own PongSnapshot does.
-interface Snapshot extends DecodedSnapshotLike {
+interface Snapshot {
+  tick: number;
+  serverTime: number;
   players: [string, { x: number; y: number }][];
 }
 
+// The key type is REQUIRED and it is the one decision here. Pids are strings
+// everywhere in tickroom, so a JSON room like this one is keyed by `string`;
+// a room on the default binary codec is keyed by `number`, because
+// `CodecEntity.id` is one. There is no default, precisely because there is no
+// answer that is right for both.
+const interp = new SnapshotInterpolator<string>();
+
 const conn = new RoomConnection({
+  tickHz: 20, // must equal your RoomRuntime.tickHz
   mint: () => fetch('/api/session', { method: 'POST' }).then((r) => r.json()),
-  decodeSnapshot: (buf) => JSON.parse(new TextDecoder().decode(buf)),
-  onSnapshot: (raw) => {
-    const snap = raw as Snapshot;
-    interp.push({
-      // BOTH timestamps are required, and they do different jobs.
-      //
-      // `serverTime` is the PLAYBACK AXIS: frames are ordered by it and
-      // interpolated against it, so remote motion is replayed on the uniform
-      // grid the server emitted it on rather than on the smeared schedule the
-      // network happened to deliver it. Send a real server clock stamp here.
-      // Passing your own `performance.now()` for both fields makes this a
-      // no-op that replays every burst and every stretched gap as motion.
-      //
-      // `receivedAt` is the local arrival stamp, and it exists so the
-      // interpolator can measure the offset between your clock and the
-      // server's. It must come from the SAME clock you pass to `sample()`.
-      receivedAt: performance.now(),
-      serverTime: snap.serverTime,
-      entities: new Map(snap.players.map(([id, p]) => [id, { x: p.x, y: p.y }])),
-    });
-  },
-  onStatus: (status) => {
-    // CLEAR THE INTERPOLATOR ON EVERY DISCONNECT. `RoomConnection` holds no
-    // reference to it, so nothing else can. Skip this and the first frame of
-    // the new epoch is bracketed against a frame from seconds ago, which is a
-    // guaranteed snap on every reconnect; the stale clock offset from the old
-    // socket's path comes along with it.
-    if (status !== 'open') interp.clear();
+  decodeSnapshot: (buf) => JSON.parse(new TextDecoder().decode(buf)) as Snapshot,
+  // The connection pushes every snapshot into the interpolator with the right
+  // timestamps and clears it on every reconnect. You say which parts move.
+  interpolate: {
+    into: interp,
+    entities: (snap) => new Map(snap.players),
   },
   onStallChange: (stalled) => banner.toggle(stalled),
 });
 
 await conn.start();
 
-function frame(now: number, dt: number) {
-  conn.pollStall();
-  // Pass `now` explicitly: it is the same clock (performance.now()) that
-  // onSnapshot() stamped receivedAt with above, so playback and the buffer
-  // agree on what time it is. Omitting it also works (sample() defaults to
-  // reading performance.now() itself), but naming it keeps both call sites
-  // visibly tied to one clock.
-  for (const [id, e] of interp.sample(dt, now)) draw(id, e.x, e.y);
+// One input per tick, as HELD STATE rather than an event. `targetTick` is what
+// makes the server and your own prediction apply this on the identical tick;
+// leave it 0 to have the server apply on arrival instead.
+setInterval(() => {
+  if (!conn.tick.initialized) return;
+  conn.send(new TextEncoder().encode(JSON.stringify({
+    seq: seq++,
+    targetTick: conn.tick.value,
+    data: { x: input.x, y: input.y },
+  })));
+}, 50);
+
+// THE ONE PER-FRAME CALL. It advances the tick counter your inputs are stamped
+// against, polls the stall detector, and samples the interpolator, from one
+// delta it measures itself.
+function frame(now: number) {
+  for (const [id, e] of conn.frame(now).entities) draw(id, e.x, e.y);
+  requestAnimationFrame(frame);
 }
+requestAnimationFrame(frame);
 ```
 
-You now have reconnect-with-backoff, session re-minting, a smoothed server clock, server-timeline interpolation that adapts to measured jitter, never-freeze extrapolation, and a stall detector that can tell a dead room from a slow one.
+That is the whole browser integration, upstream and down. You now have
+reconnect-with-backoff, session re-minting, a smoothed server clock,
+server-timeline interpolation that adapts to measured jitter, never-freeze
+extrapolation, and a stall detector that can tell a dead room from a slow one.
+
+**What `conn.send` will not check for you.** It takes
+`ArrayBuffer | Uint8Array | string`, so the payload shape is yours: the relay's
+`decodeInput` in step 2 is the only thing that reads it, and the two have to
+agree. The shape above is one JSON-encoded `ClientInput` per message, matching
+that `decodeInput`. Everything else about the client is now typed end to end,
+so this is the seam to get right.
+
+**The roster arrives on `onText`, and it is typed.** The relay seeds a joining
+socket with a roster frame and the ticker broadcasts one on every change:
+
+```ts
+import { isRosterFrame } from 'tickroom/client';
+
+onText: (msg) => {
+  if (!isRosterFrame(msg)) return;
+  setPresence(Object.keys(msg.map)); // keyed by pid; values are your joinMeta
+},
+```
 
 ---
 
@@ -247,6 +258,8 @@ You now have reconnect-with-backoff, session re-minting, a smoothed server clock
 | `PlayoutBuffer` | An input lands on the *same tick* at both ends despite jitter. |
 | `Inbox` | Backpressure with a per-sender quota, so one flooder degrades only themselves. |
 | `RoomConnection` | Reconnect, resume, re-mint, clock sync, protocol-skew recovery. |
+| `conn.frame(now)` | The one per-frame call: advances the tick, polls the stall, returns the poses to draw. |
+| `conn.tick` | The monotonic counter an input's `targetTick` is stamped from. Anchored per epoch, advanced by `frame()`. |
 | `SnapshotInterpolator` | Other entities move smoothly. Adapts to measured jitter, never freezes. |
 | `ErrorOffset` | A correction becomes a glide instead of a teleport. |
 | `stallDecision` | Tell the player the world is gone, without crying wolf on a routine handoff. |
@@ -279,7 +292,11 @@ if (WORLD_MAX_X > range.max) throw new Error('world does not fit the wire');
 
 The scale is not on the wire, so encoder and decoder must agree, and changing it changes what the bytes MEAN while moving no byte: that is a protocol version bump, and it is yours to make (the version byte is already in the frame). Pick the smallest field that covers your world plus headroom.
 
-**Re-send the last few inputs in every packet.** The playout buffer's push is duplicate-overwriting and out-of-order safe, so re-sends are free, and a lost packet stops mattering.
+**`DefaultInputRecord.axes` is a normalised stick, and it clamps too.** It is an `i8`, so at the default scale it spans [-1, 1] at 1/127 and `[640, 480]` decodes as `[1, 1]`: every remote entity in one corner, silently. `axisScale` moves the boundary the way `positionScale` does (`{ axisScale: 1 }` gives +-127 at one whole unit, and both ends must agree), but note the part scaling cannot fix: the field is 254 steps wide however it is scaled. That is a stick, not a position. A payload carrying COORDINATES wants its own record on `ByteWriter` at `i16` or wider.
+
+**`CodecEntity.id` throws rather than clamping or wrapping.** It is a `u16`, and an id outside `0..65535` is a `CodecError` at encode time. Positions clamp because an entity pinned at a boundary it nearly reached still reads correctly; an identity has no nearby value, so 65535 is not an approximation of 70000, it is a different player. Derive ids from a join counter and they stay small; derive them from a database row id and this is the error you want.
+
+**Re-send the last few inputs in every packet.** The playout buffer's push is duplicate-overwriting and out-of-order safe, so re-sends are free, and a lost packet stops mattering. `encodeInputWindow` is that mechanism for a stick-shaped input; a positional one re-sends its own last few records the same way.
 
 **The successor spawn belongs in `finally`, and must be awaited but raced.** A thrown ticker is exactly when a room would otherwise sit dead. Fire-and-forget was measurably wrong: as the last thing a handler does, it is post-response IO the platform can suspend before it flushes.
 
@@ -310,7 +327,7 @@ If bandwidth ever becomes the bill, the lever is not a bigger plan, it is ending
 | | |
 | --- | --- |
 | [`examples/pong`](examples/pong) | Two-player 2D game. Server-authoritative paddles and ball. |
-| [`examples/cursors`](examples/cursors) | Multiplayer cursors. Not a game at all; realtime presence. |
+| [`examples/cursors`](examples/cursors) | Multiplayer cursors, both halves. Not a game at all; realtime presence, at 10Hz with unstamped inputs. |
 | [`examples/node-server`](examples/node-server) | The same simulation on a plain Node `ws` server, no serverless. |
 
 Each example is tested, not just illustrative: the round-trip tests prove a
@@ -325,7 +342,7 @@ snapshot.
 ## Verification
 
 ```bash
-npm test                       # 400 tests, no services needed
+npm test                       # 556 tests, no services needed
 redis-server --port 6399 --save '' --appendonly no --daemonize yes
 npm run test:integration       # the same architecture against a real Redis
 ```
