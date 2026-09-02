@@ -359,16 +359,19 @@ continues the tick count rather than resetting the room.
 
 ## Status, honestly
 
-Not published to npm and not deployed anywhere. The architecture's production
-evidence is the game it was extracted from, where the lease, the checkpoint
-handoff, the playout timeline, the stall thresholds and the interpolation rules
-were all measured under real load. This repo proves the extraction is faithful
-and that the mechanisms work against real Redis and a real socket; it has not
-itself served a player.
+Published to npm, not deployed anywhere. The architecture's production evidence
+is the game it was extracted from, where the lease, the checkpoint handoff, the
+playout timeline, the stall thresholds and the interpolation rules were all
+measured under real load. This repo proves the extraction is faithful and that
+the mechanisms work against real Redis and a real socket; it has not itself
+served a player.
 
-Known gaps: the integration suite exercises a toy runtime rather than the
-examples end to end, and there is no CI (the integration half needs a Redis
-service container). Both are tracked in `AGENTS.md`.
+CI runs the typecheck, the unit tests and the build on every push and PR, plus
+the integration suite against a Redis service container. Releases publish from a
+tag through npm trusted publishing, so no token is stored anywhere.
+
+Known gap: the integration suite exercises a toy runtime rather than the
+examples end to end. Tracked in `AGENTS.md`.
 
 ---
 

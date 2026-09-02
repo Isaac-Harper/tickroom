@@ -121,7 +121,7 @@ export function renewAttempted(clock: OwnershipClock, now: number): OwnershipClo
 
 /**
  * Options for `renewConfirmed`. See the function doc for what
- * `preserveAttemptTime` trades off, and TR-10b in the migration notes for
+ * `preserveAttemptTime` trades off, and the `TR-10b` block in `lease.test.ts` for
  * why it exists as an opt-in rather than a straight behaviour change.
  */
 export interface RenewConfirmedOptions {

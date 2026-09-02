@@ -77,12 +77,12 @@ export function representableRange(
 // of the first screen rather than the far edge of the map. Such a host must
 // not reach for `quantizeCm` at all: pass `positionScale` to
 // `encodeDefaultSnapshot`/`decodeDefaultSnapshot` (a pixel host wants 1, for
-// +-32767 pixels at 1px resolution), or call `quantize` directly with its own
-// scale, and check the result of `representableRange` against its world
-// bounds at startup.
+// -32768 to +32767 pixels at 1px resolution), or call `quantize` directly
+// with its own scale, and check the result of `representableRange` against
+// its world bounds at startup.
 export const CM_SCALE = 100;
 
-/** Metres to centimetre-precision `i16`. Range is +-327.67m; values further out clamp to that boundary rather than wrapping (see `quantize`). NOTE THE UNIT: a pixel-coordinate host wants `positionScale` on the default codec, not this. */
+/** Metres to centimetre-precision `i16`. Range is -327.68m to +327.67m (an `i16` is not symmetric); values further out clamp to that boundary rather than wrapping (see `quantize`). NOTE THE UNIT: a pixel-coordinate host wants `positionScale` on the default codec, not this. */
 export function quantizeCm(metres: number): number {
   return quantize(metres, CM_SCALE, I16.min, I16.max);
 }

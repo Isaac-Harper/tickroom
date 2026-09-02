@@ -33,16 +33,16 @@ export interface DefaultSnapshotCodecOptions {
   /**
    * Units per integer step for the two position fields, i.e. what one `i16`
    * count MEANS in the host's world. Defaults to `CM_SCALE` (100), which
-   * reads the `x`/`y` on `CodecEntity` as METRES and spans +-327.67m at 1cm
-   * resolution.
+   * reads the `x`/`y` on `CodecEntity` as METRES and spans -327.68m to
+   * +327.67m at 1cm resolution.
    *
    * A HOST WHOSE COORDINATES ARE NOT METRES MUST SET THIS. Pixels and screen
    * units are the common case (this library is aimed at 2D games, cursor
    * layers and map overlays, and those rarely count in metres), and at the
-   * default scale everything past 327.67 CLAMPS to the boundary: entities
+   * default scale everything outside that span CLAMPS to the boundary: entities
    * pile up against a wall the host never placed, with no error, no warning
    * and nothing in a metric to see. A pixel host wants `positionScale: 1`,
-   * which is +-32767 pixels at 1px resolution. Pass the same value to
+   * which is -32768 to +32767 pixels at 1px resolution. Pass the same value to
    * `representableRange` at startup and assert your world bounds fit, because
    * that assertion is the only signal this ever produces.
    *
@@ -65,9 +65,17 @@ export interface DefaultSnapshotCodecOptions {
  * Wire layout, all little-endian (see `bytes.ts`):
  *
  *   header:  u8 version, u32 tick, f64 serverTime, u16 entityCount
- *   entity:  u16 id, i16 x(cm), i16 y(cm), u16 heading(turn), u8 state
+ *   entity:  u16 id, i16 x, i16 y, u16 heading(turn), u8 state
  *            ... repeated entityCount times
  *   trailer: u16 extraLength, extraLength bytes
+ *
+ * `x` and `y` are quantised at `positionScale`, which DEFAULTS to `CM_SCALE`
+ * but is no longer fixed at it, so this layout does not name their unit: the
+ * bytes mean whatever scale the caller passed, and both ends must agree. This
+ * comment used to say `x(cm)`, which stopped being true the moment the scale
+ * became a parameter, and it is the first thing a host reads when working out
+ * what its coordinates mean, i.e. exactly the confusion the parameter was
+ * added to end.
  *
  * `version` is written but NOT enforced here: this function only encodes, it
  * never has a reason to refuse an unexpected version, and a decoder deciding

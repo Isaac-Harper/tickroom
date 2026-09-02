@@ -14,9 +14,13 @@ generalised so it works for 2D games, collaborative apps, multiplayer cursors,
 or anything realtime where several clients need to agree on state changing many
 times a second.
 
-PUBLIC repo, MIT licensed. Not published to npm; consumers install it as a git
+PUBLIC repo, MIT licensed, and PUBLISHED TO NPM as `tickroom` (0.1.1 at the time
+of writing; `npm install tickroom ioredis`). It also still installs as a git
 dependency, which is what `prepare` exists for (npm builds a git dep by running
-it, and `dist/` is gitignored).
+it, and `dist/` is gitignored), so the hook stays whether or not anyone uses that
+route. Releases go out from a version tag via `.github/workflows/release.yml`
+using npm trusted publishing (OIDC), so there is no stored npm token to leak;
+that workflow's header is the operating manual for cutting one.
 
 ## The architecture in one paragraph
 
@@ -111,8 +115,12 @@ whole timing guarantee rests on nothing in it ever awaiting.
   against both non-finite AND implausible timestamps. A playhead stranded for
   `REANCHOR_AFTER_MS` while at least `REANCHOR_MIN_SAMPLES` frames arrive
   re-anchors the offset outright, and so does a run of `TIMELINE_STEP_FRAMES`
-  frames whose implied one-way delay is impossible. Observability: `delayMs`,
-  `underrunRate`, `rejectedFrames`, `reanchors`.
+  frames whose implied one-way delay is impossible. The SEED frame is
+  provisional rather than exempt, because it defines the floor the others are
+  judged against: a run of `TIMELINE_STEP_FRAMES` frames contradicting it
+  discards it. Observability: `delayMs`, `underrunRate`, `rejectedFrames`,
+  `reanchors`, and the last two are lifetime counters that `clear()` does NOT
+  reset.
 - `src/client/connection.ts` - `RoomConnection`. Reconnect, re-mint, clock sync,
   protocol-skew recovery, stall observation.
 - `src/codec/bytes.ts` - `ByteWriter` / `ByteReader`. The reader is a TRUST
@@ -349,7 +357,7 @@ real-Redis suite and skips cleanly when there is none.
 
 ## Status
 
-MEASURED ON THIS TREE, not estimated: `npx vitest run` is 512 tests across 32
+MEASURED ON THIS TREE, not estimated: `npx vitest run` is 538 tests across 32
 files, all green (with a local Redis up, so the six integration files run rather
 than skip); `npx tsc --noEmit` is clean repo-wide including `examples/`;
 `npm run build` emits `dist/` cleanly. Roughly 6,100 lines of source and 3,500 of
@@ -357,9 +365,13 @@ tests. Per layer: core 154, server 46, client 54, codec 72.
 
 - Extracted and implemented: core, server, client, codec, adapters, plus three
   examples (a 2D game, a presence layer, a plain Node host).
-- NOT published to npm. NOT deployed anywhere. NOT run against a real Redis or a
-  real WebSocket, so every claim here is unit-level plus whatever the source
-  architecture already proved in production.
+- PUBLISHED to npm (`tickroom`, 0.1.0 and 0.1.1). NOT deployed anywhere, and
+  never run against production traffic, so every claim here is unit-level and
+  integration-level plus whatever the source architecture already proved in
+  production. This bullet used to say "NOT published to npm... NOT run against a
+  real Redis or a real WebSocket", which contradicted both the release workflow
+  and the real-Redis section further down THIS FILE; if you are updating status,
+  update every place that states it.
 - Every test runs offline against a fake in-memory Redis
   (`src/server/testFakeRedis.ts`, a Map plus a pub/sub hub with `.fork()` for a
   second connection and `.break(method)` to force failures). That fake was built
@@ -374,8 +386,13 @@ tests. Per layer: core 154, server 46, client 54, codec 72.
 ### Verified by mutation, not just observed green
 
 The two-clock rule was checked by reintroducing the historical bug (making
-`renewFailed` advance `lastOwnedAt`) and confirming `lease.test.ts` fails two
-cases, then restoring. If you change anything in `lease.ts`, do this again. A
+`renewFailed` advance `lastOwnedAt`) and confirming `lease.test.ts` fails THREE
+cases, then restoring: `renewFailed leaves the clock completely unchanged`,
+`THE REGRESSION CASE: ...`, and `the two-clock rule survives the option:
+renewFailed still returns the clock unchanged either way`. This said "two" until
+2026-09-02, which was correct when it was written and went stale the moment
+TR-10b added the third case: a mutation matrix is a statement about the tree it
+was measured on, and the COUNT rots even when the behaviour does not. If you change anything in `lease.ts`, do this again. A
 green test that cannot fail is worse than no test, and this is the one invariant
 in the library whose failure mode is silent and catastrophic.
 
@@ -400,7 +417,13 @@ mutation is the interesting one. Deleting `exitReason = 'lease-lost'` from the
 SYNCHRONOUS guard (section 7) reddens only
 `reports lease-lost when the SYNCHRONOUS guard is the only finder`; changing the
 ASYNC path's assignment (section 12) to `'duration'` reddens only
-`stops publishing once the lease is stolen mid-run`. Deleting
+`reports lease-lost when the ASYNC renew is the finder`. That sibling was added
+on 2026-09-02 and this line used to name `stops publishing once the lease is
+stolen mid-run`: strengthening that case (it asserted nothing about publishing,
+see below) meant pacing it onto the SYNCHRONOUS finder, which left section 12
+with no test at all until the sibling was written. STRENGTHENING A TEST CAN
+ORPHAN A MUTATION: when you make a case select a specific detector, check what
+the OTHER detector lost. Deleting
 `lostLeaseExplicitly = true` outright leaves all 35 green, because the
 synchronous guard now catches the same loss and reports the same reason, which
 is the defence in depth the fix creates rather than a hole. Doing BOTH (the
@@ -429,6 +452,31 @@ into twice.
 | future-stamp refusal not applied | `ONE frame stamped in the FUTURE ...` + the forward-step test |
 | future-stamp refusal made PERMANENT | `a large FORWARD serverTime step is adopted ... instead of stalling forever` |
 | dead-epoch cut keyed on the LAST arrival | `an out-of-order arrival on the re-anchor own render frame ...` |
+| seed refutation removed (first frame exempt again) | `the FIRST frame of a connection is PROVISIONAL ...` |
+| `dt` finiteness guard deleted | `a non-finite receivedAt is refused too ...` (via `underrunRate` going permanently NaN) |
+| retention floor `frames.length - 2` widened | `the time prune always leaves two frames ...` |
+| `bracketIndex` `<=` narrowed to `<` | `a playhead exactly on the newest frame is an UNDERRUN ...` |
+| `observeInterval`'s `delta > 0` widened to `!== 0` | `a reordered arrival contributes no emission interval ...` |
+| `posePartial`'s future-only arm deleted | `an entity that has JUST APPEARED renders at its one known pose ...` |
+| `lerpHeading`'s OUTER `wrapAngle` dropped | `heading interpolates the shortest arc across the +-pi wrap` (at frac 0.75; frac 0.5 cannot see it) |
+| speed low-pass replaced by the instantaneous value | `measures a low-passed speed from its own rendered motion` |
+| `clear()` made to reset `rejectedFrameCount`/`reanchorCount` | `clear() resets the GAUGES but deliberately not the lifetime COUNTERS` |
+
+A SECOND DEFENCE-IN-DEPTH PAIR, recorded for the same reason.
+`clientTick.test.ts`'s `reportBufferHealth keeps dilation within +-dilationMax`
+has TWO clamps behind it: deleting the post-ease clamp alone is green, deleting
+the `-1..1` clamp inside the target computation alone is green, deleting BOTH
+reddens it. Neither green cell is a vacuous test.
+
+THE ONE CONSTRUCT WITH NO MUTATION, AND IT IS NOT A HOLE: the `frac` clamp to
+[0,1] in the interpolate branch (and the matching `t` clamp in `posePartial`) is
+UNREACHABLE BY CONSTRUCTION, not merely untested. `push()` keeps `frames`
+ascending by `serverTime` and `bracketIndex` returns the last frame at or before
+the playhead, so `a.serverTime <= playServerTime < b.serverTime` always holds and
+`frac` is in [0,1) before the clamp; `span === 0` is already handled by its own
+guard. Verified by replacing both clamps with a throw on any raw value outside
+[0,1] and running the whole file: nothing threw. Record it as dead defensive
+code, not as a missing test.
 
 THE NOTE ON THE FINITENESS GUARD, because a green cell there is a claim about
 coverage that would otherwise be read as a vacuous test. The finiteness guard
@@ -815,6 +863,137 @@ carrying forward:
   `uptimeMs` well under the duration cap so the two exits stay distinguishable
   independently of the string.
 
+### Defects found by closing the interpolator's known-open items (2026-09-02)
+
+- THE SEED FRAME ESCAPED THE PLAUSIBILITY GUARD, BECAUSE IT *IS* THE FLOOR THE
+  GUARD TESTS AGAINST. `refuseSteppedFrame` returns early while
+  `!offsetSeeded`, so the first frame of a connection is exempt. That is not
+  merely an exemption: the floor is a sliding-window MINIMUM, so the first
+  frame DEFINES the value every later frame is judged by, and a minimum can
+  only ever be dragged further down. A future-stamped seed therefore sets a
+  floor no honest frame can correct, because every real frame afterwards sits
+  ABOVE it, which is indistinguishable from ordinary jitter and is waved
+  through. Measured on a 20Hz stream of an entity moving at a constant
+  100 u/s, the same +1500ms stamp costs NOTHING mid-run (1 frame refused, peak
+  rendered speed 101 u/s, zero rewinds, playback never leaves its band) and
+  costs 767ms of wrong playback on frame one: peak 4548 u/s, 21 backward
+  rewinds, the pose 881ms stale, and `rejectedFrames` STILL ZERO, so the metric
+  that exists to surface exactly this reported nothing. +30000ms measured 767ms
+  and 3782 u/s; the size barely matters, because what is being measured is how
+  long the stranded-playhead re-anchor takes to notice. Fixed by making the
+  seed PROVISIONAL rather than exempt (`refuteSeedFrame`): the same test run in
+  the opposite direction, so `TIMELINE_STEP_FRAMES` consecutive frames sitting
+  more than `OFFSET_FLOOR_SLACK_MS` ABOVE the seed discard it, hand their own
+  offsets in as the error window, and let `reanchor`'s dead-epoch cut lift the
+  seed's frame out of the buffer. After: +1500ms is 0ms of settling and a peak
+  of 619 u/s. The three calm profiles are byte-identical, and the one profile
+  that could have regressed (a genuine congestion onset in the first frames,
+  which is a real reason for later frames to sit above the seed) came out
+  BETTER, not worse: peak 2100 to 1500 u/s and worst rewind 35 to 25 units,
+  because anchoring to three congested packets beats holding a floor from one
+  pre-congestion packet. A server whose clock is simply offset from the client's
+  is untouched, since every frame carries the same offset and frame two
+  corroborates frame one. The STAMPED-IN-THE-PAST direction needed no fix at
+  all and was measured to confirm it: the existing floor guard already catches
+  it on frame two (settling 50ms, 3 frames refused).
+  THE REUSABLE PART IS THE SHAPE. When a guard measures a value against a
+  statistic derived from the same stream, ask what happens to the FIRST sample,
+  and specifically whether the statistic is one a single sample can pin (a
+  minimum, a maximum) rather than one it can only nudge (a mean, a median).
+
+- `rejectedFrames` AND `reanchors` DELIBERATELY SURVIVE `clear()`, AND THAT IS
+  NOW WRITTEN DOWN AND PINNED. It was previously true of the code and stated
+  nowhere, so the omission read as an oversight and the next tidy-up would have
+  "fixed" it. The rule is GAUGES reset, COUNTERS do not: `delayMs` and
+  `underrunRate` describe the current epoch and are meaningless carried across
+  a reconnect, while both counters answer a question about the HOST ("is
+  something above this producing timestamps it should not", "is the offset
+  estimate failing to converge") that a reconnect does not refute. Since
+  `clear()` is called on EVERY reconnect, resetting them would mean the more
+  often a client reconnects the less evidence survives, which is exactly
+  backwards. A consumer wanting a per-epoch number can difference the counter;
+  recovering a lifetime total from a counter already reset is impossible.
+  Pinned by `clear() resets the GAUGES but deliberately not the lifetime
+  COUNTERS`, mutation-checked by making `clear()` zero them.
+
+- THE `OFFSET_FLOOR_SLACK_MS` BOUNDARY WAS SWEPT AND IS SOUND, no dead zone and
+  no discontinuity in the dangerous direction. Recorded here so nobody has to
+  re-derive it. The boundary only exists for events that push a frame's implied
+  one-way delay DOWN (a forward `serverTime` step, or a latency DROP); a
+  latency step UP never approaches it and is handled identically either side.
+  On a forward `serverTime` step, measured (settling after the step / peak
+  rendered speed on a 100 u/s entity / frames refused):
+
+  | step | settles | peak | refused | path taken |
+  | --- | --- | --- | --- | --- |
+  | +200ms | 0ms | 115 | 0 | absorbed, no correction needed |
+  | +900ms | 12.5s | 196 | 0 | eased slew only, slow but smooth |
+  | +990 / +999 / +1000ms | 1017ms | 5260 | 0 | stranded-playhead re-anchor |
+  | +1001ms and above | 0ms | 450-504 | 3 | floor refusal, then re-anchor |
+
+  So the boundary value itself (exactly 1000, which `>=` accepts) takes the
+  re-anchor path and converges in about a second; every larger step takes the
+  refusal path and is strictly BETTER. The band from roughly 950 to 1000 is the
+  worst of the three, at a 5260 u/s spike, but that is the pre-refusal
+  behaviour which was already the accepted cost of the re-anchor, and it is
+  bounded and converges. Nothing falls between the two mechanisms.
+  ONE REAL GAP WAS FOUND IN THE SWEEP AND IS NOT FIXED: the refusal run is
+  counted as CONSECUTIVE (`steppedOffsets.length = 0` on any in-floor frame),
+  which is not invariant to arrival ORDER, and `push()` documents out-of-order
+  arrivals as ordinary. A latency DROP larger than the slack reorders the
+  stream by definition (packets already in flight arrive on the old schedule),
+  so old and new frames interleave and each old one resets the counter: the
+  escape hatch never reaches `TIMELINE_STEP_FRAMES` during the overlap.
+  Measured on a 3000ms base delay dropping by 1001ms: 23 legitimate frames
+  refused across the overlap, then a 6106 u/s spike, where the same drop of
+  1000ms (one millisecond less) refuses nothing and peaks at 133. This is the
+  same lesson as the dead-epoch cut ("the cut is against the NEWEST of those
+  arrivals, not the LAST one"): a run-based discriminator has to be
+  order-invariant. Left alone deliberately, because it needs a base one-way
+  delay above a second to reach at all and the fix is a behaviour change
+  (a windowed count rather than a consecutive one) rather than a correction.
+
+### Defects found by sweeping the whole library for the five known classes (2026-09-02)
+
+The sweep took the five shapes every real bug in this repo has fallen into and
+looked for more of each, everywhere. Two were fixed here; the rest are listed in
+the review notes because they change behaviour or public API and are the owner's
+call, not a sweeper's.
+
+- THE BALANCER HONOURED `exclude` ON EVERY PATH EXCEPT THE ONE THAT SAYS "FULL".
+  `assignRoom` `continue`s the excluded index in the capacity loop, so that room
+  is never measured, and the all-full fallback then returned `roomIdFor(base, 0)`
+  regardless. Two things wrong at once: the client is sent straight back to the
+  instance that just bounced it, burning the bounded re-assign budget against one
+  room (the strand-on-"full" failure `exclude` exists to prevent), and `full:
+  true` is asserted about the ONE room whose capacity was never read. This is the
+  surviving half of the shape commit 7d20026 fixed: that commit taught the
+  mget-FAILURE path to honour `exclude` and left the FULL path alone. Fixed to
+  return the lowest non-excluded index, with the same degenerate guard the
+  sibling path already has (the excluded room is handed back only when it is the
+  only room there is). `full` is honest on the new path in a way it never was on
+  index 0: every index it can return WAS measured and WAS at capacity.
+  THE LESSON IS THE ONE ABOUT PAIRED SEAMS AGAIN. When a fix teaches one branch
+  what an option means, the other branches that read the same option are the
+  counterpart; grep the option name before ticking the item off.
+
+- A NON-FINITE `maxAgeS` REMOVED THE SESSION EXPIRY ENTIRELY, SILENTLY.
+  `(opts.maxAgeS ?? DEFAULT_MAX_AGE_S) * 1000` uses `??`, which catches an ABSENT
+  value and not a `NaN` one, and the canonical way to get `NaN` here is
+  `maxAgeS: Number(process.env.SESSION_MAX_AGE_S)` with the variable unset.
+  `age > NaN` is false, so the expiry check never fires while the future-dated
+  check still passes: every token ever minted stays redeemable forever, in the
+  module whose own header says an expiry is not optional. No log, no throw, and
+  nothing observable until a leaked token is replayed. Fixed with a
+  `Number.isFinite` check falling back to the default rather than refusing, since
+  refusing would lock every player out of a running deployment over one unset
+  variable. Zero and negative are deliberately left alone: those expire
+  everything, which is a host asking for something drastic rather than a host
+  failing to ask for anything.
+  THE SHAPE IS WORTH REMEMBERING: `??` IS NOT A VALIDITY CHECK. Every
+  `?? DEFAULT` in this library sits on a number a host may well have computed
+  with `Number(...)`, and `Number('')` is 0 while `Number(undefined)` is NaN.
+
 ### Verified against a real Redis and a real socket
 
 `tests/` runs against a REAL Redis (six files), not the fake. Start one with
@@ -862,8 +1041,10 @@ metric. Measure something you own.
 
 ### Owed before a 1.0
 
-- A published package, and a decision on whether `ioredis` stays a peer
-  dependency or the `RedisLike` seam is documented as the supported swap point.
+- ~~A published package~~ LANDED (`tickroom` on npm, tag-triggered trusted
+  publishing in `.github/workflows/release.yml`). Still owed: a decision on
+  whether `ioredis` stays a peer dependency or the `RedisLike` seam is
+  documented as the supported swap point.
 - The integration suite runs a toy runtime, not the examples. Wiring the pong
   example end to end through it would be a stronger demonstration.
 - ~~No CI.~~ LANDED: `.github/workflows/ci.yml`, two jobs. `check` runs
@@ -882,9 +1063,11 @@ metric. Measure something you own.
   exits 1 having run 0 of 37 tests; no flag with no Redis exits 0 with 37
   skipped (the unchanged local default); flag set with a real Redis exits 0 with
   37 passed.
-- The package installs as a git dependency. `"prepare": "npm run build"` is what
-  makes that work: `dist/` is gitignored and every `exports` path points into it,
-  so without the hook a `github:` install resolves to a package with no code in
-  it at all. `prepare` also runs on a plain local `npm install`, which is
+- The package ALSO installs as a git dependency, and `"prepare": "npm run build"`
+  is what makes that work: `dist/` is gitignored and every `exports` path points
+  into it, so without the hook a `github:` install resolves to a package with no
+  code in it at all. Publishing to npm did not retire the hook, because a `npm
+  publish` also runs it and because a consumer pinning a commit is still a
+  supported route. `prepare` also runs on a plain local `npm install`, which is
   harmless (it is the same `tsc -p tsconfig.build.json` the `build` script runs,
   it needs no network, and nothing in the build re-enters install).
