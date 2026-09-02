@@ -135,5 +135,21 @@ export async function assignRoom(opts: BalancerOptions): Promise<BalancerResult>
     }
   }
 
+  // EVERY MEASURED CANDIDATE IS FULL, AND `exclude` STILL HAS TO BE HONOURED
+  // HERE. Index 0 was `continue`d above when it is the excluded one, so it was
+  // never measured, and returning it anyway both sends the client straight back
+  // to the instance that just bounced it (burning the bounded re-assign budget
+  // against one room, which is the strand-on-"full" failure this option exists
+  // to prevent) and asserts `full: true` about the one room whose capacity was
+  // never read. Same reasoning as the mget-failure path above, which was taught
+  // to honour `exclude` and left this path alone.
+  //
+  // `full` is honest on this path in a way it would not have been on index 0:
+  // every index returned here WAS measured and WAS at capacity.
+  for (let i = 0; i < maxRooms; i++) {
+    if (i !== excludedIndex) return { room: roomIdFor(base, i), base, index: i, full: true };
+  }
+  // Degenerate case, same as above: the excluded room is the only room there
+  // is, so it is the only thing left to offer.
   return { room: roomIdFor(base, 0), base, index: 0, full: true };
 }

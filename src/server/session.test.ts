@@ -58,6 +58,26 @@ describe('session tokens', () => {
     expect(justAfter).toBeNull();
   });
 
+  it('a non-finite maxAgeS falls back to the default instead of removing the expiry', () => {
+    // `??` catches an ABSENT maxAgeS, not a NaN one, and the canonical way to
+    // get NaN here is `maxAgeS: Number(process.env.SESSION_MAX_AGE_S)` with the
+    // variable unset. `age > NaN` is false, so an unguarded NaN makes every
+    // token ever minted permanently redeemable, silently, in the module whose
+    // own header says the expiry is not optional.
+    const mintedAt = 1_000_000;
+    const opts = { ...OPTS, maxAgeS: Number.NaN };
+    const token = makeToken({ pid: 'p1', handle: 1, sub: 's' }, opts, mintedAt);
+
+    // A year later. With the guard this is refused by the 12h default; without
+    // it, it verifies.
+    const wayLater = mintedAt + 365 * 24 * 3600 * 1000;
+    expect(verifyToken(token, { pid: 'p1', handle: 1 }, opts, wayLater)).toBeNull();
+
+    // ...and the token is still good inside the default window, so the fallback
+    // is the default rather than a blanket refusal that would lock everyone out.
+    expect(verifyToken(token, { pid: 'p1', handle: 1 }, opts, mintedAt + 60_000)).not.toBeNull();
+  });
+
   it('rejects a future-dated token beyond tolerable clock skew', () => {
     const now = 1_000_000;
     const token = makeToken({ pid: 'p1', handle: 1, sub: 's' }, OPTS, now + 10 * 60 * 1000);

@@ -291,6 +291,20 @@ describe('SnapshotInterpolator', () => {
     // the midpoint heading's absolute value must stay large (near pi), not
     // collapse toward 0 (which is what a naive linear lerp would produce).
     expect(Math.abs(heading)).toBeGreaterThan(2.5);
+
+    // AND THE OUTER WRAP, WHICH FRAC 0.5 ALONE CANNOT SEE. The midpoint is the
+    // one fraction where the wrapped and unwrapped results agree: the sum
+    // lands exactly on +-pi. So `lerpHeading` stripped of its outer
+    // `wrapAngle`, keeping only the shortest-arc delta, passes everything
+    // above while returning headings outside the (-pi, pi] range every
+    // consumer of one assumes. Probe a fraction where the two differ: a local
+    // clock of 145 puts the playhead at server time 75, three quarters through
+    // the same bracket, where the unwrapped sum is 3.1916 rather than -3.0916.
+    const late = interp.sample(0.05, 145).get('a')!;
+    expect(late.extrapolated).toBe(false);
+    expect(late.heading!).toBeGreaterThan(-Math.PI);
+    expect(late.heading!).toBeLessThanOrEqual(Math.PI);
+    expect(late.heading!).toBeCloseTo(-3.0916, 3);
   });
 
   it('the adaptive delay grows under injected jitter and stays clamped to [min,max]', () => {
@@ -389,6 +403,13 @@ describe('SnapshotInterpolator', () => {
     });
     const { speeds, xs } = drive(interp, arrivals, { untilMs: 10_000, warmupMs: 1500 });
 
+    // COUNT THE SAMPLES BEFORE BOUNDING THEM. `Math.max(...[])` is -Infinity
+    // and `Math.min(...[])` is Infinity, so every bound in this file is
+    // satisfied by a run that rendered NOTHING AT ALL: an entity that never
+    // appeared, or a playhead stranded so badly that `drive` recorded no
+    // frames, would read as a perfectly smooth profile. The assertion that
+    // there was something to measure is part of the measurement.
+    expect(speeds.length).toBeGreaterThan(400);
     expect(Math.max(...speeds)).toBeLessThan(130);
     // A REWIND is the failure this profile actually produces, and the previous
     // assertion here (`speeds.every(s => s >= 0)`) could not see it or anything
@@ -432,6 +453,7 @@ describe('SnapshotInterpolator', () => {
       worstRate = Math.max(worstRate, ((xs[i + win]! - xs[i]!) / win) * 60);
     }
     expect(worstRate).toBeLessThanOrEqual(cap + 0.5);
+    expect(speeds.length).toBeGreaterThan(900); // an empty run satisfies every bound here
     expect(Math.max(...speeds)).toBeLessThan(130);
     // ...and it does converge rather than merely being slow: well after the
     // 4 seconds the 200ms correction needs, the entity tracks the new offset.
@@ -466,6 +488,134 @@ describe('SnapshotInterpolator', () => {
     expect(later.get('b')!.x).toBeCloseTo(7.5, 6);
   });
 
+  it('an entity that has JUST APPEARED renders at its one known pose rather than being dropped', () => {
+    // The third arm of `posePartial`: a future frame carries the key and no
+    // frame behind the playhead does. That is a brand new entity, and there is
+    // no continuity to preserve, so holding the single known pose is right.
+    // No other test reached this arm at all: every partial-entity case here
+    // has history on at least one side, so the arm could be deleted (making
+    // `posePartial` return null, which drops the entity from the rendered map
+    // entirely) with the whole file still green. A newly spawned entity
+    // flickering for one bracket is not a defect anyone would look for here.
+    const interp = new SnapshotInterpolator<string>({ minDelayMs: 100, maxDelayMs: 100, startDelayMs: 100 });
+    interp.push(frame(0, 40, { a: { x: 0, y: 0 } }));
+    interp.push(frame(50, 90, { a: { x: 5, y: 0 } }));
+    interp.push(frame(100, 140, { a: { x: 10, y: 0 }, b: { x: 100, y: 7, heading: 0.5 } }));
+
+    // Offset seeded at 40, delay pinned at 100, so nowMs 215 puts the playhead
+    // at server time 75: the bracket [50, 100], whose OLDER frame is the last
+    // one that predates `b` existing at all.
+    const out = interp.sample(0.05, 215);
+    expect(out.get('a')!.x).toBeCloseTo(7.5, 6);
+
+    const b = out.get('b');
+    expect(b).toBeDefined();
+    expect(b!.x).toBe(100);
+    expect(b!.y).toBe(7);
+    expect(b!.heading).toBe(0.5);
+    // Held, not invented: there is no velocity to extrapolate along yet.
+    expect(b!.extrapolated).toBe(false);
+  });
+
+  it('a playhead exactly on the newest frame is an UNDERRUN, not a zero-width bracket', () => {
+    // `bracketIndex` takes the last frame at or before the playhead, and the
+    // `<=` is what makes "exactly on the newest frame" the underrun it is:
+    // there is nothing beyond the playback point, which is the entire
+    // definition. Weakened to `<`, that instant is instead reported as an
+    // ordinary interpolation at frac 1, which renders the SAME position, so
+    // position alone cannot see it. What it costs is the `extrapolated` flag
+    // and `underrunRate`, i.e. exactly the two signals a host watches to know
+    // its buffer has run dry.
+    //
+    // The clocks are pinned so the equality is exact rather than approximate:
+    // the offset seeds at 40 and never moves (every frame carries the same
+    // one-way delay), and the delay cannot ease off 100 with min === max.
+    const interp = new SnapshotInterpolator<string>({ minDelayMs: 100, maxDelayMs: 100, startDelayMs: 100 });
+    interp.push(frame(0, 40, { a: { x: 0, y: 0 } }));
+    interp.push(frame(50, 90, { a: { x: 5, y: 0 } }));
+    interp.push(frame(100, 140, { a: { x: 10, y: 0 } }));
+
+    // Playhead at 240 - 40 - 100 = server time 100 exactly, the newest stamp.
+    const out = interp.sample(1 / 60, 240);
+    const a = out.get('a')!;
+    expect(a.x).toBeCloseTo(10, 6);
+    expect(a.extrapolated).toBe(true);
+    expect(interp.underrunRate).toBeGreaterThan(0);
+  });
+
+  it('a reordered arrival contributes no emission interval, so it cannot shrink the delay', () => {
+    // `observeInterval` counts FORWARD deltas only. `push()` documents
+    // out-of-order arrivals as ordinary rather than anomalous, and a backward
+    // delta is not an interval the server emitted: it is the same interval
+    // seen from the wrong end. Admitting one puts a NEGATIVE number in the
+    // window the median interval is taken from, and that median is a term in
+    // the delay target, so a reordering link would talk the buffer DOWN at
+    // precisely the moment it needs to be deeper. That is the same shape of
+    // mistake as the inter-arrival-gap estimator this module already replaced
+    // once.
+    //
+    // A uniform 50ms grid delivered with every adjacent pair swapped (the odd
+    // tick overtakes the even one by 10ms). Measured on this profile: 160.0ms
+    // of delay counting forward deltas only, 85.0ms if backward deltas are
+    // admitted, on a stream whose real emission interval never changed.
+    const interp = new SnapshotInterpolator<string>({ minDelayMs: 10, maxDelayMs: 500, startDelayMs: 10 });
+    const arrivals: Arrival[] = [];
+    for (let i = 0; i < 400; i++) {
+      const serverTime = i * 50;
+      const latency = i % 2 === 0 ? 100 : 40;
+      arrivals.push({ serverTime, receivedAt: serverTime + latency, entities: { a: { x: serverTime / 10, y: 0 } } });
+    }
+    arrivals.sort((a, b) => a.receivedAt - b.receivedAt);
+    drive(interp, arrivals, { untilMs: 20_000, warmupMs: 20_000 });
+
+    expect(interp.rejectedFrames).toBe(0); // the reordering itself is ordinary, not refused
+    expect(interp.delayMs).toBeGreaterThan(140);
+    expect(interp.delayMs).toBeLessThan(180);
+  });
+
+  it('the time prune always leaves two frames, since one frame carries no velocity to extrapolate along', () => {
+    // The retention floor in `pruneFrames` is documented ("two frames are
+    // always retained, since one frame cannot form a bracket") and pinned by
+    // nothing: relaxing it to `Math.min(drop, this.frames.length)` left the
+    // whole file green. The damage is not the missing bracket, it is the
+    // missing VELOCITY. The underrun branch derives its extrapolation speed
+    // from the two newest frames, so a buffer pruned down to one frame
+    // extrapolates at zero and the entity FREEZES, which is the one thing this
+    // module promises never to do.
+    //
+    // The setup is the shape that triggers it: a long silence, then one frame
+    // from far ahead on the server clock, so every older frame sits below a
+    // prune horizon computed from a playhead that has moved on. The delay is
+    // pinned and the one-way delay is uniform at 40ms, so the playhead is
+    // exactly `now - 140` throughout and the arithmetic below is not
+    // approximate.
+    const interp = new SnapshotInterpolator<string>({ minDelayMs: 100, maxDelayMs: 100, startDelayMs: 100 });
+    interp.push(frame(0, 40, { a: { x: 0, y: 0 } }));
+    interp.push(frame(50, 90, { a: { x: 5, y: 0 } }));
+    interp.push(frame(100, 140, { a: { x: 10, y: 0 } }));
+
+    // Sampled while the playhead is INSIDE the buffer, so no error window is
+    // ever opened and the time prune is not suspended when it next runs.
+    expect(interp.sample(1 / 60, 200).get('a')!.x).toBeCloseTo(6, 6);
+
+    // 900ms of silence, then the stream resumes. The prune on this push sees a
+    // playhead at server time 900 and a horizon 350ms behind it, so all three
+    // older frames are past it and only the retention floor keeps the second
+    // one alive.
+    interp.push(frame(1000, 1040, { a: { x: 100, y: 0 } }));
+
+    // Playhead at 1060, past the newest frame: an underrun, which extrapolates
+    // rather than freezing. The velocity comes from the retained pair (server
+    // times 100 and 1000, 90 units apart), i.e. the true 100 units/sec, held
+    // for the 60ms the playhead leads by.
+    const out = interp.sample(1 / 60, 1200).get('a')!;
+    expect(out.extrapolated).toBe(true);
+    expect(out.x).toBeCloseTo(106, 6);
+    // Pruned to a single frame there is no earlier pose to difference against,
+    // the derived velocity is zero, and this reads exactly 100: frozen.
+    expect(out.x).toBeGreaterThan(103);
+  });
+
   it('an entity unseen past dropAfterMs is forgotten', () => {
     const interp = new SnapshotInterpolator<string>({ startDelayMs: 50, minDelayMs: 50, maxDelayMs: 250, dropAfterMs: 500 });
     interp.push(frame(0, 40, { a: { x: 0, y: 0 } }));
@@ -487,10 +637,25 @@ describe('SnapshotInterpolator', () => {
   });
 
   it('measures a low-passed speed from its own rendered motion', () => {
+    // A LOW PASS IS ONLY OBSERVABLE ACROSS A CHANGE. The version this replaced
+    // drove a clean constant-velocity stream, where the filtered value and the
+    // instantaneous value coincide from the first frame onwards: dropping the
+    // filter entirely (`speed = inst`) landed inside the same 90..110 bound.
+    // So step the speed and watch the reported value LAG the rendered one,
+    // which is the only thing the filter actually does.
     const interp = new SnapshotInterpolator<string>({ startDelayMs: 100, minDelayMs: 100, maxDelayMs: 100, speedTau: 0.12 });
-    const arrivals = straightLine({ ticks: 40, tickMs: 50, speed: 100, latency: () => 40 });
-    let last = 0;
+
+    // 100 u/s up to server time 1000, then 400 u/s. Position stays continuous
+    // across the change, so the only discontinuity in the stream is the slope.
+    const arrivals: Arrival[] = [];
+    for (let i = 0; i < 40; i++) {
+      const serverTime = i * 50;
+      const x = serverTime <= 1000 ? (100 * serverTime) / 1000 : 100 + (400 * (serverTime - 1000)) / 1000;
+      arrivals.push({ serverTime, receivedAt: serverTime + 40, entities: { a: { x, y: 0 } } });
+    }
+
     const hz = 60;
+    const rendered: { now: number; x: number; speed: number }[] = [];
     let next = 0;
     for (let now = 0; now <= 1500; now += 1000 / hz) {
       while (next < arrivals.length && arrivals[next]!.receivedAt <= now) {
@@ -499,10 +664,31 @@ describe('SnapshotInterpolator', () => {
         next++;
       }
       const e = interp.sample(1 / hz, now).get('a');
-      if (e) last = e.speed;
+      if (e) rendered.push({ now, x: e.x, speed: e.speed });
     }
-    expect(last).toBeGreaterThan(90); // converged onto the true 100 units/sec
-    expect(last).toBeLessThan(110);
+
+    // Well before the step, the filter has had many time constants to converge
+    // onto the true 100 units/sec.
+    const settled = rendered.filter((r) => r.now > 600 && r.now < 1100);
+    expect(settled.length).toBeGreaterThan(20);
+    for (const r of settled) {
+      expect(r.speed).toBeGreaterThan(90);
+      expect(r.speed).toBeLessThan(110);
+    }
+
+    // The first rendered frame whose own motion is fully on the new slope.
+    const jump = rendered.findIndex((r, i) => i > 0 && (r.x - rendered[i - 1]!.x) * hz > 350);
+    expect(jump).toBeGreaterThan(0);
+    // The rendered motion is already at 400 u/s here and the reported speed is
+    // nowhere near it yet, because a 0.12s time constant moves about 13% of
+    // the way per 60Hz frame. Unfiltered this frame reports the full 400.
+    expect(rendered[jump]!.speed).toBeLessThan(250);
+
+    // And it does get there, a few time constants later.
+    const last = rendered[rendered.length - 1]!;
+    expect(last.now).toBeGreaterThan(1400);
+    expect(last.speed).toBeGreaterThan(350);
+    expect(last.speed).toBeLessThan(410);
   });
 
   it('clear() resets frames, entities, and the adaptive delay to its starting value', () => {
@@ -543,6 +729,39 @@ describe('SnapshotInterpolator', () => {
     const a = interp.sample(0.05, 1145).get('a')!;
     expect(a.x).toBeCloseTo(102.5, 6);
     expect(a.extrapolated).toBe(false);
+  });
+
+  it('clear() resets the GAUGES but deliberately not the lifetime COUNTERS', () => {
+    // `clear()` is called on every reconnect, so what it does and does not
+    // reset is a decision rather than a detail, and the omission of the two
+    // counters previously read as an oversight because nothing recorded it.
+    // The split is gauges versus counters: `delayMs` and `underrunRate`
+    // describe the CURRENT epoch and are meaningless carried across a
+    // reconnect, while `rejectedFrames` and `reanchors` answer a question
+    // about the HOST ("is something above this producing timestamps it should
+    // not", "is the offset estimate failing to converge") that a reconnect
+    // does not refute. Resetting them would mean the more often a client
+    // reconnects the less evidence survives, which is exactly backwards.
+    const interp = new SnapshotInterpolator<string>({ startDelayMs: 90 });
+
+    // A forward serverTime step produces both: refused frames, then a re-anchor.
+    drive(
+      interp,
+      serverTimeStep({ ticks: 200, tickMs: 50, speed: 100, latencyMs: 40, stepAtTick: 60, stepMs: 5000 }),
+      { untilMs: 8000, warmupMs: 0 },
+    );
+    expect(interp.rejectedFrames).toBeGreaterThan(0);
+    expect(interp.reanchors).toBeGreaterThan(0);
+
+    const rejected = interp.rejectedFrames;
+    const reanchors = interp.reanchors;
+
+    interp.clear();
+
+    expect(interp.delayMs).toBe(90); // a gauge: reset
+    expect(interp.underrunRate).toBe(0); // a gauge: reset
+    expect(interp.rejectedFrames).toBe(rejected); // a counter: carried
+    expect(interp.reanchors).toBe(reanchors); // a counter: carried
   });
 
   // Regression for the bug examples/pong/client.ts shipped with: calling
@@ -631,10 +850,30 @@ describe('SnapshotInterpolator', () => {
     interp.sample(Number.NaN, Number.NaN);
     expect(Number.isFinite(interp.delayMs)).toBe(true);
 
+    // AND THE HALF `delayMs` CANNOT SEE. A non-finite `dt` is not merely
+    // ignored downstream: `decayUnderrun` guards on `dt <= 0`, which is FALSE
+    // for NaN, so a NaN `dt` walks straight past it into
+    // `underrunEma += (target - underrunEma) * ease` and an exponential ease
+    // can never leave NaN again. That is the same permanent-poisoning shape as
+    // the non-finite `serverTime` defect, arriving through a third door, and
+    // `underrunRate` is exactly the gauge a host polls to decide whether
+    // playback is healthy.
+    expect(Number.isFinite(interp.underrunRate)).toBe(true);
+
     // The bad call left nothing behind: the next honest one still brackets.
     const a = interp.sample(1 / 60, 165).get('a')!;
     expect(a.x).toBeCloseTo(2.5, 6);
     expect(Number.isFinite(a.x)).toBe(true);
+
+    // And it is still gone twenty clean frames later, which is the assertion
+    // that separates "recovered" from "the bad value simply has not been read
+    // back yet": a poisoned EMA stays poisoned for the rest of the connection.
+    for (let i = 4; i < 24; i++) {
+      interp.push(frame(i * 50, i * 50 + 40, { a: { x: i * 5, y: 0 } }));
+      interp.sample(1 / 60, i * 50 + 45);
+    }
+    expect(Number.isFinite(interp.underrunRate)).toBe(true);
+    expect(interp.underrunRate).toBeLessThan(0.5);
   });
 
   it('a sustained one-way latency step re-anchors instead of degrading for tens of seconds', () => {
@@ -794,6 +1033,48 @@ describe('SnapshotInterpolator', () => {
     expect(x).toBeGreaterThan(xAtStop);
   });
 
+  it('the FIRST frame of a connection is PROVISIONAL, so a future stamp there cannot poison the offset floor', () => {
+    // The refusal above is measured against a sliding-window MINIMUM, which
+    // means the first frame of an epoch does not merely escape the test, it
+    // DEFINES the value every later frame is tested against. A minimum can only
+    // be dragged further down, so a future-stamped seed sets a floor no honest
+    // frame can ever correct: every real frame afterwards sits ABOVE it, which
+    // is indistinguishable from jitter, and they are all waved through.
+    //
+    // The same stamp is free mid-run and expensive on frame one, which is the
+    // whole finding. Measured on this profile at +1500ms: mid-run it costs one
+    // refused frame, a peak rendered speed of 101 u/s on a 100 u/s entity and
+    // zero rewinds; on frame one it cost 767ms of wrong playback peaking at
+    // 4548 u/s with 21 backward rewinds and the pose 881ms stale, and
+    // `rejectedFrames` stayed at ZERO the whole time, so the metric that exists
+    // to surface exactly this reported nothing. The size of the error barely
+    // matters (+30000ms measured 767ms and 3782 u/s), because what is really
+    // being measured is how long the stranded-playhead re-anchor takes to
+    // notice a floor that was wrong from the first packet.
+    const arrivals = straightLine({ ticks: 300, tickMs: 50, speed: 100, latency: () => 40 });
+    arrivals[0]!.serverTime += 1500; // the one frame the whole floor is built from
+
+    const interp = new SnapshotInterpolator<string>();
+    const { track, frameMs } = drive(interp, arrivals, { untilMs: 5000, warmupMs: 0 });
+
+    // The seed is refused retroactively, and counted, rather than standing.
+    expect(interp.rejectedFrames).toBe(1);
+
+    // TIMELINE_STEP_FRAMES contradicting frames settle it, so the disturbance
+    // is a few snapshot intervals rather than the REANCHOR_AFTER_MS (600ms)
+    // wait the stranded playhead would otherwise have to sit through.
+    expect(longestExtrapolationMs(track, 0, frameMs)).toBeLessThan(300);
+
+    const steps = stepsAfter(track, 0);
+    expect(steps.length).toBeGreaterThan(200); // an empty run satisfies every bound here
+    const peakSpeed = Math.max(...steps.map((s) => Math.abs(s))) / (frameMs / 1000);
+    expect(peakSpeed).toBeLessThan(1200);
+
+    // ...and playback is on the real timeline afterwards, not 1500ms ahead of it.
+    const lastNow = track[track.length - 1]!.now;
+    expect(track[track.length - 1]!.x).toBeCloseTo(newestDeliveredX(lastNow, 50, 100, 40), -1);
+  });
+
   it('ONE straggler is not enough evidence to re-anchor on', () => {
     // The re-anchor adopts the MINIMUM of the samples that landed during the
     // error window, with no slew. With a gate of "at least one push" that is a
@@ -829,7 +1110,9 @@ describe('SnapshotInterpolator', () => {
     // Thin evidence is not evidence. Keep waiting: extrapolate-then-hold is
     // already correct while the error window holds fewer than the threshold.
     expect(interp.reanchors).toBe(0);
-    expect(Math.min(...stepsAfter(track, 3000))).toBeGreaterThan(-1);
+    const steps = stepsAfter(track, 3000);
+    expect(steps.length).toBeGreaterThan(1000); // an empty run satisfies every bound here
+    expect(Math.min(...steps)).toBeGreaterThan(-1);
   });
 
   it('an out-of-order arrival on the re-anchor own render frame does not destroy a newer buffered frame', () => {
@@ -902,7 +1185,9 @@ describe('SnapshotInterpolator', () => {
     const { track } = drive(interp, arrivals, { untilMs: 20_000, warmupMs: 20_000 });
 
     expect(interp.reanchors).toBe(0);
-    expect(stepsAfter(track, 3000).filter((d) => Math.abs(d) < 1e-9).length).toBe(0);
+    const steps = stepsAfter(track, 3000);
+    expect(steps.length).toBeGreaterThan(800); // zero steps are all non-motionless, vacuously
+    expect(steps.filter((d) => Math.abs(d) < 1e-9).length).toBe(0);
   });
 
   it('the time prune is suspended while the playhead is under suspicion, so a re-anchor never lands on an empty buffer', () => {
@@ -940,7 +1225,9 @@ describe('SnapshotInterpolator', () => {
     const arrivals = serverTimeStep({ ticks: 1400, tickMs: 50, speed: 100, latencyMs: 40, stepAtTick: 200, stepMs: -5000 });
     const { track } = drive(interp, arrivals, { untilMs: 40_000, warmupMs: 40_000 });
 
-    const peak = Math.max(...stepsAfter(track, 9000).map((d) => Math.abs(d) * 60));
+    const steps = stepsAfter(track, 9000);
+    expect(steps.length).toBeGreaterThan(1000); // an empty run satisfies every bound here
+    const peak = Math.max(...steps.map((d) => Math.abs(d) * 60));
     expect(peak).toBeLessThan(800);
   });
 
@@ -991,6 +1278,8 @@ describe('SnapshotInterpolator', () => {
     const arrivals = serverTimeStep({ ticks: 1400, tickMs: 50, speed: 100, latencyMs: 40, stepAtTick: 200, stepMs: -5000 });
     const { track } = drive(interp, arrivals, { untilMs: 40_000, warmupMs: 40_000 });
 
-    expect(Math.min(...stepsAfter(track, 9000))).toBeGreaterThan(-10);
+    const steps = stepsAfter(track, 9000);
+    expect(steps.length).toBeGreaterThan(1000); // an empty run satisfies every bound here
+    expect(Math.min(...steps)).toBeGreaterThan(-10);
   });
 });

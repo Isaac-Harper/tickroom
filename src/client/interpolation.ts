@@ -395,6 +395,11 @@ export class SnapshotInterpolator<K extends string | number = number> {
   private errorWindowNewestServerTime: number | null = null;
   /** Raw offsets of the run of consecutive frames refused for sitting below the offset floor. Empty whenever the last frame landed near the floor, which is what makes the run CONSECUTIVE. See `refuseSteppedFrame`. */
   private steppedOffsets: number[] = [];
+  /** Raw offset of the frame that SEEDED the estimate, while that seed is still provisional, or null once it has been corroborated or discarded. See `refuteSeedFrame`. */
+  private seedOffsetMs: number | null = null;
+  /** Raw offsets of the run of consecutive frames that have CONTRADICTED the provisional seed, and the newest `serverTime` among them. */
+  private seedRefutations: number[] = [];
+  private seedRefutationNewest = -Infinity;
   /** Median of `intervalWindow`, cached because both the delay target and the buffer prune horizon need it. */
   private intervalMs = 0;
 
@@ -483,6 +488,7 @@ export class SnapshotInterpolator<K extends string | number = number> {
       return;
     }
     if (this.refuseSteppedFrame(frame)) return;
+    this.refuteSeedFrame(frame);
 
     // Evidence that data is still flowing, which is what separates "the clock
     // estimate is wrong" from "the world went quiet". See `trackPlayheadError`.
@@ -571,6 +577,81 @@ export class SnapshotInterpolator<K extends string | number = number> {
     return false;
   }
 
+  /**
+   * Judge the frame that SEEDED the offset estimate, which is the one frame
+   * `refuseSteppedFrame` structurally cannot judge.
+   *
+   * The floor is a sliding-window MINIMUM, so the first frame of a connection
+   * does not merely escape the plausibility test, it DEFINES the value every
+   * later frame is tested against, and a minimum can only be dragged further
+   * down. A future-stamped seed therefore sets a floor no honest frame can ever
+   * correct: every real frame afterwards sits ABOVE it, which is indistinguish-
+   * able from ordinary jitter, so they are all waved through and the poisoned
+   * floor stands until it slides out of a 128-sample window.
+   *
+   * The damage is not hypothetical, and it is exactly the damage the guard was
+   * built to prevent, arriving through the one door the guard does not cover.
+   * Measured on a 20Hz stream of an entity moving at a constant 100 u/s: the
+   * SAME +1500ms stamp costs nothing at all mid-run (one frame refused, peak
+   * rendered speed 101 u/s, zero rewinds, playback never leaves its band) and
+   * costs 767ms of wrong playback on frame one, peaking at 4548 u/s with 21
+   * backward rewinds and the rendered pose 881ms stale, before the stranded-
+   * playhead re-anchor eventually cleans it up. `rejectedFrames` stays at ZERO
+   * throughout, so the metric that exists to surface exactly this reports
+   * nothing. At +30000ms it is 767ms and 3782 u/s; the shape does not depend on
+   * the size of the error, because what is being measured is how long the
+   * re-anchor takes to notice.
+   *
+   * So the seed is PROVISIONAL rather than exempt. The discriminator is the one
+   * `refuseSteppedFrame` already uses, run in the opposite direction: a frame
+   * whose implied one-way delay sits more than `OFFSET_FLOOR_SLACK_MS` ABOVE
+   * the seed contradicts it, because that would mean the seed packet had spent
+   * a full second LESS in flight than this one. One such frame is jitter and
+   * proves nothing. `TIMELINE_STEP_FRAMES` consecutive ones are a timeline, and
+   * the seed is the outlier: it is discarded, the contradicting run becomes the
+   * anchor through the same escape hatch a stranded playhead uses, and the
+   * dead-epoch cut in `reanchor` lifts the seed's frame out of the buffer so it
+   * cannot go on being an interpolation endpoint.
+   *
+   * THE CORROBORATION PATH IS THE COMMON ONE AND COSTS NOTHING. A healthy
+   * connection's second frame lands within the slack of its first, which
+   * retires the seed permanently on the very next push; this can only ever fire
+   * in the first few frames of an epoch. It is deliberately NOT a general
+   * "the floor holder is an outlier" rule, which would be free to fire at any
+   * time and would churn against exactly the congestion excursions the
+   * minimum-floor exists to be robust to.
+   *
+   * A server whose clock is genuinely offset from the client's is untouched by
+   * this: every frame carries the same large offset, so the second frame
+   * corroborates the first and the estimate is simply correct.
+   */
+  private refuteSeedFrame(frame: SnapshotFrame<K>): void {
+    if (this.seedOffsetMs === null) return;
+
+    const rawOffset = frame.receivedAt - frame.serverTime;
+    if (rawOffset <= this.seedOffsetMs + OFFSET_FLOOR_SLACK_MS) {
+      this.seedOffsetMs = null;
+      this.seedRefutations.length = 0;
+      return;
+    }
+
+    this.seedRefutations.push(rawOffset);
+    if (frame.serverTime > this.seedRefutationNewest) this.seedRefutationNewest = frame.serverTime;
+    if (this.seedRefutations.length < TIMELINE_STEP_FRAMES) return;
+
+    // The contradicting run is the only evidence about the real timeline that
+    // the poisoned floor has not touched, so it is handed in as the error
+    // window exactly the way `refuseSteppedFrame` hands in its refused run.
+    // Counted on `rejectedFrames` because the seed frame IS being refused, just
+    // retroactively: a host whose decoder mis-stamps the first frame of every
+    // epoch should see a number climbing rather than silence.
+    this.rejectedFrameCount++;
+    this.offsetWindow = this.seedRefutations.slice();
+    this.pushesSinceErrorStart = this.seedRefutations.length;
+    this.errorWindowNewestServerTime = this.seedRefutationNewest;
+    this.reanchor();
+  }
+
   /** Minimum of the offset window: the least contaminated estimate of the local-to-server clock difference, since one-way delay is never negative. */
   private offsetFloor(): number {
     let floor = Infinity;
@@ -613,6 +694,12 @@ export class SnapshotInterpolator<K extends string | number = number> {
       this.offsetMs = rawOffset;
       this.offsetSeeded = true;
       this.lastArrivalAt = frame.receivedAt;
+      // The seed defines the floor every later frame is judged against, so it
+      // is held PROVISIONAL until a later frame corroborates it. See
+      // `refuteSeedFrame`.
+      this.seedOffsetMs = rawOffset;
+      this.seedRefutations.length = 0;
+      this.seedRefutationNewest = -Infinity;
       return;
     }
 
@@ -772,6 +859,21 @@ export class SnapshotInterpolator<K extends string | number = number> {
    * a specific socket's path delay; a new connection may take a different
    * route, and carrying the old floor over would bias the new epoch's playhead
    * until the whole window had turned over.
+   *
+   * `rejectedFrames` AND `reanchors` ARE DELIBERATELY NOT RESET, and the
+   * omission is a decision rather than an oversight, which is why it is written
+   * down here and pinned by a test. They are lifetime COUNTERS and the rest of
+   * this method resets GAUGES; that split is the whole distinction. Both
+   * counters answer a question about the HOST, not about the current epoch:
+   * "is something above this producing timestamps it should not" and "is the
+   * offset estimate failing to converge". Those are diagnoses that a reconnect
+   * does not refute, and since this method is called on EVERY reconnect,
+   * resetting them would mean a client that reconnects every few seconds could
+   * never accumulate enough evidence to show either problem at all: the more
+   * broken the connection, the more thoroughly the evidence would be erased.
+   * A consumer wanting a per-epoch figure differences the counter across the
+   * epoch, which is possible; recovering a lifetime total from a counter that
+   * has already been reset is not.
    */
   clear(): void {
     this.frames = [];
@@ -786,6 +888,9 @@ export class SnapshotInterpolator<K extends string | number = number> {
     this.lastServerTime = null;
     this.errorWindowNewestServerTime = null;
     this.steppedOffsets = [];
+    this.seedOffsetMs = null;
+    this.seedRefutations = [];
+    this.seedRefutationNewest = -Infinity;
     this.intervalMs = 0;
     this.currentDelayMs = this.startDelayMs;
     this.targetDelayMs = this.startDelayMs;
@@ -1095,6 +1200,11 @@ export class SnapshotInterpolator<K extends string | number = number> {
     this.playheadErrorSinceMs = null;
     this.pushesSinceErrorStart = 0;
     this.errorWindowNewestServerTime = null;
+    // Any anchor supersedes the provisional seed, whichever detector produced
+    // it: the offset no longer rests on that first frame at all.
+    this.seedOffsetMs = null;
+    this.seedRefutations.length = 0;
+    this.seedRefutationNewest = -Infinity;
     this.reanchorCount++;
     return true;
   }

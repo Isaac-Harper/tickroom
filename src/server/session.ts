@@ -156,7 +156,18 @@ export function verifyToken(
   }
   if (claims.pid !== expect.pid || claims.handle !== expect.handle) return null;
 
-  const maxAgeMs = (opts.maxAgeS ?? DEFAULT_MAX_AGE_S) * 1000;
+  // `??` catches an ABSENT maxAgeS and not a non-finite one, and the difference
+  // is the whole expiry. `maxAgeS: Number(process.env.SESSION_MAX_AGE_S)` with
+  // the variable unset is `NaN`, and `age > NaN` is false, so EVERY token ever
+  // minted stays redeemable forever while the future-dated check still passes:
+  // a silent, permanent removal of the expiry, in the module whose own header
+  // says an expiry is not optional. Fall back to the default rather than
+  // refusing outright, because refusing would lock every player out of a
+  // running deployment over one unset variable. A zero or negative value is
+  // left alone deliberately: that expires everything, which is a host asking
+  // for something drastic rather than a host failing to ask for anything.
+  const maxAgeS = Number.isFinite(opts.maxAgeS) ? (opts.maxAgeS as number) : DEFAULT_MAX_AGE_S;
+  const maxAgeMs = maxAgeS * 1000;
   const age = nowMs - claims.iat;
   if (age > maxAgeMs) return null; // expired
   if (age < -CLOCK_SKEW_MS) return null; // future-dated past tolerable skew; see CLOCK_SKEW_MS

@@ -53,6 +53,33 @@ describe('assignRoom', () => {
     expect(result.room).toBe('lobby'); // falls back to instance 0
   });
 
+  it('honours exclude on the FULL path, instead of naming the one room it never measured', async () => {
+    // The excluded index is `continue`d in the capacity loop, so it is never
+    // read. Falling back to index 0 regardless therefore does two wrong things
+    // at once: it sends the client straight back to the instance that just
+    // bounced it, burning the bounded re-assign budget against one room, and it
+    // asserts `full: true` about the single room whose capacity was never
+    // measured. This is the surviving half of the shape the mget-failure path
+    // was already taught (see 'skips the excluded room on a Redis read error
+    // too'): the two paths must agree about what `exclude` means.
+    const redis = new FakeRedis();
+    const maxRooms = 3;
+    for (let i = 0; i < maxRooms; i++) {
+      await setPlayers(redis, roomIdFor('lobby', i), 20);
+    }
+    const result = await assignRoom({ redis, base: 'lobby', maxPlayers: 20, maxRooms, exclude: 'lobby' });
+    expect(result.full).toBe(true);
+    expect(result.room).not.toBe('lobby'); // NOT the excluded instance 0
+    expect(result.room).toBe('lobby~1');
+  });
+
+  it('falls back to the excluded room on the full path only when it is the only room there is', async () => {
+    const redis = new FakeRedis();
+    await setPlayers(redis, roomIdFor('lobby', 0), 20);
+    const result = await assignRoom({ redis, base: 'lobby', maxPlayers: 20, maxRooms: 1, exclude: 'lobby' });
+    expect(result).toEqual({ room: 'lobby', base: 'lobby', index: 0, full: true });
+  });
+
   it('is not full while at least one instance has room', async () => {
     const redis = new FakeRedis();
     const maxRooms = 3;
