@@ -72,14 +72,23 @@ whole timing guarantee rests on nothing in it ever awaiting.
   everything else is built against it. Change it only with a very good reason.
 - `src/core/redisLike.ts` - structural minimum Redis interface, so core never
   hard-imports ioredis. ioredis satisfies it with no adapter.
-- `src/core/ids.ts` - room identity and Redis key naming. `roomKeys`, `roomIdFor`,
-  `normalizeRoomId`. A TRUST BOUNDARY: the raw value comes from a query param and
-  is interpolated into key names, which have no escaping.
+- `src/core/ids.ts` - room identity and Redis key naming. `roomKeys`,
+  `roomIdFor`, `normalizeRoomId`, `normalizeBase`. A TRUST BOUNDARY: the raw
+  value comes from a query param and is interpolated into key names, which
+  have no escaping. TWO DOORS, ONE IMPLEMENTATION: `normalizeRoomId` takes a
+  room id and falls back to a known-good one, `normalizeBase` takes a BASE (a
+  pool of instances) and returns `null`, because the only caller that needs it
+  already answers 400 and silently redirecting a hostile `?base=` would turn a
+  refusal into a reassignment. `normalizeRoomId` delegates its whole base half
+  to `normalizeBase`, so a rule added to one cannot go missing from the other.
 - `src/core/lease.ts` - the exactly-one-writer mechanism plus the `OwnershipClock`
   two-clock rule. The single most safety-critical file. See the gotcha below.
 - `src/core/checkpoint.ts` - the checkpoint ENVELOPE grammar, pure:
-  `CHECKPOINT_VERSION`, `packCheckpoint`, `unpackCheckpoint`,
-  `graceMsFromCheckpoint`. JSON and arithmetic only.
+  `CHECKPOINT_VERSION`, `packCheckpoint`, `inspectCheckpoint`,
+  `unpackCheckpoint`, `graceMsFromCheckpoint`. JSON and arithmetic only.
+  `inspectCheckpoint` is the one to reach for anywhere the answer gets logged:
+  it returns WHY it refused (`absent`, `unparseable`, `malformed`, `version`)
+  and `unpackCheckpoint` is the thin wrapper that throws that away.
 - `src/server/checkpoint.ts` - checkpoint STORAGE: gzip encode/decode with
   magic-byte sniffing and the Redis read/write pair, TTL riding the SET. Lives
   in this layer because it imports `node:zlib`; it used to be in `core/` and
@@ -105,7 +114,9 @@ whole timing guarantee rests on nothing in it ever awaiting.
   exercised through `RoomConnection`, which needs a live socket to reach these
   states, which is exactly why they live apart.
 - `src/client/errorOffset.ts` - `ErrorOffset`. Render-layer correction smoothing.
-- `src/client/clientTick.ts` - the monotonic dilated client tick.
+- `src/client/clientTick.ts` - the monotonic client tick. Anchored once per
+  epoch, advanced in whole steps by `RoomConnection.frame()`. No longer
+  dilated: see the deleted buffer-health seam below.
 - `src/client/interpolation.ts` - `SnapshotInterpolator`. Playback on the SERVER
   timeline (`serverTime` is the axis; `receivedAt` exists only to estimate the
   local-versus-server clock offset, as a slew-capped sliding-window minimum),
@@ -114,15 +125,20 @@ whole timing guarantee rests on nothing in it ever awaiting.
   omits, shortest-arc heading, measured speed. `push()` is a TRUST BOUNDARY,
   against both non-finite AND implausible timestamps. A playhead stranded for
   `REANCHOR_AFTER_MS` while at least `REANCHOR_MIN_SAMPLES` frames arrive
-  re-anchors the offset outright, and so does a run of `TIMELINE_STEP_FRAMES`
-  frames whose implied one-way delay is impossible. The SEED frame is
+  re-anchors the offset outright, and so do `TIMELINE_STEP_FRAMES` frames
+  whose implied one-way delay is impossible within a `TIMELINE_STEP_WINDOW`
+  of judged frames. The SEED frame is
   provisional rather than exempt, because it defines the floor the others are
   judged against: a run of `TIMELINE_STEP_FRAMES` frames contradicting it
   discards it. Observability: `delayMs`, `underrunRate`, `rejectedFrames`,
   `reanchors`, and the last two are lifetime counters that `clear()` does NOT
   reset.
 - `src/client/connection.ts` - `RoomConnection`. Reconnect, re-mint, clock sync,
-  protocol-skew recovery, stall observation.
+  protocol-skew recovery, stall observation, AND the two epoch-scoped components
+  it owns: the tick counter and (optionally) a `SnapshotInterpolator`. Generic in
+  the host's snapshot type and the interpolator's key type, both inferred.
+  `frame()` is the ONE per-frame call. Also exports `RosterFrame`/`isRosterFrame`,
+  the typed shape of the `onText` roster control frame.
 - `src/codec/bytes.ts` - `ByteWriter` / `ByteReader`. The reader is a TRUST
   BOUNDARY and bounds-checks every read.
 - `src/codec/quantize.ts` - clamping (never wrapping) quantisation helpers,
@@ -134,7 +150,11 @@ whole timing guarantee rests on nothing in it ever awaiting.
   optional `DefaultSnapshotCodecOptions` carrying `positionScale`, which
   defaults to `CM_SCALE` so the existing wire is byte-identical. A pixel host
   passes 1 (+-32767 px at 1px); both ends must agree, and the bump that
-  agreement implies belongs to the host.
+  agreement implies belongs to the host. `encodeInputWindow`/`decodeInputWindow`
+  take an optional `DefaultInputWindowOptions` carrying `axisScale`, defaulting
+  to `AXIS_SCALE` (127) so the existing wire is byte-identical.
+  `encodeDefaultSnapshot` THROWS `CodecError` on an entity id outside
+  `0..65535`.
 - `src/adapters/vercel.ts` - Next.js App Router route factories. Takes
   `upgradeWebSocket` by injection; imports nothing from next or @vercel/functions.
 - `src/adapters/node.ts` - the same server core behind a plain `ws` server, no
@@ -156,13 +176,32 @@ whole timing guarantee rests on nothing in it ever awaiting.
   handlers. One `await` on a Redis round trip inside the loop and a slow network
   stretches every tick in the room.
 - Only a CONFIRMED lease renew advances ownership. See the two-clock gotcha.
+- ONE FUNCTION PER CLOCK IN `lease.ts`. `renewAttempted` moves `lastRenewAt`
+  and nothing else, `renewConfirmed` moves `lastOwnedAt` and nothing else,
+  `renewFailed` moves neither. Any function able to move both is a step back
+  toward the single collapsed timestamp the module exists to prevent, which is
+  why `renewConfirmed`'s `preserveAttemptTime` option was deleted rather than
+  adopted. A caller that uses `renewDue` MUST call `renewAttempted`; the
+  confirmation path deliberately cannot pace on its behalf.
 - Every exit from the tick loop names itself. `exitReason` defaults to
   `'duration'`, so a `break` that does not set it reports a healthy
   lifetime-capped exit for whatever actually happened. See the gotcha below.
 - A checkpoint carries a geometry digest and a mismatch starts fresh. See the
   geometry gotcha.
+- A CHECKPOINT WHOSE VERSION THIS BUILD DOES NOT IMPLEMENT STARTS FRESH, in
+  both directions, and the log line says so. Same rule and same reasoning as
+  the geometry digest.
 - Capacity is read from ONE key (`room:{id}:stats`) by both the relay and the
   balancer. See the capacity gotcha.
+- A COUNTER COUNTS WHAT HAPPENED, NOT WHAT WAS ATTEMPTED. `publishes`,
+  `bytesPublished` and `bytesDelivered` move inside the publish promise's
+  `.then`, never beside it.
+- AN EMPTY METRIC WINDOW IS `null`, NEVER ZEROS. For a latency distribution
+  zero is the BEST value, so a flattened empty window reports the healthiest
+  possible reading for the sickest possible state.
+- A CAP THAT COULD NOT BE EVALUATED SAYS SO. `checkAdmission` still fails OPEN
+  on a Redis fault, because failing closed locks users out of a healthy
+  deployment; what it may not do is fail open invisibly.
 - A wire change bumps the protocol version when it changes MEANING, not only when
   it changes SHAPE. Re-ordering an enum moves no byte and is still a bump.
 - Anything whose rate a client controls is COUNTED in process and flushed on a
@@ -182,10 +221,12 @@ whole timing guarantee rests on nothing in it ever awaiting.
   stamp came from an authority whose clock is its own. See the defects below.
 - THE FUTURE-STAMP REFUSAL MUST NOT BE PERMANENT. A server clock that genuinely
   steps forward trips the same test on every frame, so a refusal with no way out
-  is a total stall. Past `TIMELINE_STEP_FRAMES` CONSECUTIVE refusals the run is
-  treated as a timeline rather than a glitch and becomes the new anchor. The
-  count resets on the first frame that lands back near the floor, which is what
-  makes a one-off corrupt stamp and a sustained step distinguishable at all.
+  is a total stall. Past `TIMELINE_STEP_FRAMES` refusals WITHIN
+  `TIMELINE_STEP_WINDOW` judged frames the run is treated as a timeline rather
+  than a glitch and becomes the new anchor. The window ages the count out
+  instead of one in-floor frame resetting it, which is what makes a one-off
+  corrupt stamp and a sustained step distinguishable WITHOUT depending on
+  arrival order. See the run-based-discriminator gotcha.
 - The interpolator's clock offset is eased, EXCEPT when the playhead has been
   stranded off the buffer for `REANCHOR_AFTER_MS` (600) with at least
   `REANCHOR_MIN_SAMPLES` (5) frames arrived since, which re-anchors it
@@ -201,10 +242,34 @@ whole timing guarantee rests on nothing in it ever awaiting.
   already stopped believing. BOTH HALVES ARE NOW PINNED, having previously been
   asserted here and pinned by nothing: see the mutation matrix below for the
   measurements that justified keeping them.
-- A reconnect must `clear()` the interpolator. `RoomConnection` holds no
-  reference to one, so only the caller can: from `onStatus`, the moment the
-  status leaves `'open'`. Without it the first frame of the new epoch brackets
-  against a seconds-stale one at `frac ~= 1`, which is a snap per reconnect.
+- A reconnect must `clear()` the interpolator, AND THE CONNECTION NOW DOES IT.
+  `RoomConnection.beginEpoch()` calls `markUnanchored()` and
+  `interpolate?.into.clear()` together, because they were always the same fact:
+  the epoch changed. Without the clear the first frame of the new epoch brackets
+  against a seconds-stale one at `frac ~= 1`, a snap per reconnect, plus the old
+  path's clock offset. A host driving an interpolator by hand (no `interpolate`
+  option) still owns the call. THE LESSON IS THE ONE THIS REPO KEEPS RELEARNING:
+  the fix for "every consumer must hand-write these two lines correctly" is to
+  write the two lines once, not to write fifteen lines of README about them.
+- `RoomConnection.frame()` IS THE ONLY PER-FRAME CALL, and that is a safety
+  property rather than ergonomics. It used to be three (`pollStall`,
+  `tick.advance`, `interp.sample`) and the middle one appeared in no README, no
+  architecture doc and not in the shipped pong client. See the defect below for
+  what omitting it measured. `ClientTick.advance` is still public on the CLASS
+  but `conn.tick` is typed `ClientTickView`, which does not name it, so a host
+  can neither forget it nor drive it twice.
+- `RoomConnectionOptions.tickHz` IS REQUIRED. It defaulted to 20, and a default
+  on a number the host always knows is a silent 2x error waiting for the first
+  10Hz room: it drives the tick counter's step, `estimateServerTick`'s slope and
+  the underrun threshold in `stats()` at once.
+- `SnapshotInterpolator<K>` HAS NO DEFAULT KEY TYPE, deliberately. Pids are
+  strings everywhere the simulation contract touches; `CodecEntity.id` is a
+  number. There is no default that is right for both, so a default is only ever
+  silently wrong for one of them.
+- `CodecEntity.id` IS REFUSED OUT OF RANGE, not clamped and not wrapped, and it
+  is the one field in the default codec that does not go through the quantiser.
+  Clamping is right for a coordinate and wrong for an identity: 65535 is no more
+  an approximation of 70000 than 4464 is. There is no nearby value for an id.
 - Prose style: no em dashes, no en dashes. Never mention AI or an assistant in
   code, comments, commits, or docs. Plain descriptive commit messages.
 
@@ -219,6 +284,52 @@ publishing: two divergent simulations interleaving on one channel at 20Hz, both
 clobbering the same checkpoint. `renewFailed` returning the clock UNCHANGED is the
 fix and it looks like a no-op function, which is exactly why somebody keeps
 deleting it.
+
+A SLOW RENEW REPLY USED TO OPEN A HOLE IN THE RENEW SCHEDULE, AND THE HOLE
+LOSES THE LEASE. `renewConfirmed` re-anchored `lastRenewAt` (the PACING clock)
+onto the confirmation time, so `renewDue` waited `leaseRenewMs` from the reply
+rather than from the attempt. Ordinarily that is only a renew period of
+`leaseRenewMs + RTT`, which quietly halves the margin `leaseRenewMs` exists to
+buy. Once RTT exceeds `leaseRenewMs` the attempts overlap, several in-flight
+renews resolve back to back, each one drags the pacing clock forward again, and
+the next attempt is due `leaseRenewMs` after the LAST of them: nothing reaches
+Redis for up to `RTT + leaseRenewMs`. Traced and pinned at RTT 4000 / renew
+1500 / TTL 5000: attempts leave at 1500, 3000 and 4500 and then not again until
+10000, the key lapses at 11500, a successor legitimately acquires it, and
+`lastOwnedAt` (8500) keeps `mayPublish` true until 13500. Two seconds of exactly
+the split brain the two-clock rule exists to prevent, reached without either
+clock ever being collapsed. Fixed by making `renewConfirmed` move only
+`lastOwnedAt`. OVERLAPPING RENEWS ARE THE ACCEPTED PRICE AND ARE NOT NEW: they
+already happened whenever RTT exceeded `leaseRenewMs`, the bound is the same
+`ceil(RTT / leaseRenewMs)` either way, and they are safe because `renewLease`
+is an owner-checked compare-and-extend, `lastOwnedAt` is non-decreasing across
+resolutions, and a `false` reply is a fact about the key that no later reply
+can take back.
+
+A HALF-BUILT SEAM IS WORSE THAN NO SEAM, AND `preserveAttemptTime` WAS ONE.
+The option existed, was documented at length, was tested, named `ticker.ts` as
+the caller that needed it, and `ticker.ts` never called it. Everything passed:
+the fix was present in the tree and absent from every code path that runs. The
+resolution was NOT to pass the flag, because an option whose only correct value
+is `true` leaves the next reader re-deriving why, on the most safety-critical
+module in the library. It was to delete the option and make the behaviour
+unconditional, which also makes the two-clock rule structural. THE LESSON IS
+THE PAIRED-SEAM ONE AGAIN, in its sharpest form: when a change adds an option,
+a helper or a hook, the counterpart is the CALL SITE, and a helper with no
+caller is not a landed fix, it is a comment that compiles.
+
+ZERO IS NOT A NEUTRAL PLACEHOLDER FOR A LATENCY GAUGE. `percentiles([])`
+returned `{ p50: 0, p95: 0, max: 0 }`, on the reasoning that a gauge reading 0
+is sortable where a `NaN` is not. That reasoning is exactly backwards here:
+zero is the BEST possible value, so "no samples at all" and "every sample
+instantaneous" produced identical numbers. Paired with publish counters that
+counted ATTEMPTS, a room whose every publish was rejected reported 20
+publishes a second, bytes climbing at the healthy rate, and the best
+`publishAwait` in the fleet. It now returns `null`, `RoomStats.cadence`,
+`publishAwait` and `serverInternal` are `Percentiles | null`, and the counters
+moved inside the publish promise. The reusable shape: WHEN A GAUGE'S EMPTY
+VALUE IS ALSO ITS HEALTHIEST VALUE, THE EMPTY CASE HAS TO BE A DIFFERENT TYPE,
+not a different number.
 
 EVERY `break` OUT OF THE TICK LOOP MUST SET ITS OWN `exitReason`, BECAUSE THE
 INITIALISER IS A PLAUSIBLE ANSWER. `exitReason` starts as `'duration'`, the one
@@ -336,6 +447,18 @@ comparison agrees with itself whatever the default is and cannot fail on the one
 change it exists to catch; mutation-checked by moving the default scale to 1000
 and confirming that test reddens.
 
+A CONSECUTIVE COUNT IS NOT INVARIANT TO ARRIVAL ORDER, AND `push()` DOCUMENTS
+OUT-OF-ORDER ARRIVALS AS ORDINARY. This is now the third time the same shape has
+bitten the interpolator (the dead-epoch cut keying on the LAST arrival rather
+than the newest; the seed frame defining the statistic it was judged against;
+and this). The floor-refusal escape hatch counted CONSECUTIVE refusals and was
+reset by any in-floor frame, which cannot survive the one event that most needs
+it: a latency DROP larger than `OFFSET_FLOOR_SLACK_MS` reorders the stream by
+construction, so old and new frames interleave one for one and every old one
+cleared the count. Now windowed over `TIMELINE_STEP_WINDOW` (12) judged frames.
+BEFORE WRITING A RUN-BASED DISCRIMINATOR IN THIS MODULE, ASK WHAT REORDERS THE
+STREAM, because something always does.
+
 ## Gates
 
 From the repo root:
@@ -357,11 +480,13 @@ real-Redis suite and skips cleanly when there is none.
 
 ## Status
 
-MEASURED ON THIS TREE, not estimated: `npx vitest run` is 538 tests across 32
+MEASURED ON THIS TREE, not estimated: `npx vitest run` is 593 tests across 33
 files, all green (with a local Redis up, so the six integration files run rather
-than skip); `npx tsc --noEmit` is clean repo-wide including `examples/`;
-`npm run build` emits `dist/` cleanly. Roughly 6,100 lines of source and 3,500 of
-tests. Per layer: core 154, server 46, client 54, codec 72.
+than skip; without one it is 556 passed and 37 skipped, still exit 0);
+`npx tsc --noEmit` is clean repo-wide including `examples/`; `npm run build`
+emits `dist/` cleanly. Roughly 9,000 lines of source and 9,800 of tests. Per
+layer: core 200, server 134, client 90, codec 80, adapters 11, examples 41,
+`tests/` 37.
 
 - Extracted and implemented: core, server, client, codec, adapters, plus three
   examples (a 2D game, a presence layer, a plain Node host).
@@ -386,15 +511,25 @@ tests. Per layer: core 154, server 46, client 54, codec 72.
 ### Verified by mutation, not just observed green
 
 The two-clock rule was checked by reintroducing the historical bug (making
-`renewFailed` advance `lastOwnedAt`) and confirming `lease.test.ts` fails THREE
+`renewFailed` advance `lastOwnedAt`) and confirming `lease.test.ts` fails FOUR
 cases, then restoring: `renewFailed leaves the clock completely unchanged`,
-`THE REGRESSION CASE: ...`, and `the two-clock rule survives the option:
-renewFailed still returns the clock unchanged either way`. This said "two" until
-2026-09-02, which was correct when it was written and went stale the moment
-TR-10b added the third case: a mutation matrix is a statement about the tree it
-was measured on, and the COUNT rots even when the behaviour does not. If you change anything in `lease.ts`, do this again. A
-green test that cannot fail is worse than no test, and this is the one invariant
-in the library whose failure mode is silent and catastrophic.
+`THE REGRESSION CASE: a string of failed renews must make mayPublish go false
+within the TTL...`, `THE CONTRAST: the same failing renews against a COLLAPSED
+clock keep mayPublish true`, and `the two-clock rule survives the change:
+renewFailed still returns the clock unchanged`. This said "two" until
+2026-09-02 and then "three"; it is four now that TR-10b's own case was
+rewritten. A mutation matrix is a statement about the tree it was measured on,
+and the COUNT rots even when the behaviour does not. If you change anything in
+`lease.ts`, do this again. A green test that cannot fail is worse than no test,
+and this is the one invariant in the library whose failure mode is silent and
+catastrophic.
+
+WHOLE-TREE, THAT SAME MUTATION REDDENS A FIFTH CASE, in another file, and it is
+worth knowing before you read a partial run as a clean one:
+`ticker.test.ts`'s `reports lease-lost when the SYNCHRONOUS guard is the only
+finder` also fails, because a `lastOwnedAt` refreshed by failures is exactly
+what stops the pre-publish guard from ever firing. Re-measured on this tree at
+5 failed / 588 passed across the full suite.
 
 The interpolator's shortest-arc heading was checked the same way: replacing
 `lerpHeading`'s body with `a + (b - a) * t` reddens
@@ -461,12 +596,21 @@ into twice.
 | `lerpHeading`'s OUTER `wrapAngle` dropped | `heading interpolates the shortest arc across the +-pi wrap` (at frac 0.75; frac 0.5 cannot see it) |
 | speed low-pass replaced by the instantaneous value | `measures a low-passed speed from its own rendered motion` |
 | `clear()` made to reset `rejectedFrameCount`/`reanchorCount` | `clear() resets the GAUGES but deliberately not the lifetime COUNTERS` |
+| refusal count made CONSECUTIVE again | `the floor-refusal escape hatch counts over a WINDOW ...` (23 refused against a bound of 3) |
 
-A SECOND DEFENCE-IN-DEPTH PAIR, recorded for the same reason.
-`clientTick.test.ts`'s `reportBufferHealth keeps dilation within +-dilationMax`
-has TWO clamps behind it: deleting the post-ease clamp alone is green, deleting
-the `-1..1` clamp inside the target computation alone is green, deleting BOTH
-reddens it. Neither green cell is a vacuous test.
+THE CONNECTION'S THREE NEW SEAMS EACH HAVE A MUTATION. Disabling the
+interpolator push in `processSnapshot` reddens three cases in
+`connection.test.ts`; stamping `serverTime` from the local clock instead of the
+decoded one reddens `pushes each snapshot itself ...` with
+`expected 253.038833 to be greater than 1600000000000` (the two clock domains
+are ~1.7e12 apart, which is what makes that assertion unfakeable); deleting the
+`interpolate?.into.clear()` from `beginEpoch` reddens `clears the interpolator
+on a reconnect ...`; and deleting `this.clock.advance(dt)` from `frame()`
+reddens both tick cases at `expected +0 to be 20` and `expected +0 to be 10`.
+
+For the codec: removing the entity-id range check reddens `throws CodecError on
+an id past the u16 ceiling ...`; ignoring `axisScale` on both halves reddens
+`axisScale moves the boundary ...` at `expected 1 to be 64`.
 
 THE ONE CONSTRUCT WITH NO MUTATION, AND IT IS NOT A HOLE: the `frac` clamp to
 [0,1] in the interpolate branch (and the matching `t` clamp in `posePartial`) is
@@ -488,6 +632,35 @@ BOTH reddens them. Measured both ways. That is defence in depth, not a hole,
 but it does mean the finiteness guard has no mutation of its own and the
 ordering in `push()` is load bearing: the finiteness guard runs first, so
 `refuseSteppedFrame` can never put a NaN in `steppedOffsets`.
+
+THE SERVER, CORE AND ADAPTER CHANGES OF 2026-09-02 EACH HAVE ONE TOO, same
+rule, same reason to re-run it after touching any of those files.
+
+| mutation | reddens |
+| --- | --- |
+| `renewConfirmed` re-anchors `lastRenewAt` to `now` again | 3 in `lease.test.ts`, including the traced split brain (`expected 5500 to be 1500`) |
+| `renewFailed` advances `lastOwnedAt` | 4 in `lease.test.ts` (see above) |
+| `percentiles([])` back to `{p50:0,p95:0,max:0}` | 2 in `metrics.test.ts`, 2 in `ticker.test.ts` |
+| publish counters moved back outside the promise | 2 in `ticker.test.ts` |
+| `publishFails++` deleted | 2 in `ticker.test.ts` |
+| checkpoint version check deleted | 5 in `core/checkpoint.test.ts`, 2 in `ticker.test.ts` |
+| version check narrowed to `> CHECKPOINT_VERSION` (the tempting one-sided shape) | 1 in `core/checkpoint.test.ts`, 1 in `ticker.test.ts` |
+| `ticker.checkpoint-refused` log line deleted | 2 in `ticker.test.ts` |
+| `normalizeBase` drops `FORBIDDEN_CHARS` | 8 in `ids.test.ts` |
+| `normalizeBase` drops the `~` refusal | 1 in `ids.test.ts` |
+| `normalizeBase` drops `DANGEROUS_BASE_NAMES` | 5 in `ids.test.ts`, including `normalizeRoomId`'s own bare-`in` case, which is what proves the delegation is real |
+| balancer route back to a bare `isValidBase(base)` | 9 in `adapters/vercel.test.ts` |
+| `socketCapEvaluated` hardcoded `true` | 3 in `relay.test.ts` |
+| per-command errors discarded again (`typeof socketCount === 'number'` alone) | 1 in `relay.test.ts`, the broken-prune case |
+
+THE LAST ROW IS THE INTERESTING ONE AND IT IS NOT A HOLE. A `ZCARD` that
+errored comes back as `[error, null]` on the fake and `[error, undefined]` on
+ioredis, and neither is a number, so the old `typeof` check already caught that
+one shape. What it could not catch is the PRUNE failing: the count is then a
+real number computed over stale members, high enough to refuse a legitimate
+reconnect. Reading the errors is what makes the distinction, and the broken-
+prune case is the only mutation that observes it. The other three cases in that
+group are pinned by the `socketCapEvaluated` row above them.
 
 ### Defects found and fixed during integration, worth not reintroducing
 
@@ -567,6 +740,13 @@ ordering in `push()` is load bearing: the finiteness guard runs first, so
   writing the ENTIRE quickstart (all three steps) into a scratch `.ts` file
   inside `src/` (so it resolves through the real tsconfig) and confirming
   zero errors, then deleting the scratch file.
+  BOTH OF THOSE TWO ARE NOW STRUCTURAL RATHER THAN DOCUMENTED, which is the
+  better fix and is why the quickstart no longer casts anything.
+  `SnapshotInterpolator<K>` lost its default key type outright, so the wrong
+  one cannot be picked silently, and `RoomConnection` is generic in `TSnap`
+  with `decodeSnapshot`'s return type fixing it, so `onSnapshot` and
+  `interpolate.entities` both receive the host's own shape and neither
+  `unknown` nor a cast survives.
 
 `noUncheckedIndexedAccess` VERDICT: measured at 28 errors across 6 files
 (`examples/node-server/server.ts` 1, `src/codec/snapshot.test.ts` 21,
@@ -762,7 +942,9 @@ carrying forward:
   Persistence is the discriminator: past `TIMELINE_STEP_FRAMES` (3) CONSECUTIVE
   refusals the collected offsets become the new anchor through the same escape
   hatch a stranded playhead uses, and the frame that proved it is accepted. The
-  count resets on the first frame back near the floor. Measured on a +5000ms
+  count reset on the first frame back near the floor, which is the half that
+  was later replaced by a `TIMELINE_STEP_WINDOW` of judged frames; see the
+  run-based-discriminator gotcha for why. Measured on a +5000ms
   forward step: settling time 1000ms to 0, worst staleness 950 to 70, peak
   rendered speed 5260 to 504 u/s, and exactly 3 frames refused across a
   forty-second run rather than a number that keeps climbing.
@@ -937,7 +1119,8 @@ carrying forward:
   worst of the three, at a 5260 u/s spike, but that is the pre-refusal
   behaviour which was already the accepted cost of the re-anchor, and it is
   bounded and converges. Nothing falls between the two mechanisms.
-  ONE REAL GAP WAS FOUND IN THE SWEEP AND IS NOT FIXED: the refusal run is
+  ONE REAL GAP WAS FOUND IN THE SWEEP, LEFT ALONE AT THE TIME, AND HAS SINCE
+  BEEN FIXED (see the run-based-discriminator gotcha): the refusal run was
   counted as CONSECUTIVE (`steppedOffsets.length = 0` on any in-floor frame),
   which is not invariant to arrival ORDER, and `push()` documents out-of-order
   arrivals as ordinary. A latency DROP larger than the slack reorders the
@@ -949,9 +1132,11 @@ carrying forward:
   1000ms (one millisecond less) refuses nothing and peaks at 133. This is the
   same lesson as the dead-epoch cut ("the cut is against the NEWEST of those
   arrivals, not the LAST one"): a run-based discriminator has to be
-  order-invariant. Left alone deliberately, because it needs a base one-way
-  delay above a second to reach at all and the fix is a behaviour change
-  (a windowed count rather than a consecutive one) rather than a correction.
+  order-invariant. It was left alone at the time because it needs a base
+  one-way delay above a second to reach at all and the fix is a behaviour
+  change rather than a correction. The behaviour change was made in the
+  0.2.0 client pass: the count is now windowed over `TIMELINE_STEP_WINDOW`
+  (12) judged frames rather than reset by one in-floor arrival.
 
 ### Defects found by sweeping the whole library for the five known classes (2026-09-02)
 
@@ -993,6 +1178,55 @@ call, not a sweeper's.
   THE SHAPE IS WORTH REMEMBERING: `??` IS NOT A VALIDITY CHECK. Every
   `?? DEFAULT` in this library sits on a number a host may well have computed
   with `Number(...)`, and `Number('')` is 0 while `Number(undefined)` is NaN.
+
+- THE BALANCER ROUTE WAS THE ONE ROUTE OF THREE WITH NO TRUST BOUNDARY ON IT.
+  The ticker and relay routes both run `normalizeRoomId`; the balancer route
+  ran a bare `isValidBase(base)` and nothing else, so `FORBIDDEN_CHARS`, the
+  length cap and `DANGEROUS_BASE_NAMES` were all bypassed on a value that
+  `assignRoom` then interpolates into a Redis key name once per instance in
+  the pool. `isValidBase` cannot be the boundary: it is HOST-supplied, this
+  repo's own docs already treat it as something written wrong (a bare
+  `raw in WORLDS` matches inherited properties), and it says nothing about
+  characters or length at all. Fixed with a new `normalizeBase` in
+  `core/ids.ts`, which `normalizeRoomId` now delegates its base half to.
+  WHY NOTHING CAUGHT IT: there were no adapter tests at all, and every check
+  the route was missing was present, correct and well tested one layer down in
+  a function the route never reached for. A test one layer down cannot observe
+  whether a route calls it. `src/adapters/vercel.test.ts` now exists for
+  exactly that question and stubs only `assignRoom` and `getRedis`.
+
+- `checkAdmission` DISCARDED THE PIPELINE'S PER-COMMAND ERRORS, so the
+  per-user socket cap could silently stop enforcing during a Redis fault,
+  which is precisely when it is load-bearing (that cap is not a fairness
+  control: every socket holds its own Redis subscriber, so one client opening
+  sockets without limit can exhaust a managed plan's connection ceiling and
+  take the room ticker's own subscriber down with it). `pipeline().exec()`
+  resolves with a `[error, reply]` pair PER COMMAND and does not reject when
+  one fails. Deliberately NOT fixed by failing closed: refusing during a Redis
+  blip locks every user out of a healthy deployment, which is worse than the
+  thing being prevented. Fixed by reading the errors and adding
+  `AdmissionResult.socketCapEvaluated`, which both adapters and the node
+  example now log on. The stale-entry prune counts toward it as well as the
+  count itself: without the prune the set still holds members for sockets long
+  gone, so the count reads HIGH and would refuse a legitimate reconnect, which
+  is the fail-closed direction this function will not go in on data it knows is
+  stale.
+
+- `unpackCheckpoint` PROMISED VERSION REJECTION IN ITS DOCSTRING AND PERFORMED
+  NONE. It named "a value from an incompatible future version" among the
+  things it returned `null` for and never looked at `v` at all. The direction
+  people expect to matter is the newer one; the DANGEROUS one is the older,
+  because it PARSES: every field present, every type correct, so a `v: 1` body
+  handed to a build whose version 2 changed what `tick` counts is restored in
+  full and simulated happily. That is the geometry-digest failure through a
+  different door, with the same properties (silent, permanent, TTL refreshed
+  by the very write that perpetuates it, healthy in every metric). Fixed with
+  `!== CHECKPOINT_VERSION`, checked BEFORE the field types so a version that
+  dropped a field reads as the version change it is rather than as corruption.
+  `inspectCheckpoint` carries the reason out and the ticker logs
+  `ticker.checkpoint-refused` with `reason`, `foundVersion` and
+  `expectedVersion`, silent for an absent checkpoint so an ordinary cold room
+  stays quiet and the refusal is a signal rather than noise.
 
 ### Verified against a real Redis and a real socket
 
@@ -1039,6 +1273,52 @@ failed in the full suite while passing in isolation. Key prefixes isolate keys;
 they do not isolate `INFO`, `DBSIZE`, `CLIENT LIST`, or any other server-level
 metric. Measure something you own.
 
+### The buffer-health seam, deleted deliberately and specified for whoever wants it
+
+`ClientTick.reportBufferHealth` AND ITS FIVE TUNING CONSTANTS WERE DELETED, AND
+THE REASON IS WORTH KEEPING. `STEP_DILATION_MAX`, `MARGIN_TARGET`,
+`MARGIN_SPAN`, `HEALTH_EASE_TAU` and `DILATION_EASE_TAU` tuned a control loop
+that NOTHING IN THE LIBRARY COULD DRIVE: grep for `bufferHealth` found the
+method and its own constants and nothing else, so `dilation` was permanently
+1.0 and the `+-5%` step dilation in `docs/ARCHITECTURE.md` section 4 described
+behaviour no consumer could reach. Shipping an undriveable feature is worse than
+shipping neither the feature nor the constants. Four `ClientTick` tests went
+with it, including the defence-in-depth pair this file used to record
+(`reportBufferHealth keeps dilation within +-dilationMax` had two clamps behind
+it, either one deletable on its own while staying green).
+
+The two live options were WIRE IT UP or DELETE IT, and delete won on two
+grounds. First, the producer is structurally server-side: the quantity is how
+many ticks of input a player's `PlayoutBuffer` holds ahead of what the ticker is
+consuming, which only `src/server/ticker.ts` knows. Landing the client half
+alone is precisely the half-a-paired-seam mistake TR-4 is recorded for. Second,
+the tempting client-side substitute (derive the margin from
+`tick.value - estimateServerTick()` minus half `stats().rttMs`) drives a real
+feedback loop from a signal this library's own comment calls a biased PROXY
+rather than a measurement, and a persistent bias larger than `MARGIN_SPAN` pegs
+the dilation at a limit until `shouldReanchor` fires. A wrong-but-plausible
+control loop nobody can measure is the exact failure this repo is built to
+avoid.
+
+THE SEAM TO BUILD, IF SOMEBODY WANTS THE FEATURE BACK, stated precisely so the
+next pass does not have to re-derive it:
+
+1. `src/server/ticker.ts` computes, per player per tick, the buffered margin
+   `bufferedAheadTicks = highestBufferedTargetTick(pid) - currentTick`, from the
+   `PlayoutBuffer` it already holds.
+2. It publishes those on the SAME cadence and channel the roster frame uses,
+   NOT per tick and NOT per player message: anything whose rate a client
+   controls is counted in process and flushed on a cadence the client cannot
+   drive. A `{ t: 'health', margins: Record<pid, number> }` frame at 1Hz is the
+   shape; it belongs behind a `TickerOptions` formatter for the same reason
+   `metaPayload` does.
+3. The relay forwards it unchanged (it already forwards control frames).
+4. `RoomConnectionOptions` grows `bufferMarginFrom?(msg: unknown): number | null`,
+   read in `handleTextFrame`, and `frame()` feeds the result plus its own `dt`
+   into the restored `ClientTick.reportBufferHealth`.
+
+Steps 1 and 2 are the load-bearing half. Do not restore step 4 without them.
+
 ### Owed before a 1.0
 
 - ~~A published package~~ LANDED (`tickroom` on npm, tag-triggered trusted
@@ -1047,6 +1327,9 @@ metric. Measure something you own.
   documented as the supported swap point.
 - The integration suite runs a toy runtime, not the examples. Wiring the pong
   example end to end through it would be a stronger demonstration.
+- The buffer-health seam, if anyone wants the client tick to dilate again. The
+  section above it is the whole specification; the client half alone is not a
+  feature.
 - ~~No CI.~~ LANDED: `.github/workflows/ci.yml`, two jobs. `check` runs
   typecheck, unit tests and build with no services (the `tests/` files skip).
   `integration` runs `npm run test:integration` against a `redis:8` service

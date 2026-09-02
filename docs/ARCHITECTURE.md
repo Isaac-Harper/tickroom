@@ -120,6 +120,10 @@ The fix is one field. Stamp a digest of the world geometry and rules into the ch
 
 The trap is that a hand-rolled digest only covers the fields somebody remembered to mix in. If you add a field to your world definition, add it to the digest, or the digest is quietly lying.
 
+### The envelope version, which is the same failure through a different door
+
+The envelope carries a version, and a checkpoint whose version is not the one this build implements is refused and the room starts fresh. The direction people expect to matter is the newer one. The dangerous one is the **older**, because it *parses*: every field is present and every type is right, so a body written by the previous version is restored in full and simulated happily even though the current build changed what one of those fields means. Same properties as the geometry mismatch, and the same fix. The comparison is `!== CHECKPOINT_VERSION` rather than `>`, and it runs **before** the field-type checks, so a version that dropped a field reads as the version change it is instead of as corruption. `inspectCheckpoint` returns *why* it refused (`absent`, `unparseable`, `malformed`, `version`) so the ticker can log it; an absent checkpoint is silent, because an ordinary cold room is not a refusal.
+
 ---
 
 ## 4. The tick timeline
@@ -160,7 +164,9 @@ Packet loss stops being a visible correction and becomes nothing at all, for a h
 
 The client keeps its own tick counter. It is anchored **once per connection epoch** to the server's estimated tick plus a small margin, and thereafter advances by whole steps and never jumps.
 
-To stay aligned it does not correct the counter, it **dilates the step interval** within ±5%. When the server reports the buffer running thin, tick slightly faster to rebuild it; when it reports a persistent surplus, tick slightly slower to shed input latency. Continuous, invisible, and it never produces the discontinuity a counter correction would.
+**This section used to describe a step-interval dilation, within ±5%, driven by the server reporting how deep its playout buffer was running. That control loop has been DELETED, and the honest reason is worth recording rather than quietly dropping.** The method a host would have called to feed it had no producer anywhere in the library: nothing in the ticker or the relay ever published the buffer margin, so nothing could drive it and the dilation term was permanently 1.0. Five exported constants tuned a loop that never ran. Shipping a control loop with no input is worse than shipping neither, because the constants read as a considered design and the getter reads as a working signal.
+
+Wiring it properly means the ticker publishing playout margin, the relay forwarding it, and the client routing it in, which is a real feature across three layers rather than a client-side tidy-up. The one tempting shortcut, driving the loop from the client's own RTT estimate, is ruled out by this library's own note that the estimate is a biased proxy rather than a true round trip: a feedback loop on a biased input is worse than no loop. Until that seam is built end to end, the counter simply advances at wall-clock rate and re-anchors on drift, which is what the next paragraph describes and what the code actually does.
 
 **Re-anchoring is directional, and only on drift.** A ticker handoff does not close the socket, so the reconnect path never fires, but the server's tick counter *pauses* for the whole interval no ticker owns the room while the client's keeps advancing at wall-clock rate. Past half the playout window the client re-anchors. Only on the ahead side: running *behind* is a latency spike, already handled without a jump by never-drop-late re-stamping, so re-anchoring there would trade a harmless late input for a visible correction.
 
@@ -170,7 +176,7 @@ To stay aligned it does not correct the counter, it **dilates the step interval*
 
 Remote entities are rendered **behind a deliberate delay**. This is the trade that buys smoothness and it is not optional.
 
-**Playback runs on the SERVER's clock, not on the local arrival clock.** This is the one that decides whether any of the rest works. The server emits snapshots on a uniform grid; the network smears their arrival times, bunching several into a few milliseconds after a head-of-line stall clears and stretching the gap between others. Time playback against arrival stamps and that smear is replayed *as motion*: measured on an entity moving at a constant 100 u/s, arrival-clock playback rendered a peak of 1568 u/s, a standard deviation of 144, and 9 visible backward rewinds, where server-clock playback of the identical frames rendered 261, 20.7 and zero. The local arrival stamp is still required, for exactly one job: the minimum of `receivedAt - serverTime` over a sliding window is the least-contaminated estimate of the offset between the two clocks, and that offset is what turns a local `now` into a position on the server's timeline. It is eased toward that floor at no more than 5% of wall time, for the same reason the client tick dilates rather than corrects.
+**Playback runs on the SERVER's clock, not on the local arrival clock.** This is the one that decides whether any of the rest works. The server emits snapshots on a uniform grid; the network smears their arrival times, bunching several into a few milliseconds after a head-of-line stall clears and stretching the gap between others. Time playback against arrival stamps and that smear is replayed *as motion*: measured on an entity moving at a constant 100 u/s, arrival-clock playback rendered a peak of 1568 u/s, a standard deviation of 144, and 9 visible backward rewinds, where server-clock playback of the identical frames rendered 261, 20.7 and zero. The local arrival stamp is still required, for exactly one job: the minimum of `receivedAt - serverTime` over a sliding window is the least-contaminated estimate of the offset between the two clocks, and that offset is what turns a local `now` into a position on the server's timeline. It is eased toward that floor at no more than 5% of wall time, because the offset is subtracted from the playhead, so moving it IS moving playback in time, and moving it faster than a few percent of wall time is perceptible as remote entities briefly running fast or slow.
 
 **A slow estimate needs an escape hatch.** A sliding minimum eased under a slew cap is right for noise and wrong for a *step*: a route change, a network switch, or a handoff onto a machine with its own clock skew moves the true offset in one jump, and easing toward a floor the window has not turned over yet strands the playhead off the buffer for the whole turnover. Measured: a permanent +1000ms one-way latency step cost 22.5 seconds of continuous extrapolation, rendering a 20Hz stop-go staircase. So a playhead that stays somewhere no buffered frame brackets for longer than `REANCHOR_AFTER_MS` (600ms) re-anchors the offset outright, **and only if enough frames are still arriving** (`REANCHOR_MIN_SAMPLES`, 5). That gate is the whole safety of it: an outage parks the playhead in exactly the same place and looks identical from inside the client, but there is no new data to anchor to, so extrapolate-then-hold remains correct there. The count matters as well as the fact: the re-anchor adopts the minimum of the samples that landed during the error window with no slew, so anchoring on a single straggler adopts that one packet's raw offset, which measured as a 600ms offset error held for twelve seconds. One visible correction in exchange for tens of seconds of degradation is the same trade `shouldReanchor` and `ErrorOffset.reset()` already make.
 
@@ -200,7 +206,7 @@ If the relay read the persistent metadata hash instead, a ticker that died hard 
 
 One key for capacity. The metadata hash is consulted only to recognise a *rejoin*, which it can still do correctly while stale.
 
-Admission fails **open** on a read error: a monitoring failure must never become an outage.
+Admission fails **open** on a read error: a monitoring failure must never become an outage. What it must not do is fail open *quietly*. A Redis fault disables the per-user socket cap in exactly the conditions the cap is load-bearing, so `checkAdmission` reads the pipeline's per-command errors and reports `socketCapEvaluated: false` rather than letting a degraded read look like a passing check. Both adapters and the node example log a warning on it.
 
 There is a boundary race (two joiners can both see the last slot), so the ticker enforces the cap authoritatively and publishes a targeted `room-reject` for the loser, who re-assigns to another instance and reconnects. The relay pre-check is the fast, friendly path, not the guarantee.
 
@@ -311,6 +317,14 @@ Two more worth watching:
 
 - **`tickHz`**, measured against **real wall time between flushes**, never assumed. A stalled loop is exactly what the number exists to expose, and computing it from the loop's own assumptions hides the failure.
 - **`bytesDelivered`** = `bytesPublished × playerCount`, the fan-out that the bandwidth bill actually tracks.
+
+### A counter counts what happened, and an empty window is not a healthy one
+
+Two rules that sound like tidiness and are the difference between a metric and a lie.
+
+**Counters move inside the publish promise, never beside it.** `publishes`, `bytesPublished` and `bytesDelivered` record deliveries, not attempts. A room whose every publish is rejected otherwise reports 20 publishes a second with bytes climbing at the healthy rate.
+
+**An empty latency window is `null`, never zeros.** For a distribution of durations, zero is the *best* possible value, so flattening "no samples at all" to `{ p50: 0, p95: 0, max: 0 }` makes the sickest room in the fleet report the healthiest numbers in it. `RoomStats.cadence`, `publishAwait` and `serverInternal` are `Percentiles | null` for that reason. The general shape: when a gauge's empty value is also its healthiest value, the empty case has to be a different **type**, not a different number.
 
 ### The alerting blind spot
 
