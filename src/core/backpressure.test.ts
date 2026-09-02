@@ -75,28 +75,40 @@ describe('the fairness property: a per-sender cap protects OTHER senders from on
   });
 
   it('THE ACTUAL FAIRNESS CLAIM: a quiet sender still gets through while another sender is actively flooding', () => {
-    const inbox = new Inbox<number>({ cap: 1000, perSenderCap: 5 });
+    // THE GLOBAL CAP HAS TO BE SMALL ENOUGH FOR THE FLOODER TO EXHAUST IT,
+    // or this test claims nothing. With a cap of 1000 the flooder never gets
+    // near it, so the quiet sender is admitted whether the per-sender quota
+    // exists or not, and deleting the quota outright left this case green:
+    // the very case named THE ACTUAL FAIRNESS CLAIM. A cap of 8 against a
+    // per-sender cap of 5 is the configuration where the two answers differ.
+    // Without the quota the flooder's 50 pushes fill all 8 slots and the
+    // quiet sender is shed at the door; with it the flooder is held to 5 and
+    // the other 3 slots are still there for everyone else.
+    const inbox = new Inbox<number>({ cap: 8, perSenderCap: 5 });
     for (let i = 0; i < 50; i++) inbox.push(i, 'flooder');
     // The flooder has exhausted its own quota, but a well-behaved sender
     // sending one item must not be shed by the flooder's behaviour: the
     // whole point of the per-sender cap is that they are independent.
     expect(inbox.push(999, 'quiet-player')).toBe(true);
+    expect(inbox.size()).toBe(6); // the flooder's 5 plus the quiet one, still under the global cap
     const drained = inbox.drain(1000);
     expect(drained).toContain(999);
   });
 
-  it('demonstrates the failure a per-sender cap fixes: WITHOUT one, a global-only cap lets a flooder starve everyone else', () => {
-    // A minimal reproduction of the naive design, inline, to show what this
-    // class is actually buying: a flooder alone can exhaust the entire
-    // global capacity, at which point a quiet sender's single item is shed
-    // too, indiscriminately.
-    const globalOnlyCap = 5;
-    const queue: string[] = [];
-    for (let i = 0; i < 50; i++) {
-      if (queue.length < globalOnlyCap) queue.push('flooder');
-    }
-    const quietAdmitted = queue.length < globalOnlyCap;
-    expect(quietAdmitted).toBe(false); // the defect this module exists to avoid
+  it('the same flood against a per-sender quota too large to ever bind reproduces the global-only design, and starves the quiet sender', () => {
+    // THE CONTRAST, DRIVEN THROUGH THE REAL CLASS. This used to be a few
+    // lines of arithmetic over a local array, which demonstrated the naive
+    // design without touching the module under test at all: no possible
+    // change to `backpressure.ts` could fail it, so it read as coverage of
+    // the fairness property while pinning nothing. Configuring the real
+    // `Inbox` with a per-sender cap it can never reach IS the naive design
+    // (a shared limit and nothing else), so the contrast is now measured
+    // against the same code path as the case above, with only the quota
+    // sizing differing between them.
+    const inbox = new Inbox<number>({ cap: 8, perSenderCap: 1000 });
+    for (let i = 0; i < 50; i++) inbox.push(i, 'flooder');
+    expect(inbox.size()).toBe(8); // one sender, holding the entire shared capacity
+    expect(inbox.push(999, 'quiet-player')).toBe(false); // the defect this module exists to avoid
   });
 
   it('items with no senderId are exempt from the per-sender quota', () => {

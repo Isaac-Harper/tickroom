@@ -109,6 +109,64 @@ describe('normalizeRoomId: the trust boundary', () => {
     expect(normalizeRoomId(raw, { isValidBase, fallback: FALLBACK })).toBe(FALLBACK);
   });
 
+  // THE CHARACTER FILTER AND THE LENGTH CAP, MEASURED APART FROM THE
+  // REGISTRY CHECK, which is the only way either of them is observable at
+  // all. Every case in the table above ALSO fails `isValidBase` (the
+  // registry three lines up holds lobby/arena/park and nothing else), so the
+  // fallback it observes is produced by the registry and says nothing about
+  // the two guards that ran before it: deleting the `FORBIDDEN_CHARS` test
+  // or the length comparison outright left every one of those cases green.
+  // The cases below hand `normalizeRoomId` a registry that RECOGNISES the
+  // dirty id, so the guard under test is the only thing left that can refuse
+  // it, and each group carries a control that must still be ACCEPTED so a
+  // fallback cannot come from somewhere else and read as coverage.
+  //
+  // A registry recognising an id with a colon or a control byte in it is not
+  // a contrived setup: `isValidBase` is host-supplied, the module comment
+  // already treats it as something that can be written wrong, and these
+  // bytes are exactly the ones that would otherwise be interpolated into an
+  // unescaped Redis key name.
+  describe('the character filter, isolated from the registry', () => {
+    const DIRTY = [
+      ['a:b', 'a colon, which would smuggle an extra segment into every room key'],
+      ['a*b', 'a Redis glob wildcard, so a KEYS/SCAN pattern is never constructible from a query param'],
+      ['a b', 'an ASCII space'],
+      ['a\tb', 'a tab'],
+      ['a\nb', 'a newline, which is log injection'],
+      ['a\x00b', 'a NUL byte'],
+      ['a\x1bb', 'an ESC, i.e. a terminal escape sequence in an operator tmux session'],
+      ['a\x7fb', 'a DEL'],
+      ['a\x9fb', 'a C1 control byte'],
+    ] as const;
+    const recognisesDirty = new Set<string>([...DIRTY.map(([raw]) => raw), 'ab']);
+    const isValidDirtyBase = (b: string): boolean => recognisesDirty.has(b);
+
+    it.each(DIRTY)('refuses %j (%s) even though the registry recognises it', (raw) => {
+      expect(normalizeRoomId(raw, { isValidBase: isValidDirtyBase, fallback: FALLBACK })).toBe(FALLBACK);
+    });
+
+    it('CONTROL: the same registry accepts the id with the offending byte gone', () => {
+      // Without this the group above would still pass if `normalizeRoomId`
+      // rejected everything for some unrelated reason.
+      expect(normalizeRoomId('ab', { isValidBase: isValidDirtyBase, fallback: FALLBACK })).toBe('ab');
+    });
+  });
+
+  describe('the length cap, isolated from the registry', () => {
+    const atCap = 'a'.repeat(64);
+    const overCap = 'a'.repeat(65);
+    const recognisesLong = new Set([atCap, overCap]);
+    const isValidLongBase = (b: string): boolean => recognisesLong.has(b);
+
+    it('accepts an id of exactly the maximum length', () => {
+      expect(normalizeRoomId(atCap, { isValidBase: isValidLongBase, fallback: FALLBACK })).toBe(atCap);
+    });
+
+    it('refuses an id one byte over the maximum, with the registry recognising it', () => {
+      expect(normalizeRoomId(overCap, { isValidBase: isValidLongBase, fallback: FALLBACK })).toBe(FALLBACK);
+    });
+  });
+
   it('accepts a valid bare base', () => {
     expect(normalizeRoomId('arena', { isValidBase, fallback: FALLBACK })).toBe('arena');
   });

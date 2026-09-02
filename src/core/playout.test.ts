@@ -86,6 +86,19 @@ describe('NEVER-DROP-LATE', () => {
     buf.push(7, 'staler');
     const { item } = buf.consume(11);
     expect(item).toBe('fresher');
+
+    // AND THE TIE, which is the case the `>=` exists for and a strict `>`
+    // would lose. Two pushes originally stamped for the SAME tick re-stamp
+    // onto the same slot and neither is fresher than the other, so the one
+    // already sitting there stays: that is a redundancy window re-sending a
+    // record the buffer has already taken, and the later copy must not
+    // displace it. Without this the comparison could be `>` and every case
+    // above would still pass.
+    const tie = new PlayoutBuffer<string>();
+    tie.consume(10);
+    tie.push(9, 'first-copy');
+    tie.push(9, 'second-copy');
+    expect(tie.consume(11).item).toBe('first-copy');
   });
 
   it('a genuinely fresher push DOES win over an already-re-stamped staler one, regardless of arrival order', () => {
@@ -228,6 +241,34 @@ describe('a fresh buffer in a room that is already running', () => {
     buf.push(90_000, 'runaway');
     expect(buf.consume(50_004).item).toBe('sane');
     expect(buf.consume(90_000).starved).toBe(true);
+
+    // AND THE EXACT WIDTH OF THE WINDOW, which the pair above cannot see:
+    // 90000 is 40000 ticks out, so it is refused under any reference point
+    // and any bound, and moving the reference by one tick would not have
+    // changed a single answer here. The reference is `tick - 1`, so the
+    // first push sits INSIDE its own window rather than on the edge of it,
+    // and with maxAhead 10 the admissible band around a first push of 50004
+    // is 49993..50013. Each end is pinned with its own fresh buffer, since
+    // the first consume replaces the reference with the consumer position.
+    const atTop = new PlayoutBuffer<string>(10);
+    atTop.push(50_004, 'first');
+    atTop.push(50_013, 'top of the window');
+    expect(atTop.consume(50_013).item).toBe('top of the window');
+
+    const pastTop = new PlayoutBuffer<string>(10);
+    pastTop.push(50_004, 'first');
+    pastTop.push(50_014, 'one past the top');
+    expect(pastTop.consume(50_014).starved).toBe(true);
+
+    const atBottom = new PlayoutBuffer<string>(10);
+    atBottom.push(50_004, 'first');
+    atBottom.push(49_993, 'bottom of the window');
+    expect(atBottom.consume(49_993).item).toBe('bottom of the window');
+
+    const pastBottom = new PlayoutBuffer<string>(10);
+    pastBottom.push(50_004, 'first');
+    pastBottom.push(49_992, 'one past the bottom');
+    expect(pastBottom.consume(49_992).starved).toBe(true);
   });
 
   it('bounds the window below the reference too, while there is no consumer position', () => {

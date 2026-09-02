@@ -61,7 +61,14 @@ describe('graceMsFromCheckpoint', () => {
   });
 
   it('returns 0 when there is no in-progress grace', () => {
-    const json = packCheckpoint(envelope({ tick: 100, graceUntilTick: 0 }));
+    // EXACTLY AT THE CUTOFF, which is the only value that separates
+    // `remainingTicks <= 0` from `< 0`. This case used to drive
+    // `graceUntilTick: 0` against tick 100, i.e. a grace 100 ticks in the
+    // past, which is the already-expired case below and leaves the boundary
+    // itself untested: a grace ending on this very tick has nothing left to
+    // run, so it must report 0 rather than one slack window of protection
+    // nobody's simulation is honouring.
+    const json = packCheckpoint(envelope({ tick: 100, graceUntilTick: 100 }));
     expect(graceMsFromCheckpoint(json, tickMs, slackMs)).toBe(0);
   });
 

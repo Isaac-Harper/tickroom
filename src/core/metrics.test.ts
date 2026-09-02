@@ -13,13 +13,27 @@ describe('percentiles', () => {
   it('computes p50 for an odd-length sorted set', () => {
     // sorted: 1,2,3,4,5 -> floor(0.5*5)=2 -> index 2 -> value 3
     expect(percentiles([5, 3, 1, 4, 2]).p50).toBe(3);
+    // THE INDEX RULE IS `floor(fraction * length)`, NOT
+    // `floor(fraction * (length - 1))`, and on an odd length the p50 above
+    // cannot tell those two apart: for any odd n both land on (n-1)/2. p95
+    // over the same five samples does separate them (floor(0.95*5)=4, the 5,
+    // against floor(0.95*4)=3, the 4), and it is the same off-by-one that
+    // cost the interpolator's delay quantile the largest sample in its
+    // window, so it is pinned here rather than left to the reader.
+    expect(percentiles([5, 3, 1, 4, 2]).p95).toBe(5);
   });
 
   it('rounds to integers', () => {
-    const result = percentiles([1, 2]);
+    // NON-INTEGER SAMPLES ON PURPOSE. Every other case in this file feeds
+    // whole numbers, which round to themselves, so the three `Math.round`
+    // calls could all be deleted without a single assertion turning red.
+    // sorted: 1.4, 2.6, 3.5 -> p50 index 1 (2.6 -> 3), p95 index 2 (3.5 -> 4,
+    // half away from zero), max 3.5 -> 4.
+    const result = percentiles([2.6, 1.4, 3.5]);
     expect(Number.isInteger(result.p50)).toBe(true);
     expect(Number.isInteger(result.p95)).toBe(true);
     expect(Number.isInteger(result.max)).toBe(true);
+    expect(result).toEqual({ p50: 3, p95: 4, max: 4 });
   });
 
   it('does not mutate the input array', () => {
@@ -36,7 +50,10 @@ describe('percentiles', () => {
   it('p95 sits near the top of a large uniform run', () => {
     const values = Array.from({ length: 100 }, (_, i) => i + 1); // 1..100
     const result = percentiles(values);
-    expect(result.p95).toBeGreaterThanOrEqual(95);
+    // Exact, not a bound: `>= 95` is satisfied by every plausible index rule
+    // over this input, including the off-by-one one. floor(0.95*100)=95, so
+    // the 96th sample; an index taken over `length - 1` would give 95.
+    expect(result.p95).toBe(96);
     expect(result.max).toBe(100);
   });
 });

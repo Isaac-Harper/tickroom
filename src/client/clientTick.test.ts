@@ -10,20 +10,31 @@ describe('ClientTick', () => {
   });
 
   it('anchorTo sets the counter to round(serverTick) + anchorMargin and returns the exact delta', () => {
+    // A FRACTIONAL serverTick, because that is the only kind the real caller
+    // ever produces: `connection.ts`'s `estimateServerTick()` divides an
+    // elapsed-milliseconds figure by the tick interval, so an integer is the
+    // measure-zero case. Every test here used to pass one, which made
+    // `Math.floor` and `Math.round` indistinguishable in the whole file.
     const t = new ClientTick({ tickMs: 50, anchorMargin: 4 });
-    const delta = t.anchorTo(100);
-    expect(t.value).toBe(104);
-    expect(delta).toBe(104);
+    const delta = t.anchorTo(100.6); // rounds UP to 101; flooring would give 100
+    expect(t.value).toBe(105);
+    expect(delta).toBe(105);
     expect(t.initialized).toBe(true);
     expect(t.anchored).toBe(true);
+
+    // ...and DOWN, from the other side of the same boundary, so the assertion
+    // above cannot be satisfied by rounding in one direction always.
+    const down = new ClientTick({ tickMs: 50, anchorMargin: 4 });
+    expect(down.anchorTo(100.4)).toBe(104);
+    expect(down.value).toBe(104);
   });
 
   it('a second anchorTo returns the delta from the PREVIOUS value, not from zero', () => {
     const t = new ClientTick({ tickMs: 50, anchorMargin: 4 });
-    t.anchorTo(100); // -> 104
-    const delta = t.anchorTo(200); // -> 204
-    expect(t.value).toBe(204);
-    expect(delta).toBe(100);
+    t.anchorTo(100.4); // rounds down to 100 -> 104
+    const delta = t.anchorTo(200.7); // rounds up to 201 -> 205
+    expect(t.value).toBe(205);
+    expect(delta).toBe(101);
   });
 
   it('advance() rounds serverTick and never jumps mid-epoch: a run of small frames matches the tick rate exactly', () => {
@@ -83,8 +94,20 @@ describe('ClientTick', () => {
   });
 
   it('a healthy margin at the target produces roughly zero dilation', () => {
-    const t = new ClientTick({ tickMs: 50, marginTarget: 3 });
-    for (let i = 0; i < 50; i++) t.reportBufferHealth(3, 0.1);
+    // REACHING THE TARGET HAS TO BE SOMETHING THIS CLASS DID. `easedMargin`
+    // starts at MARGIN_TARGET and `easedDilation` starts at zero, so feeding
+    // the target value and asserting the target state asserts the constructor,
+    // not the ease: emptying the whole body of `reportBufferHealth` passes it.
+    // Come at the target from somewhere else, and pin the departure too.
+    const t = new ClientTick({ tickMs: 50, marginTarget: 3, dilationMax: 0.05, marginSpan: 1.5 });
+
+    // A buffer three ticks deeper than it should be: the tick must slow down.
+    for (let i = 0; i < 300; i++) t.reportBufferHealth(8, 0.1);
+    expect(t.bufferedMargin).toBeCloseTo(8, 6);
+    expect(t.dilation).toBeCloseTo(-0.05, 6);
+
+    // Now the buffer is healthy again, and both stages ease back to rest.
+    for (let i = 0; i < 300; i++) t.reportBufferHealth(3, 0.1);
     expect(Math.abs(t.dilation)).toBeLessThan(0.001);
     expect(t.bufferedMargin).toBeCloseTo(3, 6);
   });

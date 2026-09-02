@@ -36,8 +36,17 @@ describe('decayOnStarve', () => {
   });
 
   it('does not snap a value that decays to exactly or above epsilon', () => {
-    const r = decayOnStarve(STARVE_DECAY_AFTER + 10, 0.2, { epsilon: 0.05, factor: 0.5 });
-    expect(r.value).toBe(0.1);
+    // ABOVE epsilon.
+    const above = decayOnStarve(STARVE_DECAY_AFTER + 10, 0.2, { epsilon: 0.05, factor: 0.5 });
+    expect(above.value).toBe(0.1);
+    // AND EXACTLY AT IT, which is the half this case was named for and did
+    // not drive: the snap is `Math.abs(decayed) < epsilon`, so a value
+    // landing precisely on epsilon must survive, and only a decay that takes
+    // it strictly below snaps to 0. 0.1 * 0.5 is exactly representable as
+    // the same double the 0.05 literal parses to, so this is a true equality
+    // rather than a float that happens to land close.
+    const exactly = decayOnStarve(STARVE_DECAY_AFTER + 10, 0.1, { epsilon: 0.05, factor: 0.5 });
+    expect(exactly.value).toBe(0.05);
   });
 
   it('honours a custom decayAfter', () => {

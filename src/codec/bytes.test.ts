@@ -125,6 +125,19 @@ describe('ByteWriter / ByteReader round trips', () => {
     const buf = w.finish();
     expect(buf.length).toBe(1);
     expect(buf[0]).toBe(7);
+    // Both assertions above are equally true of a `subarray`, which is a VIEW
+    // ALIASING the writer's live buffer rather than a copy. That is not a
+    // cosmetic difference: a finished frame a caller is holding (a snapshot
+    // queued for send) would carry the writer's whole spare capacity along
+    // with it and stay pinned to a buffer the writer keeps writing into. So
+    // keep writing, and prove the handed-off bytes own their own storage.
+    for (let i = 0; i < 200; i++) w.u8(0xff);
+    expect(buf.length).toBe(1);
+    expect(buf[0]).toBe(7);
+    // The one thing a view cannot fake: its backing ArrayBuffer is the
+    // writer's 256-byte one, not a 1-byte buffer of its own.
+    expect(buf.byteOffset).toBe(0);
+    expect(buf.buffer.byteLength).toBe(1);
   });
 });
 
@@ -145,6 +158,21 @@ describe('ByteReader accepts both ArrayBuffer and a Uint8Array view', () => {
     new Uint8Array(ab).set(buf);
     const r = new ByteReader(ab);
     expect(r.u32()).toBe(42);
+  });
+
+  it('bytes(n) returns a copy the caller can hold past the source buffer\'s lifetime', () => {
+    // `bytes()` documents its return value as a COPY, never a view into the
+    // source, and that promise is what lets a decoder hand a payload straight
+    // to something that outlives the frame it arrived in. A view would pass
+    // every assertion made at read time and then change underneath its holder
+    // the moment the source buffer is reused, which for a socket reading into
+    // a recycled receive buffer is the ordinary case, not the exotic one.
+    const source = new Uint8Array([1, 2, 3, 4]);
+    const r = new ByteReader(source);
+    const held = r.bytes(4);
+    expect(Array.from(held)).toEqual([1, 2, 3, 4]);
+    source.fill(0xff);
+    expect(Array.from(held)).toEqual([1, 2, 3, 4]);
   });
 });
 
@@ -231,5 +259,22 @@ describe('explicit little-endian byte order', () => {
   it('a known hex sequence decodes to the expected u32', () => {
     const raw = new Uint8Array([0x78, 0x56, 0x34, 0x12]);
     expect(new ByteReader(raw).u32()).toBe(0x12345678);
+  });
+
+  it('f32 writes its IEEE-754 bits low byte first', () => {
+    // Pi as a single-precision float is 0x40490fdb, so little-endian bytes
+    // are [0xdb, 0x0f, 0x49, 0x40] and big-endian is the exact reverse. A
+    // round trip cannot tell the two apart, since a writer and a reader that
+    // are wrong in the SAME direction agree with each other perfectly; only
+    // the bytes on the wire can, and the wire is what another host reads.
+    const buf = new ByteWriter().f32(Math.PI).finish();
+    expect(Array.from(buf)).toEqual([0xdb, 0x0f, 0x49, 0x40]);
+  });
+
+  it('a known f32 hex sequence decodes little-endian too', () => {
+    // The reader half of the same claim, pinned against literal bytes rather
+    // than against the writer, for the reason above.
+    const raw = new Uint8Array([0xdb, 0x0f, 0x49, 0x40]);
+    expect(new ByteReader(raw).f32()).toBe(Math.fround(Math.PI));
   });
 });

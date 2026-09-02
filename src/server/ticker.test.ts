@@ -206,6 +206,19 @@ describe('runTicker', () => {
     const keys = roomKeys('r1', NS);
     const runtime = makeCounterRuntime();
 
+    // THE SNAPSHOT CHANNEL IS ACTUALLY WATCHED, because "stops publishing" is
+    // the claim in the name and this case used to assert only the exit reason,
+    // the uptime and the lease value. All three of those are satisfied by the
+    // ASYNC detector on its own, so the synchronous guard could be disabled
+    // outright (`if (false && owns && !mayPublish(...))`) without a red test:
+    // the very guard the case is named for was pinned by nothing.
+    const publishedAt: number[] = [];
+    const observer = redis.fork();
+    observer.on('message', (channel) => {
+      if (channel === keys.out) publishedAt.push(Date.now());
+    });
+    await observer.subscribe(keys.out);
+
     const resultPromise = runTicker({
       runtime,
       redis,
@@ -215,30 +228,91 @@ describe('runTicker', () => {
       // Shrunk well below the production defaults so the guard fires inside
       // a test's real-time budget instead of the production 1.5-5s window.
       leaseTtlMs: 50,
-      leaseRenewMs: 20,
+      // AND NO RENEW IS EVER DUE, which is what leaves the synchronous guard
+      // as the only finder. This is the same argument the `eval`-breaking
+      // case below makes, reached by pacing instead of by breakage: with a
+      // renew interval this far past the run, section 11 never fires, so
+      // `lostLeaseExplicitly` can never be set and nothing but the
+      // pre-publish `mayPublish` check can notice the theft. It is also the
+      // realistic shape of the condition the guard exists for: ownership
+      // lapsing between renews rather than a renew reporting the loss.
+      leaseRenewMs: 100_000,
       checkpointMs: 1000,
       statsMs: 1000,
-      maxRunMs: 5000, // must not be what ends the test
-      emptyGraceMs: 5000, // the room has no players, so this must also not be what ends it
+      // Thirty times the lease TTL, so neither of these can plausibly be what
+      // ends the run, and short enough that a ticker which never notices the
+      // theft returns a wrong answer to assert against instead of running out
+      // the suite's own timeout.
+      maxRunMs: 1500,
+      emptyGraceMs: 1500, // the room has no players, so this must not end it either
     });
 
     // Let it acquire the lease and take a few ticks.
     await new Promise((r) => setTimeout(r, 15));
+    const stolenAt = Date.now();
     // Steal the lease the way an independent competing process would: write
     // a different owner value directly, with no coordination at all.
     await redis.set(keys.lease, 'a-thief', 'PX', 5000);
 
     const result = await resultPromise;
+    observer.disconnect();
+
+    // It was publishing, so the assertion below is about a channel that was
+    // genuinely being fed rather than one nothing ever reached.
+    expect(publishedAt.length).toBeGreaterThan(0);
+    // NOT ONE SNAPSHOT PAST THE GUARD'S DEADLINE. Ownership was last
+    // confirmed at the acquire, so it lapses `leaseTtlMs` into the run and
+    // the last publish must sit before that; the bound below is measured from
+    // the theft (15ms in) with a whole extra TTL of slack, so it rules out a
+    // loop that simply kept publishing while a successor owned the room,
+    // without turning into a measurement of how fast the guard is.
+    expect(publishedAt.filter((t) => t > stolenAt + 100).length).toBe(0);
+
     expect(result.reason).toBe('lease-lost');
     // AND it exited on the lease rather than on the clock. Both exits used to
     // be reachable from this setup with different reasons, so pin the one
     // fact that separates them independently of which detector won: a
-    // duration exit cannot happen before the 5000ms cap, and this is half of
-    // it. See the next case for why the two detectors used to disagree.
-    expect(result.uptimeMs).toBeLessThan(2500);
+    // duration exit cannot happen before the 1500ms cap, and this is half of
+    // it. See the case after next for why the two detectors used to disagree.
+    expect(result.uptimeMs).toBeLessThan(750);
 
     // The thief's write must still be standing: this ticker must not have
     // released (and thereby cleared) a lease it no longer owns.
+    expect(await redis.get(keys.lease)).toBe('a-thief');
+  });
+
+  it('reports lease-lost when the ASYNC renew is the finder', async () => {
+    // The other detector, on the same theft. This is the configuration the
+    // case above used to run (a renew interval well inside the TTL), where a
+    // renew comes due while the thief holds the key, reports a CONFIRMED
+    // loss, and sets `lostLeaseExplicitly` long before ownership has lapsed
+    // far enough for the synchronous guard to look. Kept as its own case
+    // because the case above no longer reaches this path at all, and section
+    // 12's `exitReason = 'lease-lost'` would otherwise have no test: changing
+    // it to 'duration' reddens exactly here.
+    const redis = new FakeRedis();
+    const keys = roomKeys('r1', NS);
+
+    const resultPromise = runTicker({
+      runtime: makeCounterRuntime(),
+      redis,
+      createSubscriber: () => redis.fork(),
+      roomId: 'r1',
+      namespace: NS,
+      leaseTtlMs: 50,
+      leaseRenewMs: 20,
+      checkpointMs: 1000,
+      statsMs: 1000,
+      maxRunMs: 5000,
+      emptyGraceMs: 5000,
+    });
+
+    await new Promise((r) => setTimeout(r, 15));
+    await redis.set(keys.lease, 'a-thief', 'PX', 5000);
+
+    const result = await resultPromise;
+    expect(result.reason).toBe('lease-lost');
+    expect(result.uptimeMs).toBeLessThan(2500);
     expect(await redis.get(keys.lease)).toBe('a-thief');
   });
 
@@ -256,12 +330,15 @@ describe('runTicker', () => {
    *       fires when ownership has already lapsed by the time an iteration
    *       starts, i.e. when the loop itself stalled past the lease TTL.
    *
-   * The test above cannot choose between them, so it used to be a coin flip
-   * on machine load: (a) reported 'lease-lost' and (b) broke out of the loop
-   * leaving `exitReason` on its 'duration' initialiser, so on a loaded host
-   * the assertion flipped. That was never a timing problem in the test, it
-   * was `ticker.ts` genuinely reporting a healthy duration-capped exit for a
-   * ticker that had just had the room taken away from it.
+   * A steal with a renew interval inside the TTL cannot choose between them,
+   * so it used to be a coin flip on machine load: (a) reported 'lease-lost'
+   * and (b) broke out of the loop leaving `exitReason` on its 'duration'
+   * initialiser, so on a loaded host the assertion flipped. That was never a
+   * timing problem in the test, it was `ticker.ts` genuinely reporting a
+   * healthy duration-capped exit for a ticker that had just had the room
+   * taken away from it. The two cases above now drive one detector each: the
+   * split-brain case pushes every renew past the end of the run so only (b)
+   * is left, and the case after it keeps renews frequent so (a) wins.
    *
    * This case pins (b) on its own, and it does so by ORDERING rather than by
    * timing: breaking `eval` means the atomic renew script can never resolve
@@ -444,7 +521,7 @@ describe('runTicker', () => {
   it('drops a stale playout buffer once an unstamped input supersedes it', async () => {
     const redis = new FakeRedis();
     const keys = roomKeys('r1', NS);
-    let starvedCount = 0;
+    let starves = 0;
     let unstampedApplied = 0;
 
     const runtime = makeCounterRuntime({
@@ -455,8 +532,8 @@ describe('runTicker', () => {
         const p = state.players.get(pid);
         if (p) p.counter += input.data as number;
       },
-      onStarve: (_state, _pid, streak) => {
-        starvedCount = streak;
+      onStarve: () => {
+        starves++;
       },
     });
 
@@ -466,7 +543,7 @@ describe('runTicker', () => {
       createSubscriber: () => redis.fork(),
       roomId: 'r1',
       namespace: NS,
-      maxRunMs: 200,
+      maxRunMs: 400,
       emptyGraceMs: 100_000,
     });
 
@@ -478,12 +555,24 @@ describe('runTicker', () => {
       JSON.stringify({ t: 'in', pid: 'alice', w: [{ seq: 1, targetTick: 1000, data: 1 } satisfies ClientInput] })
     );
     await new Promise((r) => setTimeout(r, 20));
-    const starvesBeforeUnstamped = starvedCount;
+    const starvesBeforeUnstamped = starves;
     // ...until an UNSTAMPED input arrives, which must drop the stale buffer.
     await redis.publish(keys.in, JSON.stringify({ t: 'in', pid: 'alice', w: [{ seq: 2, data: 9 } satisfies ClientInput] }));
+    // THE DROP IS MEASURED AFTER IT, NOT BEFORE IT. Everything above is true
+    // whether or not the buffer is dropped: the unstamped input is applied on
+    // that branch either way, and both counts were read before the drop could
+    // have had any effect, so deleting `dropPlayout` left this case green.
+    // The observable consequence is that the starving STOPS: a buffer holding
+    // a stamp 1000 ticks out can never be fed, so with the buffer still in
+    // place `onStarve` keeps firing on every tick for the rest of the run.
+    await new Promise((r) => setTimeout(r, 40)); // let the drop land
+    const starvesAfterDrop = starves;
+    await new Promise((r) => setTimeout(r, 120)); // ...and keep the room running, several ticks' worth
+    const starvesLater = starves;
 
     await resultPromise;
     expect(starvesBeforeUnstamped).toBeGreaterThan(0);
+    expect(starvesLater).toBe(starvesAfterDrop);
     expect(unstampedApplied).toBe(1);
   });
 });
@@ -882,10 +971,18 @@ describe('runTicker: runtime contract', () => {
     });
 
     await new Promise((r) => setTimeout(r, 10));
-    // The near one is inside the window, the far one is not. A SIZE bound with
-    // eviction would have let the far one in and thrown out the near one to
+    // The near one is inside the window, the other two are not. A SIZE bound
+    // with eviction would have let a far one in and thrown out the near one to
     // make room, starving the player on the input they were about to need. A
     // DISTANCE bound with refusal drops the runaway stamp instead.
+    //
+    // 10 IS THE STAMP THAT MEASURES THE CONFIGURED VALUE, and 400 is not. The
+    // buffer's reference is the first push minus one (tick 2), so 400 is 398
+    // ticks out and is refused by `PLAYOUT_MAX_AHEAD` (40) just as flatly as
+    // by the 4 configured here: with only 3 and 400 driven, constructing the
+    // buffer with no argument at all left this case green and the option it
+    // is named for pinned by nothing. 10 sits between the two, so it is
+    // refused ONLY while `playoutMaxAhead` is the bound actually in force.
     await redis.publish(
       keys.in,
       JSON.stringify({
@@ -893,7 +990,8 @@ describe('runTicker: runtime contract', () => {
         pid: 'alice',
         w: [
           { seq: 1, targetTick: 3, data: 1 },
-          { seq: 2, targetTick: 400, data: 1 },
+          { seq: 2, targetTick: 10, data: 1 },
+          { seq: 3, targetTick: 400, data: 1 },
         ] satisfies ClientInput[],
       })
     );

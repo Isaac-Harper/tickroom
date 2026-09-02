@@ -289,6 +289,21 @@ describe('default input window codec', () => {
     const malicious = w.finish();
     const result = decodeInputWindow(malicious);
     expect(result).toHaveLength(2);
+
+    // THE OTHER HALF OF THE SAME CLAMP, and the half no truncated packet can
+    // reach. Everything above is bounded by the BYTES PRESENT, so a decoder
+    // that dropped the protocol ceiling and clamped only against the buffer
+    // passes every one of those cases. An attacker willing to pay the
+    // bandwidth simply sends the bytes: 40 real records, all complete, still
+    // decode to INPUT_WINDOW_MAX playout entries and no more.
+    const wide = new ByteWriter().u8(1).u8(1).u8(255);
+    for (let i = 0; i < INPUT_WINDOW_MAX + 34; i++) {
+      wide.u32(i).u32(i).i8(0).i8(0).u8(0);
+    }
+    const clamped = decodeInputWindow(wide.finish());
+    expect(clamped).toHaveLength(INPUT_WINDOW_MAX);
+    // And they are the FIRST INPUT_WINDOW_MAX records, read in wire order.
+    expect(clamped.map((rec) => rec.seq)).toEqual([0, 1, 2, 3, 4, 5]);
   });
 
   it('inputWindowToClientInputs maps to the core ClientInput shape', () => {

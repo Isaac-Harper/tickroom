@@ -50,6 +50,32 @@ describe('ErrorOffset', () => {
     }
   });
 
+  it('the per-call posMaxStep / headingMaxStep overrides beat the configured values', () => {
+    // Both step caps are also parameters of `sample()`, so a caller can loosen
+    // or tighten the glide for a single frame (a correction it knows is large
+    // and wants in faster, a frame it wants held back harder) without building
+    // a second instance. Nothing in this file passed either one, so
+    // `posMaxStep ?? this.config.posMaxStep` could be replaced by the config
+    // value outright and every case stayed green.
+    const loose = new ErrorOffset(CONFIG);
+    loose.absorb({ x: 35, z: 0, heading: 3 });
+    let before = loose.current();
+    loose.sample(1.0, 2, 1); // both well ABOVE the configured 0.15 / 0.2
+    let after = loose.current();
+    expect(Math.hypot(after.x - before.x, after.z - before.z)).toBeCloseTo(2, 6);
+    expect(Math.abs(after.heading - before.heading)).toBeCloseTo(1, 6);
+
+    // ...and BELOW them too, so the assertion above cannot be satisfied by a
+    // cap that stopped binding at all.
+    const tight = new ErrorOffset(CONFIG);
+    tight.absorb({ x: 35, z: 0, heading: 3 });
+    before = tight.current();
+    tight.sample(1.0, 0.05, 0.02);
+    after = tight.current();
+    expect(Math.hypot(after.x - before.x, after.z - before.z)).toBeCloseTo(0.05, 6);
+    expect(Math.abs(after.heading - before.heading)).toBeCloseTo(0.02, 6);
+  });
+
   it('heading takes the shortest arc across the +-pi wrap', () => {
     const eo = new ErrorOffset({ ...CONFIG, headingCap: 10 });
     // absorbing a delta near +pi then another near +pi should wrap toward a

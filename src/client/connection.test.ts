@@ -96,11 +96,20 @@ describe('RoomConnection reconnect backoff', () => {
     await conn.start();
     expect(mintCount).toBe(1);
 
-    for (let i = 0; i < 3; i++) {
-      const sock = FakeSocket.instances[FakeSocket.instances.length - 1]!;
-      sock.remoteClose(1006);
+    // THE "AND ONLY THEN" HALF, which counting at the end cannot see. Three
+    // failures produce exactly one re-mint whatever the threshold is, as long
+    // as it is at most three, so a final `mintCount === 2` is equally true of a
+    // threshold of two or of one. The separating assertion is the one made
+    // BEFORE the third failure: the first two reconnects must reuse the token.
+    for (let i = 0; i < 2; i++) {
+      FakeSocket.instances[FakeSocket.instances.length - 1]!.remoteClose(1006);
       await vi.advanceTimersByTimeAsync(10_000); // comfortably past any backoff delay
+      expect(mintCount).toBe(1);
+      expect(FakeSocket.instances[FakeSocket.instances.length - 1]!.url).toContain('tok-1');
     }
+
+    FakeSocket.instances[FakeSocket.instances.length - 1]!.remoteClose(1006);
+    await vi.advanceTimersByTimeAsync(10_000);
 
     expect(mintCount).toBe(2);
     expect(FakeSocket.instances[FakeSocket.instances.length - 1]!.url).toContain('tok-2');

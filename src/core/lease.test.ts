@@ -160,20 +160,32 @@ describe('the two-clock rule', () => {
     expect(mayPublish(clock, now)).toBe(true);
   });
 
-  it('a naive single-clock model (for contrast) WOULD incorrectly stay "safe" under the regression case', () => {
-    // Demonstrates why the two-clock split matters, rather than just
-    // asserting the fixed behaviour in isolation: a single timestamp
-    // refreshed on every attempt regardless of outcome never ages past the
-    // TTL as long as attempts keep happening on schedule.
-    let naiveClock = 0;
+  it('THE CONTRAST: the same failing renews against a COLLAPSED clock keep mayPublish true', () => {
+    // Why the two-clock split matters, rather than just asserting the fixed
+    // behaviour in isolation. This used to be four lines of `naiveClock = now`
+    // and a hand-written `now - naiveClock < LEASE_TTL_MS`, which touched
+    // nothing from `lease.ts` at all: no possible change to the module could
+    // have failed it, so it read as coverage of the most safety-critical rule
+    // in the library while pinning nothing. It is now driven through the real
+    // functions, because the naive model IS reachable through them: the
+    // historical bug was one timestamp refreshed on every ATTEMPT, which is
+    // exactly what recording a renew that actually failed as `renewConfirmed`
+    // does to this clock.
+    //
+    // Both clocks below see the identical schedule of attempts and the
+    // identical string of failures. The only difference is whether a failure
+    // is allowed to refresh confirmed ownership.
+    let correct = createOwnershipClock(0);
+    let collapsed = createOwnershipClock(0);
     let now = 0;
     const renewIntervalMs = 1500;
     const totalMs = LEASE_TTL_MS + 3000;
     for (now = renewIntervalMs; now <= totalMs; now += renewIntervalMs) {
-      naiveClock = now; // the bug: refreshed on attempt, not confirmation
+      correct = renewFailed(renewAttempted(correct, now));
+      collapsed = renewConfirmed(renewAttempted(collapsed, now), now); // the bug
     }
-    const naiveMayPublish = now - naiveClock < LEASE_TTL_MS;
-    expect(naiveMayPublish).toBe(true); // the defect, reproduced for contrast
+    expect(mayPublish(collapsed, now)).toBe(true); // the defect, reproduced for contrast
+    expect(mayPublish(correct, now)).toBe(false); // and what the split buys
   });
 
   it('renewDue paces off lastRenewAt independent of confirmation', () => {
