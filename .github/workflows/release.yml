@@ -65,10 +65,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # NO `registry-url` HERE, ON PURPOSE. With it, setup-node writes an
+      # `_authToken=${NODE_AUTH_TOKEN}` line into the runner's npmrc and fills
+      # the variable with a placeholder when no secret is provided, and the
+      # first run of this workflow (v0.2.0, 2026-09-05) then had npm answer the
+      # PUT with a 404 instead of minting an OIDC credential. Trusted publishing
+      # needs exactly one auth path: the id-token. If the next tag still fails
+      # with a 404, the missing half is the npmjs.com side (the one-time setup
+      # above), not this file. 0.2.0 was published from a laptop session after
+      # that failure, so it carries no provenance.
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
 
       # npm 11.5.1+ is required for trusted publishing. ubuntu-latest ships an
       # older npm with Node 22, so pin it explicitly rather than hoping.

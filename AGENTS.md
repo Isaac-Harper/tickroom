@@ -20,7 +20,15 @@ dependency, which is what `prepare` exists for (npm builds a git dep by running
 it, and `dist/` is gitignored), so the hook stays whether or not anyone uses that
 route. Releases go out from a version tag via `.github/workflows/release.yml`
 using npm trusted publishing (OIDC), so there is no stored npm token to leak;
-that workflow's header is the operating manual for cutting one.
+that workflow's header is the operating manual for cutting one. THE FIRST RUN OF
+THAT WORKFLOW FAILED AT THE PUBLISH: v0.2.0 on 2026-09-05 passed the build, the
+typecheck and the Redis-backed suite, then npm answered the PUT with a 404,
+which is what it says when no credential matched. The workflow no longer passes
+`registry-url` to setup-node (that wrote a placeholder `_authToken` into the
+runner's npmrc); whether the npmjs.com trusted-publisher entry for this
+repository and workflow exists is still unverified, and the next tag is the
+test. 0.2.0 itself was published from a laptop session and carries no
+provenance.
 
 ## The architecture in one paragraph
 
@@ -5223,8 +5231,7 @@ its reasoning and everything unstruck is open today.
   that loads `ioredis` at module top, so `package.json` `exports` carries
   `tickroom/server/memoryRedis`, `dist/server/memoryRedis.js` has no ioredis
   import, and that subpath is the form the docs recommend. Still owed on this
-  bullet: only the 0.2.0 tag itself, since everything documented in this repo is
-  0.2.0 and the registry still serves 0.1.1.
+  bullet: only ~~the 0.2.0 tag itself~~ LANDED on 2026-09-05: `tickroom@0.2.0` is on the registry, published from a laptop session after the workflow's first publish attempt was refused (see the top of this file), so it carries no provenance; the workflow's own publish is unproven until the next tag.2.0 and the registry still serves 0.1.1.
 - ~~No shipped example stamps `targetTick`~~ LANDED. `examples/pong` is the
   stamped reference: one record per advanced tick, a six-record redundancy
   window, a locally predicted paddle reconciled by replaying that window through
