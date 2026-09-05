@@ -5231,7 +5231,11 @@ its reasoning and everything unstruck is open today.
   that loads `ioredis` at module top, so `package.json` `exports` carries
   `tickroom/server/memoryRedis`, `dist/server/memoryRedis.js` has no ioredis
   import, and that subpath is the form the docs recommend. Still owed on this
-  bullet: only ~~the 0.2.0 tag itself~~ LANDED on 2026-09-05: `tickroom@0.2.0` is on the registry, published from a laptop session after the workflow's first publish attempt was refused (see the top of this file), so it carries no provenance; the workflow's own publish is unproven until the next tag.2.0 and the registry still serves 0.1.1.
+  bullet: nothing. ~~The 0.2.0 tag itself~~ LANDED on 2026-09-05: `tickroom@0.2.0`
+  is on the registry, published from a laptop session after the workflow's first
+  publish attempt was refused (see the top of this file), so it carries no
+  provenance; the workflow's own publish is unproven until the next tag.
+
 - ~~No shipped example stamps `targetTick`~~ LANDED. `examples/pong` is the
   stamped reference: one record per advanced tick, a six-record redundancy
   window, a locally predicted paddle reconciled by replaying that window through
