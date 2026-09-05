@@ -5,6 +5,8 @@
 export {
   STALL_MS,
   STALL_COLD_MS,
+  REANCHOR_TOLERANCE_TICKS,
+  REANCHOR_MIN_INTERVAL_MS,
   stallDecision,
   shouldReanchor,
   type NetStatus,
@@ -17,11 +19,20 @@ export { ErrorOffset, type Offset, type Offset2D, type ErrorOffsetConfig } from 
 
 export {
   ClientTick,
-  ANCHOR_MARGIN,
   TICK_STEP_CAP,
   type ClientTickOptions,
   type ClientTickView,
 } from './clientTick.js';
+
+export {
+  PredictedEntity,
+  INPUT_WINDOW,
+  INPUT_HISTORY,
+  RENDER_SLEW,
+  PLAYHEAD_SNAP_TICKS,
+  type Pose,
+  type PredictedEntityOptions,
+} from './predictedEntity.js';
 
 export {
   SnapshotInterpolator,
@@ -39,6 +50,9 @@ export {
   OFFSET_SLEW_MAX,
   DELAY_JITTER_QUANTILE,
   DELAY_MARGIN_MS,
+  DELAY_SLEW_MAX,
+  FRAME_GAP_SLACK_MS,
+  RESUME_GLIDE_MAX_MS,
   PARTIAL_SCAN_FRAMES,
   type Vec2,
   type EntitySample,
@@ -50,6 +64,10 @@ export {
 export {
   RoomConnection,
   isRosterFrame,
+  RECONNECT_BASE_MS,
+  RECONNECT_FACTOR,
+  RECONNECT_JITTER_MIN,
+  RECONNECT_JITTER_MAX,
   type SessionInfo,
   type DecodedSnapshotLike,
   type RosterFrame,
@@ -59,4 +77,5 @@ export {
   type RoomConnectionOptions,
   type SnapshotInterpolationOptions,
   type FrameView,
+  type ConnectionStats,
 } from './connection.js';

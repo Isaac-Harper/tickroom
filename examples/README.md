@@ -5,19 +5,30 @@ sitting.
 
 | | What it shows |
 | --- | --- |
-| [`pong/sim.ts`](pong/sim.ts) | A real 2D game. Server-authoritative paddles and ball, seeded randomness that survives a checkpoint, events handed back to the host. |
+| [`pong/sim.ts`](pong/sim.ts) | A real 2D game, and the reference for the STAMPED path: tick-stamped inputs, a paddle predicted locally against the identical shared step function, and the server's playout depth fed back down the wire. Server-authoritative paddles and ball, seeded randomness that survives a checkpoint, events handed back to the host. |
 | [`cursors/sim.ts`](cursors/sim.ts) | Realtime presence, no game at all. A slower tick, unstamped inputs, an idle fade. |
-| [`node-server/`](node-server) | The same runtimes on a plain Node `ws` server, no serverless involved. |
+| [`node-server/`](node-server/README.md) | The same runtimes on a plain Node `ws` server, no serverless involved. Its README carries the exact run command, every environment knob, the session and socket URLs, a headless Node client, and the two recipes that make a planned handoff and the relay's warm swap happen on a schedule you can watch. |
 
 Both simulations have a browser half beside them, [`pong/client.ts`](pong/client.ts) and
 [`cursors/client.ts`](cursors/client.ts), and the pair is the point: read a
 `sim.ts` and its `client.ts` together and you have seen a whole application.
-The two clients differ in three places (`tickHz`, the send cadence that matches
-it, and what `interpolate.entities` pulls out of a snapshot) and are otherwise
-the same twenty lines of wiring, which is the claim the transport makes about
-itself. Both leave `targetTick` at 0 and both key the interpolator by pid;
-neither predicts anything locally, and each says in a comment what stamping
-would look like if it did.
+Both key the interpolator by pid, and the transport wiring underneath them is
+the same twenty lines, which is the claim the transport makes about itself.
+
+**They diverge on exactly one decision, and it is the one worth understanding.**
+Cursors is UNSTAMPED: `targetTick` stays 0, the server applies each input on
+arrival, nothing is predicted locally. Pong is STAMPED, end to end and for real:
+every input carries the tick it applies on, one record per client tick with the
+last six re-sent on every packet, and the client runs `stepPaddleY` (the
+simulation's own exported function, not a copy of it) on its own paddle so the
+paddle answers the key with no round trip in it. The server applies the record
+stamped for tick T on tick T, both ends therefore land on the same y, and a
+snapshot is a confirmation rather than a correction. When they do disagree, the
+difference goes into an `ErrorOffset` and is bled off over a few frames. Pong
+also closes the depth loop: `onBufferHealth` stores the server's playout depth
+per player, `encodeSnapshot` carries it per paddle, `decodeSnapshot` picks out
+its own pid's value as `inputLead`, and the connection trims its stamping lead
+to the smallest one that keeps the buffer fed.
 
 ## What to notice
 
@@ -36,11 +47,17 @@ can tell, and halving the rate halves the single biggest bandwidth line in the
 system. Interpolation on the client makes 10Hz read as continuous. Pick the
 lowest rate at which your content still feels live.
 
-**Stamped versus unstamped inputs is also per-runtime.** Pong could stamp its
-paddle inputs so a predicting client and the server apply them on the identical
-tick. Cursors deliberately does not: nothing is predicted locally, a tick of skew
-is invisible, and apply-on-arrival is one less moving part. Leave `targetTick` at
-0 and the playout buffer never engages.
+**Stamped versus unstamped inputs is also per-runtime, and the two examples
+have made opposite calls.** Pong stamps, because it predicts: a paddle that
+waited a round trip for the key feels broken, and prediction is only correct if
+both ends apply the same input on the same tick. `pong/sim.test.ts` runs both
+ends against the shared step function and asserts they agree tick for tick, and
+runs the same records apply-on-arrival to show that they do not. Cursors
+deliberately does not stamp: nothing is predicted locally, a tick of skew on
+somebody else's cursor is invisible, and apply-on-arrival is one less moving
+part. Leave `targetTick` at 0 and the playout buffer never engages. Stamping
+costs a `usesPlayout` and a client that keeps a few records around; pick it when
+you predict, skip it when you do not.
 
 ## The four things both runtimes do that yours must too
 
@@ -122,6 +139,29 @@ both true at once, and only a test tells them apart. Each file checks:
   `applyInput` and asserted to land inside the legal range rather than
   crashing the tick or moving an entity faster than the rules allow.
 
+`pong/sim.test.ts` proves two more, because pong is the stamped example and
+the stamped path's central claim is not something a comment can assert:
+
+- **A stamped input runs identically on both ends.** One branch is the
+  client: `stepPaddleY` on a bare number, exactly as `pong/client.ts` runs
+  it on its own paddle through `PredictedEntity`'s `step`. The other is the
+  server: the runtime, applying the record stamped for tick T on tick T. The
+  two traces are compared per tick and asserted EXACTLY equal, not close,
+  because a tolerance would hide the one failure this test exists to catch, a
+  client that got the rule nearly right. Nothing is shared between the
+  branches except the step function itself, which is why it is exported from
+  `sim.ts` rather than copied into the client: a test that compared a
+  client's copy of the rule to itself
+  would pass forever. A second test feeds the same records in
+  apply-on-arrival order and asserts the traces DIVERGE, so the first one
+  cannot pass vacuously.
+- **The playout depth is excluded from the checkpoint on purpose, and the
+  exclusion is invisible to the simulation.** `onBufferHealth`'s reading
+  describes the ticker that is exiting, so `serialize` leaves it out and a
+  restore starts it empty. The test asserts the empty `Map` and then ticks
+  both rooms forward through identical input, which is what would catch a
+  tick path that had started reading it.
+
 ## The JSON-to-binary upgrade path, worked all the way through
 
 `pong/codec.ts` is what "you must write a codec eventually" looks like in
@@ -132,9 +172,9 @@ exact snapshot (`encodePongSnapshot` / `decodePongSnapshot`) using
 
 | | bytes |
 | --- | --- |
-| JSON (`sim.ts`'s `encodeSnapshot`) | 215 |
-| Binary (`codec.ts`'s `encodePongSnapshot`) | 51 |
-| Ratio | 4.22x smaller |
+| JSON (`sim.ts`'s `encodeSnapshot`) | 243 |
+| Binary (`codec.ts`'s `encodePongSnapshot`) | 53 |
+| Ratio | 4.58x smaller |
 
 That is one realistic two-player snapshot (nonzero ball velocity, paddles off
 their spawn position, mid-game). It is not a contrived best case: the JSON
@@ -144,8 +184,14 @@ field names, quotes, and decimal ASCII on every single tick, and a snapshot
 is encoded once per tick and delivered once *per player* (see
 `RoomStats.bytesDelivered` in the README's cost model). That multiplication
 is what makes the switch worth making: a full room publishing at 20Hz turns
-this file's 164-byte-per-tick saving into a real bandwidth line, and a
+this file's 190-byte-per-tick saving into a real bandwidth line, and a
 two-player room barely notices either way.
+
+The per-paddle `inputLead` (the server's playout depth, the field that closes
+the feedback loop) costs **one byte per paddle** here against fourteen
+characters of JSON, which is the same argument in miniature: the field a
+binary wire adds for free is the field a JSON wire makes you think twice
+about.
 
 **Do not make this switch on day one.** Measure `bytesDelivered` first.
 `pong/sim.ts` keeps its JSON `encodeSnapshot` exactly as it was; `codec.ts` is
@@ -162,7 +208,12 @@ The three things worth reading `codec.ts` for, beyond the size number:
   what makes a rolling deploy safe. A mismatched version has to fail as a
   clean, immediate throw naming the mismatch, not a decoder that reads a
   new layout's bytes at an old layout's offsets and returns a snapshot full
-  of plausible-looking garbage.
+  of plausible-looking garbage. **It reads 2, not 1**, because adding
+  `inputLead` to each paddle changed what the wire MEANS and not only how
+  long it is, and this repo's rule is that meaning is what a version bump
+  tracks. A v1 decoder pointed at a v2 buffer would read the next paddle's
+  pid length out of that byte, which is precisely the plausible-garbage
+  failure the check turns into a throw.
 - **Quantised fields are picked with a stated range and headroom**, not
   just "the smallest type that fits today". Pong's ball and paddle
   positions use an `i16` at 1/100-unit precision, which covers -327.68 to

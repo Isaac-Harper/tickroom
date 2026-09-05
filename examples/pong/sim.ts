@@ -8,6 +8,13 @@
 // hold in your head and still demonstrates every part of the contract that
 // matters: idempotent join, a pure tick, a serialize/deserialize pair that
 // actually round-trips, a snapshot encoder, and events handed back to the host.
+//
+// IT IS ALSO THE REFERENCE FOR THE STAMPED PATH, which is the library's central
+// input promise and the half an example cannot leave to prose: inputs carry the
+// tick they apply on (`usesPlayout`), the paddle step is a shared pure function
+// the predicting client in client.ts runs on its own copy, and the server's
+// playout depth is echoed back down the wire (`onBufferHealth`) so the client
+// can trim its stamping lead to the smallest one that keeps the buffer fed.
 
 import type { ClientInput, RoomRuntime } from '../../src/core/index.js';
 
@@ -16,7 +23,10 @@ import type { ClientInput, RoomRuntime } from '../../src/core/index.js';
 export const FIELD_W = 200;
 export const FIELD_H = 120;
 const PADDLE_H = 24;
-const PADDLE_SPEED = 90; // units per second
+/** Units per second. Exported because the client bounds its own correction
+ *  glide with it: a paddle that slides back onto the authoritative position
+ *  faster than a paddle can legally move reads as a second, ghostly player. */
+export const PADDLE_SPEED = 90;
 const BALL_SPEED_START = 70;
 const BALL_SPEED_MAX = 160;
 const BALL_SPEEDUP = 1.04; // per paddle hit
@@ -52,11 +62,47 @@ export interface PongState {
    *  players were watching. */
   seed: number;
   winner: string | null;
+  /** Server-side playout depth per pid, in ticks, as `onBufferHealth` reports
+   *  it. NOT part of the room: it describes the ticker that is running right
+   *  now, which is why `serialize` leaves it out and every restore starts it
+   *  empty. It lives in state at all because the buffer is inside the ticker
+   *  and this hook is the only route by which its depth can reach a snapshot. */
+  depth: Map<string, number>;
 }
 
 export type PongEvent =
   | { type: 'goal'; scorer: string; score: number }
   | { type: 'win'; pid: string };
+
+/**
+ * Read a `dir` off an input record. CLAMP EVERYTHING THAT CAME OFF THE WIRE:
+ * the value was chosen by a client and a hostile one is free to send 1e9, and
+ * an unclamped speed multiplier is the whole game. Exported for the same
+ * reason `stepPaddleY` is: the client reads its own input with this function,
+ * so there is no second, subtly different clamp for the two ends to disagree
+ * over.
+ */
+export function readDir(raw: unknown): number {
+  const dir = typeof raw === 'number' && Number.isFinite(raw) ? raw : 0;
+  return Math.max(-1, Math.min(1, dir));
+}
+
+/**
+ * ONE PADDLE, ONE TICK, AND THE CLIENT RUNS THIS EXACT FUNCTION. That is the
+ * entire payoff of stamping an input with the tick it belongs to: the server
+ * applies the record stamped for tick T on tick T, the predicting client
+ * applied the same record on its own tick T, and because both ends ran this
+ * one function on the same numbers they land on the same y. A second
+ * copy of this rule in the client (even a correct-looking one, even the same
+ * expression retyped) is a divergence waiting for the first time one of the
+ * two is edited, which is why this is a shared function and not a comment
+ * saying "keep these in sync". `sim.test.ts` runs both ends against it.
+ *
+ * Pure: no state, no clock, no reads of anything the caller did not pass in.
+ */
+export function stepPaddleY(y: number, dir: number, dt: number): number {
+  return Math.max(PADDLE_H / 2, Math.min(FIELD_H - PADDLE_H / 2, y + dir * PADDLE_SPEED * dt));
+}
 
 // mulberry32. Small, fast, and seedable, which is the only property that matters:
 // the seed rides the checkpoint, so a successor continues the same sequence.
@@ -93,6 +139,7 @@ export const pongRuntime: RoomRuntime<PongState, PongEvent> = {
       serveIn: 40,
       seed: 0x9e3779b9,
       winner: null,
+      depth: new Map(),
     };
     serve(state, 1);
     return state;
@@ -100,6 +147,27 @@ export const pongRuntime: RoomRuntime<PongState, PongEvent> = {
 
   currentTick: (s) => s.tick,
   playerCount: (s) => s.paddles.size,
+
+  // BUFFER STAMPED INPUTS AND APPLY EACH ON THE TICK IT NAMES. Pong's client
+  // predicts its own paddle locally (see client.ts), so the two ends have to
+  // run the identical input on the identical tick or the prediction is wrong
+  // by construction and every snapshot arrives as a correction. Returning true
+  // unconditionally is the usually-right answer: an unstamped record
+  // (`targetTick: 0`) still applies on arrival either way, so this costs a
+  // client that does not stamp nothing at all.
+  usesPlayout: () => true,
+
+  // How deep this player's buffer is running, reported every tick including
+  // starved ones. The buffer lives inside the ticker, so this hook is the ONLY
+  // route by which its depth can reach the state and therefore the snapshot:
+  // `encodeSnapshot` puts it on the wire per paddle, the client picks its own
+  // pid's value out in `decodeSnapshot` and hands it back as `inputLead`, and
+  // the connection trims its stamping lead toward the smallest one that keeps
+  // the buffer fed. Skip the hook and the loop is simply inert: an
+  // optimisation lost, not a working connection lost.
+  onBufferHealth(s, pid, health) {
+    s.depth.set(pid, health);
+  },
 
   // IDEMPOTENT, and this is a contract requirement rather than politeness. The
   // relay republishes a join every second as a heartbeat (pub/sub is lossy, so
@@ -120,17 +188,18 @@ export const pongRuntime: RoomRuntime<PongState, PongEvent> = {
 
   leave(s, pid) {
     s.paddles.delete(pid);
+    s.depth.delete(pid);
   },
 
   applyInput(s, pid, input: ClientInput) {
     const p = s.paddles.get(pid);
     if (!p) return;
-    // CLAMP EVERYTHING THAT CAME OFF THE WIRE. This value was chosen by a client
-    // and a hostile one is free to send 1e9. The simulation is the last place
-    // that can refuse it, and an unclamped speed multiplier is the whole game.
-    const raw = (input.data as { dir?: unknown })?.dir;
-    const dir = typeof raw === 'number' && Number.isFinite(raw) ? raw : 0;
-    p.dir = Math.max(-1, Math.min(1, dir));
+    // HELD STATE, NOT AN EVENT, and unchanged by the move to stamped inputs:
+    // the record names the tick it applies ON, and the dir it carries persists
+    // until the next one supersedes it. That is what makes a dropped packet
+    // harmless rather than a missed move. `readDir` does the clamping, and the
+    // client reads its own input with the same function.
+    p.dir = readDir((input.data as { dir?: unknown })?.dir);
   },
 
   tick(s, dt): { events: PongEvent[] } {
@@ -139,7 +208,7 @@ export const pongRuntime: RoomRuntime<PongState, PongEvent> = {
     if (s.winner) return { events };
 
     for (const p of s.paddles.values()) {
-      p.y = Math.max(PADDLE_H / 2, Math.min(FIELD_H - PADDLE_H / 2, p.y + p.dir * PADDLE_SPEED * dt));
+      p.y = stepPaddleY(p.y, p.dir, dt);
     }
 
     if (s.serveIn > 0) {
@@ -204,6 +273,12 @@ export const pongRuntime: RoomRuntime<PongState, PongEvent> = {
   // A Map does not survive JSON.stringify, which is the single most common way a
   // checkpoint silently loses half a room. Convert explicitly, both ways, and let
   // the round-trip test catch it if you forget.
+  //
+  // `depth` IS DELIBERATELY NOT HERE, and that is not the same mistake. It is
+  // the playout depth of the ticker that is exiting, measured against a client
+  // whose stamping lead is about to be re-anchored across the handoff, so
+  // carrying it over would hand the successor a reading about a buffer that no
+  // longer exists. The successor rebuilds it from its own first tick.
   serialize(s) {
     return JSON.stringify({
       tick: s.tick,
@@ -232,6 +307,7 @@ export const pongRuntime: RoomRuntime<PongState, PongEvent> = {
       serveIn: raw.serveIn ?? 0,
       seed: raw.seed >>> 0,
       winner: raw.winner ?? null,
+      depth: new Map(),
     };
   },
 
@@ -250,6 +326,11 @@ export const pongRuntime: RoomRuntime<PongState, PongEvent> = {
         side: p.side,
         y: Math.round(p.y * 10) / 10,
         score: p.score,
+        // Step 2 of the feedback loop `onBufferHealth` opened. Per paddle
+        // rather than "just mine", because a snapshot is published ONCE for
+        // the whole room and delivered to every player: there is no per-client
+        // snapshot to put a single value in. Each client picks out its own.
+        inputLead: s.depth.get(p.pid) ?? 0,
       })),
     });
   },

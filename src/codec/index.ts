@@ -1,4 +1,4 @@
-export { ByteWriter, ByteReader, CodecError } from './bytes.js';
+export { ByteWriter, ByteReader, CodecError, ProtocolVersionError } from './bytes.js';
 export {
   quantize,
   dequantize,

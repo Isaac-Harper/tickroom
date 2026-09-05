@@ -29,16 +29,12 @@
 // host a `ClientTickView` with no `advance` on it at all, so there is nothing
 // left to forget and nothing to double-drive.
 
-/** Ticks of lead the counter anchors ahead of the server's own estimated current tick, so a just-stamped input has time to cross the network before the server reaches that tick. */
-export const ANCHOR_MARGIN = 4;
-
 /** Maximum whole ticks a single `advance()` call may add. Bounds a long frame (a backgrounded tab regaining focus) from bursting the counter forward by however many ticks of wall-clock time it missed; the excess time is dropped, the same trade a fixed-timestep loop already makes on its own frame dt. */
 export const TICK_STEP_CAP = 6;
 
 export interface ClientTickOptions {
   /** Nominal tick duration, ms. Must match the host simulation's fixed timestep. */
   tickMs: number;
-  anchorMargin?: number;
 }
 
 /**
@@ -57,11 +53,40 @@ export interface ClientTickView {
   readonly initialized: boolean;
   /** Is the counter anchored for the CURRENT connection epoch? False between a fresh connect attempt and its first snapshot. */
   readonly anchored: boolean;
+  /**
+   * How far the counter is into the NEXT tick, 0 (inclusive) to 1 (exclusive):
+   * the wall time accumulated since the last whole step, as a share of one
+   * tick. 0 before the first anchor and immediately after any anchor.
+   *
+   * THIS EXISTS FOR THE ONE ENTITY THE INTERPOLATOR DOES NOT SMOOTH. A locally
+   * predicted entity advances only when a tick is stamped, once per `tickMs`,
+   * while the page renders at the frame rate; drawing its raw predicted state
+   * therefore holds it still for several frames and then moves it a whole tick
+   * of travel at once, which at 20Hz is a visible step three times a second
+   * on the very entity the player is steering. Remote entities never show this
+   * because `SnapshotInterpolator` renders them between snapshots.
+   * `value - 1 + fraction` is the point one tick behind the newest stamp on
+   * this counter's timeline, and `PredictedEntity` aims a render playhead at
+   * it, one that moves by each frame's own dt within a tenth of real time
+   * rather than following the counter directly: a re-anchor moves `value` in
+   * one frame, and A COUNTER JUMP IS NOT TIME PASSING. The cost is one tick
+   * of visual delay on that entity (at most 50ms at 20Hz) on top of a
+   * prediction that has no round trip in it, in exchange for motion at the
+   * frame rate. `examples/pong/client.ts` draws through it.
+   */
+  readonly fraction: number;
+  /**
+   * The tick interval the counter was built with, ms: the constant
+   * `ClientTickOptions.tickMs` and nothing else. Exposed beside `fraction`
+   * for the same consumer, so a predicted entity derives its timestep from
+   * the counter it stamps against rather than taking a second `tickHz` it
+   * could get wrong against the connection.
+   */
+  readonly tickMs: number;
 }
 
 export class ClientTick implements ClientTickView {
-  private readonly tickMs: number;
-  private readonly anchorMargin: number;
+  readonly tickMs: number;
 
   private _value = 0;
   private _initialized = false;
@@ -70,7 +95,6 @@ export class ClientTick implements ClientTickView {
 
   constructor(opts: ClientTickOptions) {
     this.tickMs = opts.tickMs;
-    this.anchorMargin = opts.anchorMargin ?? ANCHOR_MARGIN;
   }
 
   get value(): number {
@@ -83,6 +107,17 @@ export class ClientTick implements ClientTickView {
 
   get anchored(): boolean {
     return this._anchored;
+  }
+
+  /**
+   * Read straight off the accumulator `advance()` keeps, so it is 0 before the
+   * first anchor (`advance` is a no-op until then, so nothing has accumulated),
+   * 0 after every `anchorTo` (which resets the accumulator), 0 after a capped
+   * frame (which drops the excess outright), and otherwise the remainder a
+   * whole step left behind, which is below one tick by construction.
+   */
+  get fraction(): number {
+    return this.accumulatorMs / this.tickMs;
   }
 
   /**
@@ -113,16 +148,27 @@ export class ClientTick implements ClientTickView {
   }
 
   /**
-   * Snap the counter to `round(serverTick) + anchorMargin`. Returns the delta
-   * applied (new value minus old), so a caller can fold a genuine mid-epoch
-   * re-anchor into an `ErrorOffset` (the local prediction just jumped and the
-   * render needs to absorb it) while treating a connection's very first
-   * anchor differently (nothing was rendered yet, so there is nothing to
-   * smooth: check `initialized` before this call if that distinction
-   * matters to the caller).
+   * Snap the counter to `round(targetTick)`. Returns the delta applied (new
+   * value minus old), so a caller can fold a genuine mid-epoch re-anchor into
+   * an `ErrorOffset` (the local prediction just jumped and the render needs to
+   * absorb it) while treating a connection's very first anchor differently
+   * (nothing was rendered yet, so there is nothing to smooth: check
+   * `initialized` before this call if that distinction matters to the caller).
+   *
+   * THE LEAD IS THE CALLER'S, AND IT USED TO BE THIS CLASS'S. An `ANCHOR_MARGIN`
+   * of 4 ticks was added here, which is a lead expressed in TICKS with no
+   * round-trip term in it at all: at 20Hz that is 200ms of budget for a whole
+   * round trip plus jitter, and at 60Hz it is 67ms, so every player above
+   * roughly 200ms of RTT stamped every input into a tick the server had
+   * already simulated, for the whole session. A lead that has to cover a
+   * MEASURED round trip cannot be a constant this class owns, because this
+   * class measures nothing. `RoomConnection.desiredTick()` composes it from
+   * the server-tick estimate, the measured RTT, a configured jitter lead in
+   * MILLISECONDS and the optional server-depth feedback, and hands the
+   * finished number here.
    */
-  anchorTo(serverTick: number): number {
-    const next = Math.round(serverTick) + this.anchorMargin;
+  anchorTo(targetTick: number): number {
+    const next = Math.round(targetTick);
     const delta = next - this._value;
     this._value = next;
     this._initialized = true;

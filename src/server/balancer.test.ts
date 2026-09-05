@@ -33,6 +33,103 @@ describe('assignRoom', () => {
     expect(result.room).toBe('lobby~1');
   });
 
+  it('skips EVERY excluded room, not just the first one', async () => {
+    // ONE SLOT WAS NOT ENOUGH FOR THE CASE THIS OPTION EXISTS FOR. The
+    // balancer reads a stats key with a 5s TTL while the TICKER enforces
+    // capacity authoritatively and publishes `room-reject`, so the two
+    // disagree for up to a window. With one slot a client bounced from
+    // `lobby` is sent to `lobby~1`, bounced again, and then sent back to
+    // `lobby` because the only exclusion it could carry was the second one:
+    // it ping-pongs between two rooms until its bounded re-assign budget is
+    // gone and the player is told the game is full while seats are free.
+    const redis = new FakeRedis();
+    for (let i = 0; i < 3; i++) await setPlayers(redis, roomIdFor('lobby', i), 5);
+
+    const result = await assignRoom({
+      redis,
+      base: 'lobby',
+      maxPlayers: 20,
+      exclude: ['lobby', 'lobby~1'],
+    });
+    expect(result.room).toBe('lobby~2');
+  });
+
+  it('a hostile or stale entry is dropped INDIVIDUALLY, leaving the others in force', async () => {
+    // The list arrives from a client that has already been bounced at least
+    // once, so a stale id from a previous session, an id for a base the host
+    // has since renamed, or a forged one is ORDINARY rather than exceptional.
+    // Refusing the whole list over any of them sends the client straight back
+    // to the rooms that just refused it, which is the failure the option
+    // exists to prevent.
+    const redis = new FakeRedis();
+    for (let i = 0; i < 3; i++) await setPlayers(redis, roomIdFor('lobby', i), 5);
+
+    const result = await assignRoom({
+      redis,
+      base: 'lobby',
+      maxPlayers: 20,
+      exclude: ['lobby', 'arena~4', 'lobby:evil', '__proto__', 'lobby~1'],
+    });
+    // 'lobby' and 'lobby~1' still bind; the three junk entries changed nothing.
+    expect(result.room).toBe('lobby~2');
+  });
+
+  it('honours the whole list on the FULL path and on a Redis read error too', async () => {
+    // Both fallback paths were taught about `exclude` for the same reason the
+    // main loop was, so both have to learn about the LIST at the same time or
+    // a bounce that coincides with a blip routes the client back to a room it
+    // was already refused from.
+    const full = new FakeRedis();
+    for (let i = 0; i < 3; i++) await setPlayers(full, roomIdFor('lobby', i), 20);
+    const onFull = await assignRoom({
+      redis: full,
+      base: 'lobby',
+      maxPlayers: 20,
+      maxRooms: 3,
+      exclude: ['lobby', 'lobby~1'],
+    });
+    expect(onFull).toMatchObject({ room: 'lobby~2', full: true });
+
+    const broken = new FakeRedis();
+    broken.break('mget');
+    const onError = await assignRoom({
+      redis: broken,
+      base: 'lobby',
+      maxPlayers: 20,
+      exclude: ['lobby', 'lobby~1'],
+      log: () => {},
+    });
+    expect(onError.room).toBe('lobby~2');
+    expect(onError.full).toBeUndefined(); // never manufacture "full" from a failed read
+  });
+
+  it('falls back to an excluded room when the list covers every candidate', async () => {
+    // Newly reachable: a client CAN now exclude the whole pool. Handing back
+    // an excluded room is worse than being bounced once more and strictly
+    // better than a manufactured "full" nobody measured.
+    const redis = new FakeRedis();
+    await setPlayers(redis, roomIdFor('lobby', 0), 5);
+    await setPlayers(redis, roomIdFor('lobby', 1), 5);
+    const result = await assignRoom({
+      redis,
+      base: 'lobby',
+      maxPlayers: 20,
+      maxRooms: 2,
+      exclude: ['lobby', 'lobby~1'],
+    });
+    expect(result).toEqual({ room: 'lobby', base: 'lobby', index: 0, full: true });
+  });
+
+  it('an empty list and null behave exactly like no exclude at all', async () => {
+    const redis = new FakeRedis();
+    await setPlayers(redis, roomIdFor('lobby', 0), 5);
+    const forms: Array<string[] | null | undefined> = [[], null, undefined];
+    for (const exclude of forms) {
+      const result = await assignRoom({ redis, base: 'lobby', maxPlayers: 20, exclude });
+      expect(result.room).toBe('lobby');
+    }
+  });
+
   it('ignores an exclude value for a different base', async () => {
     const redis = new FakeRedis();
     await setPlayers(redis, roomIdFor('lobby', 0), 5);

@@ -5,7 +5,7 @@
 // return any `Uint8Array` it likes, this is just a reasonable one to start
 // from.
 import type { ClientInput } from '../core/index.js';
-import { ByteWriter, ByteReader, CodecError } from './bytes.js';
+import { ByteWriter, ByteReader, CodecError, ProtocolVersionError } from './bytes.js';
 import { quantize, dequantize, quantizeAngle, dequantizeAngle, CM_SCALE, I16, U16 } from './quantize.js';
 
 export interface CodecEntity {
@@ -22,9 +22,9 @@ export interface CodecEntity {
   x: number;
   y: number;
   /** Radians. Defaults to 0 on encode if omitted; always present on decode. */
-  heading?: number;
+  heading?: number | undefined;
   /** An opaque `u8` state/anim value: idle vs moving, a colour index, a phase. Defaults to 0. */
-  state?: number;
+  state?: number | undefined;
 }
 
 export interface DefaultSnapshot {
@@ -33,7 +33,7 @@ export interface DefaultSnapshot {
   serverTime: number;
   entities: CodecEntity[];
   /** Room-specific bytes this codec does not know how to interpret (an activities container, a score block). Round-trips opaque. */
-  extra?: Uint8Array;
+  extra?: Uint8Array | undefined;
 }
 
 export const DEFAULT_SNAPSHOT_VERSION = 1;
@@ -67,7 +67,7 @@ export interface DefaultSnapshotCodecOptions {
    * the default wire is unchanged and only the HOST knows it picked a
    * different scale: owning that bump is the host's job.
    */
-  positionScale?: number;
+  positionScale?: number | undefined;
 }
 
 /**
@@ -86,11 +86,11 @@ export interface DefaultSnapshotCodecOptions {
  * what its coordinates mean, i.e. exactly the confusion the parameter was
  * added to end.
  *
- * `version` is written but NOT enforced here: this function only encodes, it
- * never has a reason to refuse an unexpected version, and a decoder deciding
- * what to do about a version mismatch (drop the snapshot, best-effort decode
- * anyway, trigger a client reload) is a policy call that belongs to the
- * caller, not to the codec.
+ * `version` is written but NOT enforced HERE: this function only encodes, so
+ * it never has a reason to refuse an unexpected value someone asks it to
+ * write. `decodeDefaultSnapshot` is where the version is enforced, and it
+ * throws on a mismatch rather than leaving that as a policy call for the
+ * caller; see that function's own docstring for why.
  *
  * AN OUT-OF-RANGE ENTITY ID THROWS, and it is the one field here that does not
  * go through the quantiser. `x` and `y` clamp, which is right for a coordinate
@@ -104,12 +104,33 @@ export interface DefaultSnapshotCodecOptions {
  * counter, a row id) often enough that the wrap is reachable in ordinary use,
  * so this refuses the frame the way `encodeInputWindow` already refuses a
  * window with too many records.
+ *
+ * `entities.length` AND `extra.length` ARE CHECKED AGAINST THE u16 CEILING
+ * TOO, up front, for the same reason `id` is: both ride a `u16` header field
+ * (`entityCount`, `extraLength`) that `ByteWriter.u16` now refuses to wrap
+ * rather than silently truncate, but a caller deserves a message that names
+ * which field overflowed rather than the generic one `ByteWriter` throws
+ * partway through encoding. Measured: 65537 entities wrapped `entityCount` to
+ * 1 and the decoder returned a one-entity snapshot with 65536 more silently
+ * dropped; a 70000-byte `extra` block wrapped `extraLength` to 4464 and the
+ * decoder handed back 4464 bytes and threw away the rest.
  */
 export function encodeDefaultSnapshot(
   s: DefaultSnapshot,
   opts?: DefaultSnapshotCodecOptions
 ): Uint8Array {
   const scale = opts?.positionScale ?? CM_SCALE;
+  if (s.entities.length > U16.max) {
+    throw new CodecError(
+      `too many entities to encode: ${s.entities.length} exceeds the u16 entityCount ceiling of ${U16.max}`
+    );
+  }
+  const extra = s.extra ?? new Uint8Array(0);
+  if (extra.length > U16.max) {
+    throw new CodecError(
+      `extra payload too large to encode: ${extra.length} bytes exceeds the u16 length-prefix ceiling of ${U16.max}`
+    );
+  }
   const w = new ByteWriter();
   w.u8(s.version);
   w.u32(s.tick);
@@ -125,7 +146,6 @@ export function encodeDefaultSnapshot(
     w.u16(quantizeAngle(e.heading ?? 0));
     w.u8(e.state ?? 0);
   }
-  const extra = s.extra ?? new Uint8Array(0);
   w.u16(extra.length);
   w.bytes(extra);
   return w.finish();
@@ -141,6 +161,18 @@ export function encodeDefaultSnapshot(
  * to be, which is a worse failure than an exception a caller can catch and
  * treat as "drop this snapshot".
  *
+ * THE VERSION BYTE IS COMPARED FIRST, before any other field is read, exactly
+ * the pattern `docs/ARCHITECTURE.md` describes and `examples/pong/codec.ts`
+ * works through in full: a mismatched decoder that read fields optimistically
+ * and only checked the version as an afterthought would not fail on a version
+ * skew, it would MISREAD, taking whatever byte offset used to be one field as
+ * a different one now. Checking first turns that into an immediate
+ * `ProtocolVersionError` (a `CodecError` subtype, so a caller that only wants
+ * "did this decode fail" keeps working unchanged, and one that wants to
+ * recover from skew specifically, e.g. `RoomConnection`, can check
+ * `error.name === 'ProtocolVersionError'` or `instanceof`) before a single
+ * byte of the mismatched body is touched.
+ *
  * `positionScale` must MATCH the one the encoder used. Nothing on the wire
  * records it, so a mismatch is silent: see `DefaultSnapshotCodecOptions`.
  */
@@ -151,6 +183,9 @@ export function decodeDefaultSnapshot(
   const scale = opts?.positionScale ?? CM_SCALE;
   const r = new ByteReader(buf);
   const version = r.u8();
+  if (version !== DEFAULT_SNAPSHOT_VERSION) {
+    throw new ProtocolVersionError(DEFAULT_SNAPSHOT_VERSION, version);
+  }
   const tick = r.u32();
   const serverTime = r.f64();
   const entityCount = r.u16();
@@ -209,7 +244,7 @@ export interface DefaultInputWindowOptions {
    * the HOST owns. `INPUT_WINDOW_VERSION` deliberately does not move for it,
    * because the default wire is unchanged.
    */
-  axisScale?: number;
+  axisScale?: number | undefined;
 }
 
 /** How many stamped inputs one window may carry. See the module comment below for why a client sends more than one. */
@@ -319,11 +354,25 @@ export function encodeInputWindow(
  * rather than throwing: a caller on a hot path (the relay forwarding a
  * client's raw frame) should never need a try/catch around this call for it
  * to be safe to run every tick against arbitrary network input.
+ *
+ * THAT PROMISE COVERS THE RUNTIME SHAPE OF `buf` ITSELF, not only its
+ * contents, which the two rules above already handle. The parameter is typed
+ * `ArrayBuffer | Uint8Array`, but a caller past a permissive boundary (an
+ * any-typed message bus, a `JSON.parse`'d payload nobody validated) can hand
+ * over a string, `null`, or an array of `Buffer`s despite what the type says,
+ * and `new ByteReader` builds a `DataView` straight from whatever it is
+ * given: `DataView`'s own constructor throws a bare, uncaught `TypeError` on
+ * anything that is not an `ArrayBuffer` (or a typed-array view over one), not
+ * a `CodecError` this module's contract already covers. So the runtime shape
+ * is checked before `ByteReader` is ever constructed, and anything that is
+ * neither an `ArrayBuffer` nor an `ArrayBufferView` decodes to `[]` exactly
+ * like every other malformed input above.
  */
 export function decodeInputWindow(
   buf: ArrayBuffer | Uint8Array,
   opts?: DefaultInputWindowOptions
 ): DefaultInputRecord[] {
+  if (!(buf instanceof ArrayBuffer) && !ArrayBuffer.isView(buf)) return [];
   const scale = opts?.axisScale ?? AXIS_SCALE;
   const r = new ByteReader(buf);
   if (!r.has(3)) return [];

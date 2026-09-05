@@ -11,6 +11,7 @@ import {
   representableRange,
   CM_SCALE,
 } from './quantize.js';
+import { CodecError } from './bytes.js';
 
 describe('quantize / dequantize round trip within tolerance', () => {
   it('a plain value round-trips within the scale\'s resolution', () => {
@@ -65,6 +66,24 @@ describe('out-of-range values CLAMP rather than WRAP', () => {
     const once = quantize(1_000_000, 1, I16.min, I16.max);
     const twice = quantize(once, 1, I16.min, I16.max);
     expect(twice).toBe(once);
+  });
+});
+
+describe('quantize refuses NaN rather than silently writing it to the wire', () => {
+  it('throws CodecError on a NaN input', () => {
+    // Before this guard, both clamp comparisons (`NaN < min`, `NaN > max`)
+    // are false, so `quantize` fell through and returned NaN itself, and
+    // `DataView.setInt16(NaN)` then stores 0: a NaN coordinate teleported its
+    // entity to the world origin with no error anywhere.
+    expect(() => quantize(NaN, CM_SCALE, I16.min, I16.max)).toThrow(CodecError);
+  });
+
+  it('still clamps +Infinity and -Infinity to the field boundary, same as any other out-of-range value', () => {
+    // NaN and Infinity are not the same failure: Infinity has a direction to
+    // clamp toward and this must not start throwing on it just because it
+    // now throws on NaN.
+    expect(quantize(Infinity, 1, I16.min, I16.max)).toBe(I16.max);
+    expect(quantize(-Infinity, 1, I16.min, I16.max)).toBe(I16.min);
   });
 });
 
@@ -137,5 +156,23 @@ describe('quantizeAngle wraps rather than clamps, correctly across +-pi', () => 
   it('dequantizeAngle always returns a value in [0, 2*PI)', () => {
     expect(dequantizeAngle(0)).toBeGreaterThanOrEqual(0);
     expect(dequantizeAngle(U16.max)).toBeLessThan(2 * Math.PI);
+  });
+
+  it('throws CodecError on a NaN heading rather than silently landing on heading 0', () => {
+    expect(() => quantizeAngle(NaN)).toThrow(CodecError);
+  });
+
+  it('clamps +Infinity to the top of the u16 range instead of misreading it as heading 0', () => {
+    // `Infinity % TWO_PI` is NaN in JavaScript (measured), which used to
+    // reach `quantize`'s fall-through and decode as heading 0: an entity
+    // whose yaw integrator ran away to infinity read as "facing exactly
+    // east" with no error. Infinity is handled before the modulo now, so it
+    // clamps like any other out-of-range value instead of masquerading as a
+    // NaN.
+    expect(quantizeAngle(Infinity)).toBe(U16.max);
+  });
+
+  it('clamps -Infinity to the bottom of the u16 range', () => {
+    expect(quantizeAngle(-Infinity)).toBe(U16.min);
   });
 });

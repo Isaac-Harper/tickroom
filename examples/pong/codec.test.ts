@@ -9,10 +9,17 @@ import { CodecError } from '../../src/codec/index.js';
 const DT = 1 / pongRuntime.tickHz;
 const SERVER_TIME = 1_700_000_000_123.456;
 
+/** The playout depth the ticker would have reported for each player on the
+ *  tick this snapshot is taken. Nonzero on purpose: a state where
+ *  `onBufferHealth` never fired encodes an `inputLead` of 0 for everyone,
+ *  which round-trips perfectly whether the field is carried or dropped. */
+const DEPTHS: Record<string, number> = { playerOne: 3, playerTwo: 2 };
+
 /** Two players, mid-game: nonzero ball velocity, paddles off their spawn
- *  y, at least one plausible score. A snapshot of two rooms sitting at
- *  their spawn defaults would round-trip fine and still tell you nothing
- *  about whether the codec handles a real, moving game. */
+ *  y, at least one plausible score, and a live playout depth per player. A
+ *  snapshot of two rooms sitting at their spawn defaults would round-trip
+ *  fine and still tell you nothing about whether the codec handles a real,
+ *  moving game. */
 function realisticTwoPlayerState(): PongState {
   const s = pongRuntime.create('bench-room');
   pongRuntime.join(s, 'playerOne');
@@ -21,6 +28,11 @@ function realisticTwoPlayerState(): PongState {
     pongRuntime.applyInput(s, 'playerOne', { seq: i, data: { dir: Math.sin(i * 0.3) } });
     pongRuntime.applyInput(s, 'playerTwo', { seq: i, data: { dir: Math.cos(i * 0.4) } });
     pongRuntime.tick(s, DT);
+  }
+  // The ticker reports this every tick, including starved ones; what a
+  // snapshot carries is whatever the most recent report left in state.
+  for (const [pid, depth] of Object.entries(DEPTHS)) {
+    pongRuntime.onBufferHealth!(s, pid, depth);
   }
   return s;
 }
@@ -55,6 +67,10 @@ describe('pong: binary codec', () => {
       expect(found!.side).toBe(original.side);
       expect(found!.score).toBe(original.score);
       expect(found!.y).toBeCloseTo(original.y, 1);
+      // Exact, not close: the depth is a whole number of ticks and rides an
+      // untouched u8, so a quantisation tolerance here would hide a dropped
+      // or mis-offset byte rather than measure a trade.
+      expect(found!.inputLead).toBe(s.depth.get(original.pid));
     }
   });
 

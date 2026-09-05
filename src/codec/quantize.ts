@@ -4,6 +4,8 @@
 // bandwidth budget: pick the smallest integer type that covers your world's
 // real range plus a little headroom, not the widest one "to be safe".
 
+import { CodecError } from './bytes.js';
+
 /**
  * Scales `v` by `scale`, rounds to the nearest integer, then CLAMPS into
  * `[min, max]`.
@@ -20,8 +22,23 @@
  * value slightly outside what the field was sized for (a physics glitch, a
  * moment of numerical overshoot, a value from before a world resize). One of
  * these is a bug report; the other is a non-event.
+ *
+ * NaN IS REFUSED RATHER THAN CLAMPED. `NaN < min` and `NaN > max` are both
+ * `false` (every comparison against NaN is), so the clamp above would fall
+ * straight through to `return scaled` and hand a NaN to whatever writes it
+ * onto the wire; `DataView.setInt16(NaN)` then stores 0, and a NaN position
+ * teleports its entity to the world origin with no error anywhere. A NaN
+ * cannot mean "far out of range" the way `Infinity` does (which this still
+ * clamps to `max`, and `-Infinity` to `min`, exactly as before): there is no
+ * direction to clamp NaN toward, so unlike an out-of-range but finite value,
+ * letting it through is not a non-event, it is a simulation bug (a `0/0`, an
+ * uninitialized field, a physics step that diverged) that has to be loud, the
+ * same call this codec already makes for an out-of-range `CodecEntity.id`.
  */
 export function quantize(v: number, scale: number, min: number, max: number): number {
+  if (Number.isNaN(v)) {
+    throw new CodecError('quantize: cannot encode NaN, which has no clamped or wrapped representation on the wire');
+  }
   const scaled = Math.round(v * scale);
   if (scaled < min) return min;
   if (scaled > max) return max;
@@ -113,8 +130,26 @@ const TURN_SCALE = TURN_STEPS / TWO_PI;
  * standard fix-up for JavaScript's sign-following `%` on negative operands)
  * instead maps every physically equivalent angle onto the same wire value,
  * which is the only definition of "correct" a circular quantity has.
+ *
+ * `+-Infinity` IS HANDLED EXPLICITLY, BEFORE THE MODULO, rather than being
+ * let fall into `%` the way every finite value is. JavaScript defines
+ * `Infinity % anything` (and `-Infinity % anything`) as `NaN`, so an
+ * unbounded heading integrator (a yaw nobody ever wraps, run long enough to
+ * overflow to infinity) would reach the modulo below, silently become NaN,
+ * and land on `quantize`'s NaN guard, which is the wrong outcome here: an
+ * infinite heading is the ordinary consequence of an integrator that was
+ * never wrapped, not a `0/0`-shaped bug, so it gets the same non-throwing
+ * clamp `quantize` already gives an out-of-range position, not a thrown
+ * error. `+Infinity` clamps to the top of the u16 range and `-Infinity` to
+ * the bottom, the same direction `quantize`'s own min/max clamp would pick if
+ * it ever saw a value that large without the modulo turning it into NaN
+ * first. An actual NaN heading (not an infinity in disguise) still reaches
+ * `quantize` below and still throws, exactly as it should: see `quantize`'s
+ * own NaN guard for why.
  */
 export function quantizeAngle(rad: number): number {
+  if (rad === Infinity) return U16.max;
+  if (rad === -Infinity) return U16.min;
   let normalized = rad % TWO_PI;
   if (normalized < 0) normalized += TWO_PI;
   return quantize(normalized, TURN_SCALE, U16.min, U16.max);

@@ -53,6 +53,22 @@
 // by last-known velocity, capped at `EXTRAP_CAP_MS`, and that cap is what
 // stops a long outage from sliding an entity arbitrarily far off the truth:
 // past the cap it simply stops advancing rather than continuing to guess.
+//
+// AND THE GUESS IS UNWOUND AS A GLIDE, WHICH IS THE OTHER HALF OF THAT RULE.
+// "Gently corrected when the next snapshot lands" is a promise the class did
+// not keep: the confirmed pose simply replaced the extrapolated one in a single
+// frame, which on a ticker handoff is a 10 unit REWIND at -625 u/s on an entity
+// moving at 100. The difference is now an additive offset on the rendered pose
+// that decays over `EXTRAP_CAP_MS`, clamped to the displacement the
+// extrapolation itself applied, so this smooths only what this module made up
+// and a real teleport still arrives as a teleport. See `finishEntity`.
+//
+// EVERY RATE THIS CLASS MEASURES OR MOVES IS CAPPED AGAINST WALL TIME, and that
+// is one idea rather than three. `OFFSET_SLEW_MAX` and `DELAY_SLEW_MAX` bound
+// the two terms of the playhead because moving either one IS moving playback in
+// time; `FRAME_GAP_SLACK_MS` decides when the caller's `dt` has stopped
+// describing real elapsed time, because a rate measured against a clamped `dt`
+// is not a rate.
 
 export const INTERP_START_MS = 100;
 export const INTERP_MIN_MS = 80;
@@ -86,8 +102,109 @@ export const INTERP_MAX_MS = 500;
 /** Per-second ease rate the adaptive delay approaches its jitter-derived target at. Not snapped, because a sudden delay change is itself a visible discontinuity: everything rendered through this interpolator would jump forward or back in time by the delta. */
 export const INTERP_ADAPT_LAMBDA = 0.7;
 
-/** How far past the newest confirmed snapshot an entity may extrapolate before it stops advancing and simply holds its last extrapolated pose. */
+/**
+ * Maximum fraction of real elapsed time the adaptive delay may slew by. THE
+ * SAME QUANTITY `OFFSET_SLEW_MAX` CAPS, ON THE OTHER TERM OF THE SAME SUM.
+ *
+ * The playhead is `now - offset - delay`, so moving the DELAY moves playback in
+ * time exactly the way moving the offset does, and this file already puts the
+ * perceptibility limit for that at a few percent of wall time (see
+ * `OFFSET_SLEW_MAX`, 5%). The delay had no cap at all: `INTERP_ADAPT_LAMBDA`
+ * eases 0.7 of the remaining DIFFERENCE per second, which on a 320ms correction
+ * is 224ms of playback time moved in the first second, forty-five times the
+ * rate the offset next to it is allowed to move at. Uncapped, one 450ms hold on
+ * an otherwise calm link cost 126 rendered frames outside +-10% of true speed:
+ * 48 of them as slow as 0.83x while the delay grew, then, seconds later when
+ * the burst aged out of the offset window, 78 as fast as 1.21x while it came
+ * back down. The repeating-stall profile is why that was never noticed; its
+ * delay saturates at the ceiling and never comes down at all.
+ *
+ * 0.08 IS MEASURED AND IT IS THE ONLY SWEPT VALUE THAT SATISFIES BOTH ENDS. The
+ * two profiles pull in opposite directions: a ONE-OFF hold wants the smallest
+ * cap it can get, because everything the delay does afterwards is a correction
+ * nobody asked for, while a REPEATING stall wants the largest, because the
+ * buffer has to reach its depth before the stall comes round again (which is
+ * the whole argument for `INTERP_MAX_MS` being 500). Rendered frames outside
+ * +-10% of a 100 u/s entity's true speed, and the repeating profile's peak:
+ *
+ *   cap     one-off hold        repeating 450ms stall
+ *   none    126 (0.83x/1.21x)   0, peak 100
+ *   0.12    178 (0.88x/1.12x)   0, peak 100
+ *   0.10    106 (0.90x/1.10x)   0, peak 100
+ *   0.08    0   (0.92x/1.08x)   0, peak 100
+ *   0.06    0   (0.94x/1.06x)   12, peak 117
+ *   0.04    0   (0.96x/1.04x)   29, peak 173
+ *   0.02    0   (0.98x/1.02x)   83, peak 275
+ *
+ * Both tests are in `interpolation.test.ts` and both bind, so this cannot be
+ * moved in either direction without one of them going red.
+ *
+ * THE TRADE IS DELIBERATE AND IT IS THE OFFSET'S TRADE. A 320ms increase now
+ * takes four seconds at a rate nobody can see instead of one and a half at a
+ * rate everybody can. What arriving late at the right buffer depth costs is a
+ * few more extrapolated frames in the meantime, which is a mechanism this file
+ * already has and already bounds; what arriving fast costs is a speed error on
+ * every remote entity on screen, which nothing bounds and everybody sees. The
+ * same reasoning charges the widest correction the delay can make (420ms, floor
+ * to ceiling) 5.25 seconds, and the latency-step test measures what that looks
+ * like: 400ms of extra staleness for two seconds after a re-anchor, rather than
+ * every entity running 20% fast for one.
+ *
+ * THE SNAP IN `reanchor()` IS DELIBERATELY NOT SUBJECT TO THIS. That is the
+ * one-frame correction the class has already decided to spend, in the case
+ * where the clock estimate is not noisy but wrong; a slew there would leave the
+ * ease still in flight, which is the exact half-correction that test names.
+ */
+export const DELAY_SLEW_MAX = 0.08;
+
+/** How far past the newest confirmed snapshot an entity may extrapolate before it stops advancing and simply holds its last extrapolated pose. Also the length of the glide that unwinds that extrapolation when the stream comes back: see `finishEntity`. */
 export const EXTRAP_CAP_MS = 150;
+
+/**
+ * Ceiling on the resume glide taken by `resumeFrom`, expressed as how many
+ * milliseconds of the entity's own measured speed the glide may cover.
+ *
+ * THE UNWIND GLIDE'S CLAMP CANNOT BE THE ONE USED HERE, and the reason is the
+ * whole difference between the two events. `finishEntity`'s clamp is "this
+ * module may only hide what this module made up", measured against the
+ * extrapolation's own displacement, and across a reconnect that displacement is
+ * ZERO: nothing was extrapolated, the connection was down and the poses were
+ * simply held. The world genuinely moved in the meantime, so every unit of the
+ * difference is real, and the honest alternatives are a snap or a glide. This
+ * file already answers that question everywhere else it comes up, and so does
+ * `ErrorOffset` for the local player: glide it, because a correction the player
+ * can watch beats a correction that happens between two frames.
+ *
+ * A second of the entity's own speed is a bound rather than a policy. It exists
+ * so a pose held across a genuinely long outage, or a key reused by a different
+ * entity, cannot buy an arbitrarily long lie; at any ordinary reconnect the
+ * outage is a fraction of that and the clamp never binds. With no measured
+ * speed to scale (the common case, since `clear()` has just dropped the motion
+ * state the speed lived in) there is nothing to bound it with and the glide is
+ * unclamped, which is the same trade made deliberately rather than by accident.
+ */
+export const RESUME_GLIDE_MAX_MS = 1000;
+
+/**
+ * How far `sample()`'s own elapsed local time may exceed the `dt` it was handed
+ * before the frame is treated as DISCONTINUOUS rather than as an ordinary
+ * render step.
+ *
+ * The two are the same number on every healthy frame, and they are not the same
+ * number after a render gap, because a caller is right to clamp `dt`:
+ * `RoomConnection.frame()` clamps it to 0.25s so one stalled frame cannot
+ * advance a whole simulation at once, and then passes the REAL `nowMs`
+ * alongside it. The playhead moves with `nowMs`, so a 30 second gap moves
+ * playback 30 seconds while `dt` still says a quarter of one, and
+ * `finishEntity` divided the resulting 30 seconds of displacement by 0.25 and
+ * reported 10,000+ u/s on an entity moving at 100. `InterpolatedEntity.speed`
+ * is documented as the animation driver, so that is a run sprint no entity
+ * performed, for a dozen frames, on a tab that was simply in the background.
+ *
+ * 100ms of slack is far more than the float residue of an accumulated render
+ * clock or one late frame, and far less than any gap worth calling one.
+ */
+export const FRAME_GAP_SLACK_MS = 100;
 
 /**
  * How long the playhead may sit in a position no buffered frame brackets
@@ -271,7 +388,7 @@ export interface Vec2 {
 export interface EntitySample {
   x: number;
   y: number;
-  heading?: number;
+  heading?: number | undefined;
   [k: string]: unknown;
 }
 
@@ -306,31 +423,57 @@ export interface SnapshotFrame<K extends string | number> {
 }
 
 export interface InterpolatorOptions {
-  minDelayMs?: number;
-  maxDelayMs?: number;
-  startDelayMs?: number;
-  extrapCapMs?: number;
+  minDelayMs?: number | undefined;
+  maxDelayMs?: number | undefined;
+  startDelayMs?: number | undefined;
+  extrapCapMs?: number | undefined;
   /** Frames retained in the playback buffer. A hard upper bound only: frames the playhead has moved safely past are pruned by TIME before this ever binds, so a delivery burst cannot evict a frame the playhead still needs just by filling the buffer. */
-  bufferCap?: number;
+  bufferCap?: number | undefined;
   /** An entity unseen in any pushed frame for this long is dropped from the output entirely. */
-  dropAfterMs?: number;
+  dropAfterMs?: number | undefined;
   /** Time constant, seconds, for the per-entity speed low-pass. Short against a real acceleration, long against one frame of interpolation noise. */
-  speedTau?: number;
+  speedTau?: number | undefined;
   /** Raw clock-offset samples kept for the offset floor and the jitter estimate. Defaults to `OFFSET_WINDOW`. */
-  offsetWindow?: number;
+  offsetWindow?: number | undefined;
   /** Maximum fraction of real elapsed time the clock offset may slew by. Defaults to `OFFSET_SLEW_MAX`. */
-  offsetSlewMax?: number;
+  offsetSlewMax?: number | undefined;
   /** Quantile of measured jitter the adaptive delay covers. Defaults to `DELAY_JITTER_QUANTILE`; 1 makes it the window maximum. */
-  delayQuantile?: number;
+  delayQuantile?: number | undefined;
   /** Fixed headroom added to the adaptive delay target. Defaults to `DELAY_MARGIN_MS`. */
-  delayMarginMs?: number;
+  delayMarginMs?: number | undefined;
 }
 
+/** What an extrapolated frame guessed with: the velocity it used and how much of `extrapCapMs` it had left to run. `finishEntity` needs both to unwind the guess when confirmed data comes back. */
+interface ExtrapGuess {
+  vx: number;
+  vy: number;
+  leftMs: number;
+}
+
+/**
+ * Per-entity render state, all of it about CONTINUITY between one rendered
+ * frame and the next, and all of it dropped by `clear()` and `forget()` along
+ * with the rest of the per-entity state (a new epoch has nothing to be
+ * continuous with).
+ */
 interface EntityMotionState {
+  /** The last pose this entity was RENDERED at, unwind offset included, because that is the pose the host actually drew and therefore the only one the next frame can be continuous with. */
   x: number;
   y: number;
+  heading: number;
   speed: number;
   hasPrev: boolean;
+  /** True if the pose above was extrapolated (or held past the cap) rather than bracketed between two confirmed frames. The unwind glide fires on the edge from this to bracketed. */
+  wasExtrapolated: boolean;
+  /** The guess that produced it: the velocity the extrapolation used and how much of `extrapCapMs` it had NOT yet spent. Enough to ask what the guess would have said on the transition frame, and (with the spent half) how far the guess had moved the entity, which is the ceiling on the glide. */
+  extrapVX: number;
+  extrapVY: number;
+  extrapLeftMs: number;
+  /** Additive offset on the rendered pose that absorbs the step out of extrapolation, and the local milliseconds left to glide it to zero. */
+  offX: number;
+  offY: number;
+  offHeading: number;
+  offMsLeft: number;
 }
 
 /**
@@ -420,8 +563,16 @@ export class SnapshotInterpolator<K extends string | number> {
   private frames: SnapshotFrame<K>[] = [];
   private lastSeenAt = new Map<K, number>();
   private motion = new Map<K, EntityMotionState>();
+  /** Poses a reconnecting host was holding on screen, waiting for their entity's first render of the new epoch. Empty except in the moments after `resumeFrom`. See that method. */
+  private resumeSeed = new Map<K, { x: number; y: number; heading?: number | undefined; speed: number }>();
 
   private localClockMs = 0;
+  /** How far the playhead moved on THIS `sample()` call, in server-clock ms. Read by `finishEntity` to project a guess forward one frame; it is the same number for every entity, so it is computed once rather than passed nine arguments deep. */
+  private playheadStepMs = 0;
+  /** Playhead of the previous `sample()` call, or null before the first one. */
+  private lastPlayServerTime: number | null = null;
+  /** Local clock at the previous `sample()`, or null before the first one. The reference the caller's `dt` is checked against: see `FRAME_GAP_SLACK_MS`. */
+  private lastSampleLocalMs: number | null = null;
 
   /** Sliding window of `receivedAt - serverTime`. Its MINIMUM is the clock offset estimate; the spread above that minimum is the jitter the delay has to cover. */
   private offsetWindow: number[] = [];
@@ -939,6 +1090,9 @@ export class SnapshotInterpolator<K extends string | number> {
     this.lastSeenAt.clear();
     this.motion.clear();
     this.localClockMs = 0;
+    this.playheadStepMs = 0;
+    this.lastPlayServerTime = null;
+    this.lastSampleLocalMs = null;
     this.offsetWindow = [];
     this.intervalWindow = [];
     this.offsetMs = 0;
@@ -957,6 +1111,77 @@ export class SnapshotInterpolator<K extends string | number> {
     this.underrunEma = 0;
     this.playheadErrorSinceMs = null;
     this.pushesSinceErrorStart = 0;
+    // Any seed from a PREVIOUS resume goes with it, which is what retires a
+    // held entity that never came back: it is dropped at the next epoch rather
+    // than waiting indefinitely for a first render that will not happen.
+    this.resumeSeed.clear();
+  }
+
+  /**
+   * Start the new epoch from the poses the host is still showing, rather than
+   * from wherever the first snapshot lands.
+   *
+   * CALL IT IMMEDIATELY AFTER `clear()`, with the poses the connection is
+   * holding on screen. `clear()` is the epoch boundary and empties everything,
+   * this hands back the one thing worth carrying across it: where the player
+   * last SAW each entity. Called before `clear()` it would simply be erased.
+   *
+   * WHAT IT FIXES IS A SNAP FOLLOWED BY A FREEZE, measured end to end through a
+   * real socket. A reconnect holds the last rendered poses, and then the new
+   * epoch's first frame steps every entity forward by the whole outage's motion
+   * at once (measured at +20 units in one frame, 1182 u/s, on a 40ms link, and
+   * +30 at 1765 u/s on a 250ms one), after which playback sits COMPLETELY STILL
+   * for about six frames, because a freshly cleared playhead starts
+   * `INTERP_START_MS` behind the first buffered frame and the hold branch
+   * renders that frame's pose exactly. Snap, freeze, then a stretch of running
+   * fast while the delay eases: three artifacts from one event.
+   *
+   * The seed turns all three into one glide. The first time each held entity is
+   * rendered in the new epoch, whichever branch renders it, the difference
+   * between the held pose and the interpolated one becomes a render offset
+   * decayed over `EXTRAP_CAP_MS` by the same machinery that unwinds an
+   * extrapolation. That also takes the freeze out on its own: the hold branch
+   * renders `frames[0]`'s pose plus a decaying offset, which is motion.
+   *
+   * THE CLAMP IS THE ONE PLACE THIS DIFFERS FROM THE EXTRAPOLATION UNWIND, for
+   * a reason rather than by omission: see `RESUME_GLIDE_MAX_MS`. Nothing was
+   * extrapolated here, so "only hide this module's own overshoot" would clamp
+   * to zero and refuse the glide outright.
+   *
+   * Entities absent from `held` are untouched, so a host may seed a subset
+   * (the ones it actually kept drawing) without affecting anything else.
+   *
+   * THE SPEED COMES IN ON THE POSE, AND IT HAS TO, WHICH IS A LESSON ABOUT
+   * WHERE STATE LIVES RATHER THAN A PARAMETER DETAIL. The clamp is scaled by
+   * the entity's measured speed, and the first version of this method read that
+   * from `this.motion`, which is precisely the map `clear()` empties one line
+   * earlier in the caller's epoch turnover. Since the documented call order is
+   * `clear()` then `resumeFrom`, every lookup returned `undefined`, every bound
+   * was `Infinity`, and the clamp was STRUCTURALLY DEAD on the only path anyone
+   * uses: an entity that RESPAWNED 5000 units away while the socket was down
+   * rendered as a 4823 unit sweep at 32,690 u/s, which is the unbounded lie the
+   * clamp exists to refuse, in the method whose own docstring promised a bound.
+   * A value read from state the caller was just told to destroy is not a
+   * default, it is a guarantee that the branch never runs.
+   *
+   * The fix needs nothing from the host: `InterpolatedEntity` already carries
+   * `speed`, so the map `frame()` handed back IS a valid `held` argument with
+   * the measurement already in it. `this.motion` remains as a FALLBACK, for a
+   * host that seeds without clearing first, and is now genuinely a fallback
+   * rather than the only source.
+   */
+  resumeFrom(held: ReadonlyMap<K, { x: number; y: number; heading?: number | undefined; speed?: number | undefined }>): void {
+    this.resumeSeed.clear();
+    for (const [key, pose] of held) {
+      if (!Number.isFinite(pose.x) || !Number.isFinite(pose.y)) continue;
+      // A speed arriving on a host-supplied pose crosses the same boundary
+      // `push()` guards: non-finite or negative is no measurement at all, and
+      // has to read as "unknown" (unclamped) rather than as a bound of NaN,
+      // which every comparison downstream would silently pass.
+      const measured = pose.speed ?? this.motion.get(key)?.speed ?? 0;
+      const speed = Number.isFinite(measured) && measured > 0 ? measured : 0;
+      this.resumeSeed.set(key, { x: pose.x, y: pose.y, heading: pose.heading, speed });
+    }
   }
 
   /**
@@ -1008,9 +1233,29 @@ export class SnapshotInterpolator<K extends string | number> {
     if (!Number.isFinite(dt)) dt = 0;
     this.localClockMs = nowMs;
 
+    // `dt` AND `nowMs` CAN DISAGREE, AND EVERY PER-ENTITY SMOOTHER HERE HAS TO
+    // BELIEVE THE CLOCK RATHER THAN THE STEP. They are the same number on a
+    // healthy frame; they part company after a render gap, because clamping
+    // `dt` is the right thing for a caller to do (`RoomConnection.frame()`
+    // clamps at 0.25s so one stalled frame cannot advance a whole simulation)
+    // and the playhead moves with `nowMs` regardless. Dividing a 30 second
+    // displacement by a quarter of a second is how `speed`, the documented
+    // animation driver, came to report 10,000+ u/s for a backgrounded tab.
+    // Anything measuring a RATE from rendered motion therefore uses the elapsed
+    // local time on such a frame; `dt` is still what the delay ease and the
+    // underrun EMA run on, since those are the caller's own frame budget.
+    const localElapsedMs = this.lastSampleLocalMs === null ? dt * 1000 : nowMs - this.lastSampleLocalMs;
+    this.lastSampleLocalMs = nowMs;
+    const smoothS = localElapsedMs > dt * 1000 + FRAME_GAP_SLACK_MS ? localElapsedMs / 1000 : dt;
+
+    // The ease sets the SHAPE of the approach and `DELAY_SLEW_MAX` sets its
+    // RATE CEILING, for the same reason `estimateOffset` caps the offset: both
+    // terms are subtracted from the playhead, so easing either one quickly is
+    // rendering every remote entity fast or slow for as long as the ease lasts.
     if (dt > 0) {
       const ease = 1 - Math.exp(-INTERP_ADAPT_LAMBDA * dt);
-      this.currentDelayMs += (this.targetDelayMs - this.currentDelayMs) * ease;
+      const maxStep = dt * 1000 * DELAY_SLEW_MAX;
+      this.currentDelayMs += clamp((this.targetDelayMs - this.currentDelayMs) * ease, -maxStep, maxStep);
       if (!Number.isFinite(this.currentDelayMs)) this.currentDelayMs = this.startDelayMs;
     }
 
@@ -1050,6 +1295,12 @@ export class SnapshotInterpolator<K extends string | number> {
       i = this.bracketIndex(playServerTime);
     }
 
+    // How far playback itself moved this call, which is what the transition
+    // out of extrapolation projects the abandoned guess forward by. Taken after
+    // any re-anchor, so it describes the playhead that actually rendered.
+    this.playheadStepMs = this.lastPlayServerTime === null ? 0 : playServerTime - this.lastPlayServerTime;
+    this.lastPlayServerTime = playServerTime;
+
     let underranThisCall = false;
 
     if (i === -1) {
@@ -1059,7 +1310,7 @@ export class SnapshotInterpolator<K extends string | number> {
       const frame = this.frames[0]!;
       for (const [key, sample] of frame.entities) {
         if (!this.lastSeenAt.has(key)) continue;
-        out.set(key, this.finishEntity(key, sample.x, sample.y, sample.heading ?? 0, sample, false, dt));
+        out.set(key, this.finishEntity(key, sample.x, sample.y, sample.heading ?? 0, sample, false, smoothS));
       }
     } else if (i === this.frames.length - 1) {
       // UNDERRUN: nothing buffered beyond the playback point. Extrapolate by
@@ -1089,7 +1340,11 @@ export class SnapshotInterpolator<K extends string | number> {
         }
         const x = sample.x + vx * elapsedS;
         const y = sample.y + vy * elapsedS;
-        out.set(key, this.finishEntity(key, x, y, sample.heading ?? 0, sample, true, dt));
+        out.set(key, this.finishEntity(key, x, y, sample.heading ?? 0, sample, true, smoothS, {
+          vx,
+          vy,
+          leftMs: this.extrapCapMs - elapsedS * 1000,
+        }));
       }
     } else {
       const a = this.frames[i]!;
@@ -1106,11 +1361,16 @@ export class SnapshotInterpolator<K extends string | number> {
           const x = lerp(sa.x, sb.x, frac);
           const y = lerp(sa.y, sb.y, frac);
           const heading = lerpHeading(sa.heading ?? 0, sb.heading ?? 0, frac);
-          out.set(key, this.finishEntity(key, x, y, heading, sb, false, dt));
+          out.set(key, this.finishEntity(key, x, y, heading, sb, false, smoothS));
           continue;
         }
         const partial = this.posePartial(key, i, playServerTime);
-        if (partial) out.set(key, this.finishEntity(key, partial.x, partial.y, partial.heading, partial.base, partial.extrapolated, dt));
+        if (partial) {
+          out.set(
+            key,
+            this.finishEntity(key, partial.x, partial.y, partial.heading, partial.base, partial.extrapolated, smoothS, partial.guess),
+          );
+        }
       }
     }
 
@@ -1290,7 +1550,7 @@ export class SnapshotInterpolator<K extends string | number> {
     key: K,
     i: number,
     playServerTime: number,
-  ): { x: number; y: number; heading: number; base: EntitySample; extrapolated: boolean } | null {
+  ): { x: number; y: number; heading: number; base: EntitySample; extrapolated: boolean; guess?: ExtrapGuess } | null {
     const ia = this.scanFor(key, i, -1);
     const ib = this.scanFor(key, i + 1, 1);
 
@@ -1332,6 +1592,7 @@ export class SnapshotInterpolator<K extends string | number> {
         heading: sa.heading ?? 0,
         base: sa,
         extrapolated: elapsedS > 0,
+        guess: { vx, vy, leftMs: this.extrapCapMs - elapsedS * 1000 },
       };
     }
 
@@ -1351,6 +1612,61 @@ export class SnapshotInterpolator<K extends string | number> {
     return -1;
   }
 
+  /**
+   * Apply the unwind glide, measure the rendered speed, and hand the pose out.
+   *
+   * THE GLIDE IS THE OTHER HALF OF "NEVER FREEZE ON UNDERRUN". Extrapolating
+   * past the newest snapshot is a GUESS, and every guess has to be paid back
+   * the moment real data lands: the entity was rendered at `pose + v * t` and
+   * the truth turns out to be somewhere else, so without this the whole
+   * discrepancy is spent in ONE frame.
+   *
+   * Both directions of that were measured on this module and neither is
+   * acceptable. On a clean ticker handoff (the world pauses while `serverTime`
+   * keeps running on the successor's clock) the entity had been guessed FORWARD
+   * and the truth is where it already was, so it steps BACKWARD by
+   * `(EXTRAP_CAP_MS - tickMs) * v`: one 10.41 unit rewind at -625 u/s on an
+   * entity whose true speed is 100. With the glide that becomes four backward
+   * frames of at most 1.16 units, -69 u/s, and a peak rendered speed of 100
+   * rather than 625. On a network gap with the world still MOVING it is the
+   * forward snap this repo already documents, and the same clamp caps what can
+   * be hidden at what the guess itself added: 3780 u/s down to 2880, the rest
+   * being real world motion nobody has any business smoothing away.
+   *
+   * So the difference becomes an additive offset on the RENDERED pose instead
+   * of a step, and the offset glides to zero over `EXTRAP_CAP_MS` of local
+   * time. The rendered pose is continuous through the transition by
+   * construction, and the pose the host is given converges onto the confirmed
+   * one over the same horizon the extrapolation was allowed to run for.
+   *
+   * THE CLAMP IS WHAT KEEPS THIS HONEST, and it is the whole difference between
+   * a smoother and a lie. The offset may not exceed the displacement the
+   * EXTRAPOLATOR ITSELF APPLIED to this entity (its derived velocity times the
+   * time it ran, which `extrapCapMs` already bounds). So the glide can only
+   * ever hide this module's own overshoot; a real teleport, a respawn, a
+   * correction from the authority, all arrive as a difference far larger than
+   * anything this module guessed and all still snap exactly as they do today.
+   * That bound also makes the glide's own rate safe without tuning: an offset
+   * of at most `v * cap`, spent over exactly `cap`, can never move an entity
+   * faster than it was already moving.
+   *
+   * THE DIFFERENCE IS TAKEN AGAINST THE GUESS PROJECTED ONE FRAME, NOT AGAINST
+   * LAST FRAME'S POSE, and that is a correction rather than a nicety. The
+   * playhead moves between the two frames, so an entity moving normally is
+   * SUPPOSED to be somewhere else this frame: differencing against where it was
+   * counts one ordinary frame of motion as overshoot, and the transition frame
+   * then renders the previous pose exactly, i.e. a dead stop, followed by the
+   * bogus offset unwinding as extra speed. Measured on the repeating-stall
+   * profile: one frame at 0.0 u/s and nine at 109 on an entity moving at a
+   * constant 100, on a transition that was already smooth. Asking what the
+   * GUESS would have said at this playhead (its velocity, for as much of the
+   * cap as it had left) isolates the guess's error and leaves a benign
+   * transition alone, because there the guess and the truth agree.
+   *
+   * The unwind rate is proportional to what is LEFT over the time that is
+   * left, which is what makes it terminate on a deadline instead of trailing an
+   * asymptote.
+   */
   private finishEntity(
     key: K,
     x: number,
@@ -1358,21 +1674,99 @@ export class SnapshotInterpolator<K extends string | number> {
     heading: number,
     base: EntitySample,
     extrapolated: boolean,
-    dt: number,
+    elapsedS: number,
+    guess?: ExtrapGuess,
   ): InterpolatedEntity {
-    let state = this.motion.get(key);
-    let speed = 0;
-    if (state && dt > 0) {
-      const dx = x - state.x;
-      const dy = y - state.y;
-      const inst = Math.hypot(dx, dy) / dt;
-      const ease = 1 - Math.exp(-dt / this.speedTau);
+    const state = this.motion.get(key);
+    let offX = state?.offX ?? 0;
+    let offY = state?.offY ?? 0;
+    let offHeading = state?.offHeading ?? 0;
+    let offMsLeft = state?.offMsLeft ?? 0;
+
+    const seed = this.resumeSeed.size > 0 ? this.resumeSeed.get(key) : undefined;
+
+    if (seed) {
+      // FIRST RENDER OF THE NEW EPOCH for an entity the host was still drawing.
+      // Consumed here rather than in `resumeFrom` because "first rendered" is
+      // the moment that matters: a seeded entity whose snapshots have not
+      // arrived yet has not been drawn from this epoch at all.
+      this.resumeSeed.delete(key);
+      const dx = seed.x - x;
+      const dy = seed.y - y;
+      const mag = Math.hypot(dx, dy);
+      const allowed = seed.speed > 0 ? (seed.speed * RESUME_GLIDE_MAX_MS) / 1000 : Infinity;
+      const scale = mag > allowed ? allowed / mag : 1;
+      offX = dx * scale;
+      offY = dy * scale;
+      offHeading = wrapAngle((seed.heading ?? heading) - heading) * scale;
+      offMsLeft = this.extrapCapMs;
+    } else if (state && state.wasExtrapolated && !extrapolated) {
+      // The edge out of extrapolation, which is the only place an offset is
+      // ever taken. Where the abandoned guess would have put the entity at this
+      // playhead, minus where the confirmed frames say it is, clamped to how
+      // far that guess had moved it in the first place.
+      const advanceS = Math.min(Math.max(0, this.playheadStepMs), Math.max(0, state.extrapLeftMs)) / 1000;
+      const guessSpeed = Math.hypot(state.extrapVX, state.extrapVY);
+      const allowed = (guessSpeed * (this.extrapCapMs - state.extrapLeftMs)) / 1000;
+      const dx = state.x + state.extrapVX * advanceS - x;
+      const dy = state.y + state.extrapVY * advanceS - y;
+      const mag = Math.hypot(dx, dy);
+      const scale = mag > allowed ? allowed / mag : 1;
+      offX = dx * scale;
+      offY = dy * scale;
+      // Heading rides the same scale rather than a cap of its own: the pose
+      // glides as one thing, and a difference the clamp calls a teleport
+      // teleports its facing with it instead of pirouetting after the fact.
+      offHeading = wrapAngle(state.heading - heading) * scale;
+      offMsLeft = this.extrapCapMs;
+    } else if (offMsLeft > 0 && elapsedS > 0) {
+      const stepMs = elapsedS * 1000;
+      const f = stepMs >= offMsLeft ? 1 : stepMs / offMsLeft;
+      offX -= offX * f;
+      offY -= offY * f;
+      offHeading -= offHeading * f;
+      offMsLeft -= stepMs;
+      if (offMsLeft <= 0) {
+        offX = 0;
+        offY = 0;
+        offHeading = 0;
+        offMsLeft = 0;
+      }
+    }
+
+    const rx = x + offX;
+    const ry = y + offY;
+    const rHeading = offHeading === 0 ? heading : wrapAngle(heading + offHeading);
+
+    // Measured from what was actually RENDERED, offset included, because that
+    // is the motion the animation this drives has to match. `elapsedS <= 0`
+    // leaves the previous reading alone rather than overwriting it with zero: a
+    // second `sample()` at the same `nowMs` renders the same instant twice, and
+    // an instant is not evidence that the entity stopped.
+    let speed = state?.speed ?? 0;
+    if (state && elapsedS > 0) {
+      const inst = Math.hypot(rx - state.x, ry - state.y) / elapsedS;
+      const ease = 1 - Math.exp(-elapsedS / this.speedTau);
       speed = state.hasPrev ? state.speed + (inst - state.speed) * ease : inst;
     }
-    state = { x, y, speed, hasPrev: true };
-    this.motion.set(key, state);
 
-    return { ...base, x, y, heading, speed, extrapolated };
+    this.motion.set(key, {
+      x: rx,
+      y: ry,
+      heading: rHeading,
+      speed,
+      hasPrev: true,
+      wasExtrapolated: extrapolated,
+      extrapVX: guess?.vx ?? 0,
+      extrapVY: guess?.vy ?? 0,
+      extrapLeftMs: guess ? clamp(guess.leftMs, 0, this.extrapCapMs) : 0,
+      offX,
+      offY,
+      offHeading,
+      offMsLeft,
+    });
+
+    return { ...base, x: rx, y: ry, heading: rHeading, speed, extrapolated };
   }
 
   private decayUnderrun(underran: boolean, dt: number): void {

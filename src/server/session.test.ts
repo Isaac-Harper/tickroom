@@ -6,6 +6,7 @@ import {
   makeSpawnToken,
   verifySpawnToken,
   secretMatches,
+  SPAWN_TOKEN_WINDOW_MS,
 } from './session.js';
 
 const OPTS = { secret: 'test-secret-value' };
@@ -108,20 +109,47 @@ describe('session tokens', () => {
 });
 
 describe('spawn tokens', () => {
+  const SECRET = 'spawn-secret';
+  // Start of a window, so every test below reasons in whole windows with no
+  // risk of landing on a boundary by accident.
+  const WINDOW_START = 1_000 * SPAWN_TOKEN_WINDOW_MS;
+
   it('binds the room id: a token for one room is rejected for another', () => {
-    const secret = 'spawn-secret';
-    const tokenA = makeSpawnToken('room-a', secret);
-    expect(verifySpawnToken('room-a', tokenA, secret)).toBe(true);
-    expect(verifySpawnToken('room-b', tokenA, secret)).toBe(false);
+    const tokenA = makeSpawnToken('room-a', SECRET, WINDOW_START);
+    expect(verifySpawnToken('room-a', tokenA, SECRET, WINDOW_START)).toBe(true);
+    expect(verifySpawnToken('room-b', tokenA, SECRET, WINDOW_START)).toBe(false);
   });
 
   it('rejects a wrong secret', () => {
-    const tokenA = makeSpawnToken('room-a', 'secret-1');
-    expect(verifySpawnToken('room-a', tokenA, 'secret-2')).toBe(false);
+    const tokenA = makeSpawnToken('room-a', 'secret-1', WINDOW_START);
+    expect(verifySpawnToken('room-a', tokenA, 'secret-2', WINDOW_START)).toBe(false);
   });
 
   it('rejects a missing token', () => {
-    expect(verifySpawnToken('room-a', null, 'secret')).toBe(false);
+    expect(verifySpawnToken('room-a', null, SECRET)).toBe(false);
+  });
+
+  it('defaults nowMs to the real clock, so a caller need not pass it', () => {
+    const token = makeSpawnToken('room-a', SECRET);
+    expect(verifySpawnToken('room-a', token, SECRET)).toBe(true);
+  });
+
+  it('stays valid through the window it was minted in and the one right after it', () => {
+    // Minted at the very start of a window: the worst case for exposure,
+    // since it is live for the rest of THIS window plus all of the next.
+    const token = makeSpawnToken('room-a', SECRET, WINDOW_START);
+    expect(verifySpawnToken('room-a', token, SECRET, WINDOW_START)).toBe(true);
+    expect(verifySpawnToken('room-a', token, SECRET, WINDOW_START + SPAWN_TOKEN_WINDOW_MS)).toBe(true);
+  });
+
+  it('rejects a token from three windows ago: a leaked or logged token buys at most two windows', () => {
+    // MUTATION CHECK for the fix that gave the token an expiry at all:
+    // widening `verifySpawnToken`'s accepted range to the current window
+    // plus the two before it (instead of just one) makes this pass when it
+    // must not.
+    const token = makeSpawnToken('room-a', SECRET, WINDOW_START);
+    expect(verifySpawnToken('room-a', token, SECRET, WINDOW_START + 2 * SPAWN_TOKEN_WINDOW_MS)).toBe(false);
+    expect(verifySpawnToken('room-a', token, SECRET, WINDOW_START + 3 * SPAWN_TOKEN_WINDOW_MS)).toBe(false);
   });
 });
 

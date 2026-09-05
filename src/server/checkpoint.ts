@@ -121,6 +121,23 @@ export function decodeCheckpoint(raw: Uint8Array | string | null | undefined): s
   return Buffer.from(raw).toString('utf8');
 }
 
+/** Who a checkpoint write claims to be, so Redis itself can refuse the write of an ex-owner. See `writeCheckpoint`. */
+export interface CheckpointOwnerCheck {
+  /** The lease key guarding this room. */
+  leaseKey: string;
+  /** This writer's own lease owner id, exactly the value it passed to `acquireLease`. */
+  owner: string;
+}
+
+// The owner-checked write, same shape and same reasoning as `RENEW_SCRIPT` in
+// `core/lease.ts`: the check and the write have to happen inside Redis or
+// they are not one decision. KEYS[1] is the state key being written, KEYS[2]
+// the lease key being tested; ARGV is the body, the owner id, and the TTL.
+// Replies with the `SET`'s own 'OK' when the write landed and Lua nil (JS
+// null) when this caller no longer holds the lease.
+const OWNER_CHECKED_SET_SCRIPT =
+  "if redis.call('get', KEYS[2]) == ARGV[2] then return redis.call('set', KEYS[1], ARGV[1], 'EX', ARGV[3]) else return nil end";
+
 /**
  * Writes a checkpoint with its TTL riding the SAME `SET` call. This is not an
  * optimisation, it is the only place the TTL is allowed to live: the TTL
@@ -129,15 +146,48 @@ export function decodeCheckpoint(raw: Uint8Array | string | null | undefined): s
  * checkpoint refreshes it), and there is no separate `EXPIRE` call anywhere
  * that a future edit could forget to keep in sync with this one. Do not add
  * one beside it.
+ *
+ * `ownerCheck` MAKES THE WRITE OWNER-CHECKED, AND A TICKER SHOULD ALWAYS PASS
+ * IT. Without it this is a plain `SET` that the caller gates on its own local
+ * "do I still own the lease" flag, and that flag lags reality by up to a renew
+ * period: an ex-owner whose lease was taken while its last renew was in flight
+ * still believes it owns the room and overwrites the SUCCESSOR's fresher
+ * checkpoint with the state it had when it stopped being the authority.
+ * Measured on a real Redis at three such overwrites inside 1.5 seconds. The
+ * lease is already an owner-checked compare-and-set for renew and release; a
+ * checkpoint is the other write that can destroy a successor's room, so it
+ * gets the same treatment.
+ *
+ * Returns the raw reply: `'OK'` when the write landed, `null` when the owner
+ * check refused it. A refusal is not an error, it is Redis reporting that the
+ * lease has moved on, so callers should treat it as a lost lease rather than
+ * as a failed write.
  */
 export async function writeCheckpoint(
   redis: RedisLike,
   key: string,
   json: string,
-  ttlS: number = STATE_TTL_S
+  ttlS: number = STATE_TTL_S,
+  ownerCheck?: CheckpointOwnerCheck
 ): Promise<unknown> {
   const body = await encodeCheckpoint(json);
-  return redis.set(key, body, 'EX', ttlS);
+  if (ownerCheck === undefined) {
+    return redis.set(key, body, 'EX', ttlS);
+  }
+  // `body` may be gzip BYTES while `RedisLike.eval` types its arguments
+  // `string | number`, which is what every other script in this library
+  // sends. The cast is about that declared surface only: Lua arguments are
+  // binary-safe and ioredis passes a Buffer through verbatim, which is the
+  // same thing the plain `SET` above already relies on.
+  return redis.eval(
+    OWNER_CHECKED_SET_SCRIPT,
+    2,
+    key,
+    ownerCheck.leaseKey,
+    body as unknown as string,
+    ownerCheck.owner,
+    ttlS
+  );
 }
 
 /**

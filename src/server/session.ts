@@ -29,7 +29,7 @@ export interface TokenClaims {
 export interface SessionAuthOptions {
   secret: string;
   /** How long a minted token stays redeemable. Defaults to 12 hours. */
-  maxAgeS?: number;
+  maxAgeS?: number | undefined;
 }
 
 const DEFAULT_MAX_AGE_S = 12 * 60 * 60;
@@ -177,9 +177,21 @@ export function verifyToken(
 }
 
 /**
- * A spawn token authorizes ONE server-to-server call: the relay asking the
- * platform to start a ticker for a specific room. It is never seen by a
- * client and never rides a URL a browser could bookmark or replay.
+ * How long a spawn token stays redeemable: the current window plus the one
+ * before it, so `SPAWN_TOKEN_WINDOW_MS * 2` is the absolute worst-case
+ * lifetime of a token minted at the very start of a window.
+ */
+export const SPAWN_TOKEN_WINDOW_MS = 5 * 60 * 1000;
+
+/**
+ * A spawn token is a room-bound, TIME-WINDOWED capability, not a one-shot.
+ * It is deterministic within its window: `makeSpawnToken` returns the exact
+ * same bytes for the same room for the whole `SPAWN_TOKEN_WINDOW_MS`, and it
+ * rides the relay's outbound spawn request as a `?k=` query parameter, which
+ * platform access logs persist well past the request itself. Anything that
+ * has ever seen that value, not only the intended recipient, can replay it
+ * until the window lapses. Calling it "fresh" would be wrong: freshness is
+ * exactly the property a deterministic, log-visible token does not have.
  *
  * WHY THIS EXISTS AT ALL: an unauthenticated ticker-spawn endpoint means one
  * anonymous request buys a multi-minute authoritative simulation loop plus
@@ -191,13 +203,36 @@ export function verifyToken(
  * WHY IT IS BOUND TO THE ROOM ID: without that binding, a token good for
  * spawning ANY room's ticker would let a single leaked or replayed token
  * spin up tickers in every room in the deployment; binding it to one room id
- * means stealing this token buys, at most, one already-legitimate spawn.
+ * confines a leak to the one room whose token leaked, for as long as the
+ * token remains valid.
+ *
+ * WHY IT IS ALSO BOUND TO A TIME WINDOW: a room-bound token with no time
+ * component is a capability with no expiry, sitting in a query string a
+ * platform's access logs keep indefinitely. `makeSpawnToken` signs
+ * `roomId:window`, where `window` is `now` truncated to
+ * `SPAWN_TOKEN_WINDOW_MS`-wide buckets, and `verifySpawnToken` accepts the
+ * current window and the one immediately before it, so a token minted right
+ * at the edge of a window is not refused a moment later. That bounds a
+ * captured token's useful life to at most two windows (ten minutes at the
+ * default) instead of forever.
  */
-export function makeSpawnToken(roomId: string, secret: string): string {
-  return sign(roomId, secret);
+export function makeSpawnToken(roomId: string, secret: string, nowMs: number = Date.now()): string {
+  const window = Math.floor(nowMs / SPAWN_TOKEN_WINDOW_MS);
+  return sign(`${roomId}:${window}`, secret);
 }
 
-export function verifySpawnToken(roomId: string, token: string | null, secret: string): boolean {
+export function verifySpawnToken(
+  roomId: string,
+  token: string | null,
+  secret: string,
+  nowMs: number = Date.now()
+): boolean {
   if (!token) return false;
-  return constantTimeEqualStrings(token, sign(roomId, secret));
+  const currentWindow = Math.floor(nowMs / SPAWN_TOKEN_WINDOW_MS);
+  // Current window, then the one before it. Never more than that: widening
+  // this is exactly what turns a bounded leak back into an unbounded one.
+  for (const window of [currentWindow, currentWindow - 1]) {
+    if (constantTimeEqualStrings(token, sign(`${roomId}:${window}`, secret))) return true;
+  }
+  return false;
 }

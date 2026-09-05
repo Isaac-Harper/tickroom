@@ -11,6 +11,27 @@
  */
 export const PLAYOUT_MAX_AHEAD = 40;
 
+/**
+ * What `push` did with a record, so a caller can tell the outcomes apart
+ * instead of inferring them from a rising starve count.
+ *
+ * - `'kept'`: buffered for the tick it was stamped for.
+ * - `'late'`: its tick had already been consumed, so it was re-stamped forward
+ *   and buffered anyway (never-drop-late).
+ * - `'stale'`: late, and a fresher record already held the slot it would have
+ *   been re-stamped onto. Nothing landed and nothing was lost, which is what a
+ *   redundancy window's re-sends do on a HEALTHY link.
+ * - `'refused'`: further than `maxAhead` from the consumed floor, so it was
+ *   dropped outright. The only one of the four that means a record is gone.
+ *
+ * `'stale'` IS DELIBERATELY NOT `'refused'`, and the distinction is the whole
+ * point of reporting at all: most of a healthy redundancy window lands on the
+ * stale path by design, so folding the two together would report a
+ * permanently sick sender for a permanently healthy one. That is the same trap
+ * `lateCount` was already moved out of.
+ */
+export type PushResult = 'kept' | 'late' | 'stale' | 'refused';
+
 interface Entry<T> {
   item: T;
   /** The tick this entry was ORIGINALLY pushed for, before any re-stamping. See NEVER-DROP-LATE below. */
@@ -46,9 +67,16 @@ interface Entry<T> {
  * ORIGINAL tick, not by arrival order: if slot `lastConsumedTick + 1` already
  * holds an entry whose `orig` is >= this push's tick, that entry is the one
  * that was always closer to being on time and it must not be clobbered by a
- * straggler that is arriving even later. `lateCount` tracks how often this
- * path fires, as a health signal: a healthy connection should almost never
- * need it.
+ * straggler that is arriving even later. `lateCount` counts only the
+ * re-stamps that actually LAND in that slot, i.e. a record the buffer had
+ * never received on time; a re-stamp that loses the freshness check above
+ * costs nothing, because an input redundancy window's whole point is to
+ * re-send a tick the buffer already has, and those re-sends taking this same
+ * late path (their original tick has, by design, already passed) must not
+ * read as a health problem. A healthy connection therefore reports zero here
+ * even while its redundancy window is constantly re-sending old ticks; a
+ * rising count means an on-time copy is genuinely missing and only a stale
+ * re-send is filling the gap.
  */
 export class PlayoutBuffer<T> {
   private readonly entries = new Map<number, Entry<T>>();
@@ -66,8 +94,30 @@ export class PlayoutBuffer<T> {
   /** Starts at -1 (no tick has been asked for yet), never at 0: tick 0 is a real, consumable tick and must not be treated as already-passed. */
   lastConsumedTick = -1;
 
-  /** How many pushes were re-stamped forward because their original tick had already passed. A rising count under a healthy round-trip time is the first sign of a starving or badly jittered link. */
+  /**
+   * How many re-stamped pushes actually LANDED in their re-stamped slot,
+   * carrying information the buffer had never received on time. Counted
+   * strictly AFTER the freshness check in `push`, not before: a redundancy
+   * window re-sends ticks the buffer already has, those re-sends take the
+   * same late path (their original tick has already passed by design) but
+   * lose the freshness check to whatever is already sitting in the slot, and
+   * a re-send that loses that check must not count here or this stops being
+   * a health signal at all on a perfectly healthy, zero-loss link. A rising
+   * count under a healthy round-trip time is the first sign of a starving or
+   * badly jittered link.
+   */
   lateCount = 0;
+
+  /**
+   * How many pushes were REFUSED for sitting further than `maxAhead` from the
+   * consumed floor. Distinct from `lateCount` in both direction and cause: a
+   * late push arrived after its tick and is applied anyway, where a refused
+   * one is discarded entirely because the sender's lead is larger than this
+   * buffer is configured to hold. A rising count is a CONFIGURATION fault
+   * rather than a network one, which is exactly why it needed a name: the only
+   * symptom before was starves climbing with nothing anywhere saying why.
+   */
+  refusedCount = 0;
 
   constructor(maxAhead: number = PLAYOUT_MAX_AHEAD) {
     this.maxAhead = maxAhead;
@@ -78,7 +128,7 @@ export class PlayoutBuffer<T> {
    * has already passed. See the class comment for the re-stamping and
    * eviction rules.
    */
-  push(tick: number, item: T): void {
+  push(tick: number, item: T): PushResult {
     // THE AHEAD BOUND IS RELATIVE, SO IT NEEDS SOMETHING REAL TO BE RELATIVE
     // TO. `lastConsumedTick` starts at -1 meaning "nothing has been asked for
     // yet", NOT "the consumer is sitting at tick -1". Measuring the bound
@@ -111,34 +161,56 @@ export class PlayoutBuffer<T> {
 
     let target = tick;
     if (target <= this.lastConsumedTick) {
-      this.lateCount += 1;
       target = this.lastConsumedTick + 1;
       const existing = this.entries.get(target);
       if (existing !== undefined && existing.orig >= tick) {
         // The slot already holds something that was always going to be due
         // no later than this push. Do not let a later straggler overwrite a
         // fresher entry just because it happened to be re-stamped onto the
-        // same slot.
-        return;
+        // same slot, and do not count it as late either: nothing landed, so
+        // nothing changed about what the buffer holds.
+        return 'stale';
       }
+      // Only counted once the push actually lands. Landing here first and
+      // counting after is what keeps a redundancy window's constant re-sends
+      // of already-consumed ticks from inflating this on an otherwise
+      // healthy link: see the class comment and the field doc above.
+      this.lateCount += 1;
+      this.entries.set(target, { item, orig: tick });
+      return 'late';
     } else if (target - this.aheadBase > this.maxAhead || this.aheadBase - target > this.maxAhead) {
       // Far enough from the reference that buffering it risks unbounded
       // growth from a misbehaving or clock-skewed sender. Drop rather than
       // evict something else to make room: an item this far out is not worth
       // protecting at another's expense.
       //
-      // The BELOW-the-reference half can only ever fire before the first
-      // consume: once one has happened `aheadBase` is the floor, and
-      // anything at or below the floor took the late branch above instead.
-      // It is what keeps the admissible window finite in both directions
-      // while no consumer position exists, so "this buffer holds O(maxAhead)
-      // slots" is true from construction rather than only from the first
-      // consume. Without it a sender walking its stamps DOWNWARD before the
-      // first consume would be admitted without limit, and the stamp comes
-      // off the wire.
-      return;
+      // THE BELOW-THE-REFERENCE HALF IS REACHABLE ONLY BEFORE THE FIRST
+      // CONSUME, AND IS DEAD CODE AFTER IT. Precisely: it can fire only when a
+      // push lands more than `maxAhead` BELOW the provisional reference an
+      // earlier push installed, and only while `aheadBase` is still that
+      // provisional value. The first `consume` replaces it with
+      // `lastConsumedTick`, from which point anything at or below the floor
+      // takes the late branch above and can never reach this test at all.
+      //
+      // IT IS KEPT BECAUSE IT IS THE ONLY MEMORY BOUND IN THAT WINDOW. Without
+      // it a sender walking its stamps DOWNWARD before the first consume is
+      // admitted without limit, and the stamps come off the wire; with it,
+      // "this buffer holds O(maxAhead) slots" is true from construction rather
+      // than only from the first consume. So it is a live bound with a narrow
+      // reachable window, not an unreachable branch to tidy away: the room in
+      // which it fires is a buffer that has been pushed to and not yet
+      // consumed from, which is every buffer's first tick.
+      //
+      // AND THE CALLER IS NOW TOLD, which it was not: this returned void, so a
+      // sender whose entire window sat past the bound was refused in complete
+      // silence. The only symptom was starves climbing with nothing naming the
+      // cause, on the one failure whose fix is a configuration change rather
+      // than a network one.
+      this.refusedCount += 1;
+      return 'refused';
     }
     this.entries.set(target, { item, orig: tick });
+    return 'kept';
   }
 
   /**
@@ -191,6 +263,7 @@ export class PlayoutBuffer<T> {
     // a consumer position that no longer exists.
     this.aheadBase = null;
     this.lateCount = 0;
+    this.refusedCount = 0;
   }
 
   private pruneAtOrBelow(tick: number): void {

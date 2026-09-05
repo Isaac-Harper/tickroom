@@ -70,6 +70,25 @@ export interface RedisLike {
   hincrby(key: string, field: string, n: number): Promise<number>;
 
   /**
+   * Optional connection-lifecycle events (`'reconnecting'`, `'ready'`,
+   * `'error'`), which ioredis exposes and a fake need not. The ticker uses it,
+   * when present, to treat the bus as suspect after a reconnect and confirm
+   * ownership with an awaited renew before publishing again; without it that
+   * confirmation waits for the ordinary renew cadence.
+   */
+  on?: ((event: string, cb: (...args: unknown[]) => void) => unknown) | undefined;
+
+  /**
+   * Removes a listener `on` added. Optional for the same reason `on` is, and
+   * load-bearing for the same reason every other teardown in this library is:
+   * the shared command client is a PROCESS SINGLETON that outlives any one
+   * `runTicker`, so a listener left behind retains that run's entire closure
+   * scope (its state, its buffers, its maps) for the lifetime of the process,
+   * and a host running many rooms in one instance accumulates one per run.
+   */
+  off?: ((event: string, cb: (...args: unknown[]) => void) => unknown) | undefined;
+
+  /**
    * Batches several commands into one round trip. Typed `any` deliberately:
    * ioredis's own pipeline typing is a chained builder whose return type
    * depends on which methods were called on it in what order, which is not

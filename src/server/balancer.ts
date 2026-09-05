@@ -16,11 +16,28 @@ export interface BalancerOptions {
   redis: RedisLike;
   base: string;
   maxPlayers: number;
-  maxRooms?: number;
-  namespace?: string;
-  /** The room that just rejected this client (a full-room bounce), so a re-assign never lands back on it. Honoured only when it genuinely names an instance of `base`; see the implementation note. */
-  exclude?: string | null;
-  log?: Logger;
+  maxRooms?: number | undefined;
+  namespace?: string | undefined;
+  /**
+   * The room or rooms that just rejected this client (a full-room bounce), so
+   * a re-assign never lands back on one. Honoured only for entries that
+   * genuinely name an instance of `base`; see the implementation note.
+   *
+   * A LIST, NOT ONE ID, and the single-string form is kept because it is the
+   * same thing with one entry (byte-identical behaviour, so no caller has to
+   * change). One id was not enough for the case this option exists for. The
+   * balancer reads `stats`, which has a 5s TTL and is written once a second,
+   * while the TICKER enforces capacity authoritatively and publishes
+   * `room-reject`; the two can disagree for a whole window. With one slot, a
+   * client bounced from `lobby` is sent to `lobby~1`, bounced from there, and
+   * then sent back to `lobby` because the only exclusion it could carry was
+   * the second one. It ping-pongs between two rooms until its bounded
+   * re-assign budget is gone and the player is told the game is full while
+   * seats are free. Accumulating the refusals is what turns that into a walk
+   * DOWN the pool.
+   */
+  exclude?: string | string[] | null | undefined;
+  log?: Logger | undefined;
 }
 
 export interface BalancerResult {
@@ -28,7 +45,7 @@ export interface BalancerResult {
   base: string;
   index: number;
   /** Present and `true` only when every instance up to `maxRooms` is at capacity. */
-  full?: boolean;
+  full?: boolean | undefined;
 }
 
 const defaultLog: Logger = (ev) => {
@@ -54,14 +71,23 @@ export async function assignRoom(opts: BalancerOptions): Promise<BalancerResult>
   const { redis, base, maxPlayers, namespace, exclude, log = defaultLog } = opts;
   const maxRooms = opts.maxRooms ?? MAX_ROOMS_PER_BASE;
 
-  // Honour `exclude` only when it parses as an instance of THIS base. A
-  // junk value, or a room id belonging to some other base entirely, must
+  // Honour `exclude` only for entries that parse as an instance of THIS base.
+  // A junk value, or a room id belonging to some other base entirely, must
   // never let an untrusted input exclude a key it has no business naming.
-  let excludedIndex: number | null = null;
-  if (exclude) {
-    const parsed = parseRoomId(exclude);
+  //
+  // ONE BAD ENTRY MUST NOT DISCARD THE GOOD ONES, which is the property the
+  // list form adds and the reason this filters per entry rather than
+  // validating the list as a unit. The value reaches here from a client that
+  // has been bounced at least once, so a stale id from a previous session, an
+  // id for a base the host has since renamed, or a forged one is ORDINARY
+  // rather than exceptional; refusing the whole list over any of them would
+  // send the client straight back to the rooms it was just refused from,
+  // which is the failure the option exists to prevent.
+  const excludedIndices = new Set<number>();
+  for (const candidate of typeof exclude === 'string' ? [exclude] : (exclude ?? [])) {
+    const parsed = parseRoomId(candidate);
     if (parsed !== null && parsed.base === base) {
-      excludedIndex = parsed.index;
+      excludedIndices.add(parsed.index);
     }
   }
 
@@ -97,20 +123,21 @@ export async function assignRoom(opts: BalancerOptions): Promise<BalancerResult>
     // reports `full` just because we could not measure capacity, including
     // in the degenerate case where the excluded room is the ONLY candidate
     // (`maxRooms === 1`, or every other instance also happens to be
-    // excluded, which cannot happen today since only one id is ever
-    // excluded but is guarded here rather than assumed). There we have
+    // excluded, which USED to be unreachable when only one id could ever be
+    // excluded and is now an ordinary outcome of a client that has walked the
+    // whole pool). There we have
     // nothing else to offer, so we hand back the excluded room anyway:
     // worse than being bounced once more, but strictly better than a
     // manufactured "full" result that was never actually measured, which
     // would tell the caller something false about the room's capacity.
     for (let i = 0; i < maxRooms; i++) {
-      if (i !== excludedIndex) return { room: roomIdFor(base, i), base, index: i };
+      if (!excludedIndices.has(i)) return { room: roomIdFor(base, i), base, index: i };
     }
     return { room: roomIdFor(base, 0), base, index: 0 };
   }
 
   for (let i = 0; i < maxRooms; i++) {
-    if (i === excludedIndex) continue;
+    if (excludedIndices.has(i)) continue;
     const raw = statsRaw[i];
     let players = 0;
     if (raw !== null && raw !== undefined) {
@@ -147,7 +174,7 @@ export async function assignRoom(opts: BalancerOptions): Promise<BalancerResult>
   // `full` is honest on this path in a way it would not have been on index 0:
   // every index returned here WAS measured and WAS at capacity.
   for (let i = 0; i < maxRooms; i++) {
-    if (i !== excludedIndex) return { room: roomIdFor(base, i), base, index: i, full: true };
+    if (!excludedIndices.has(i)) return { room: roomIdFor(base, i), base, index: i, full: true };
   }
   // Degenerate case, same as above: the excluded room is the only room there
   // is, so it is the only thing left to offer.

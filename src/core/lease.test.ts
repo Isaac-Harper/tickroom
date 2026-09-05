@@ -42,17 +42,27 @@ class FakeRedis implements Partial<RedisLike> {
   // Interprets the two Lua scripts this module actually uses, so the fake
   // stays a faithful stand-in for "compare owner, then act" without
   // depending on a real Lua interpreter.
+  //
+  // AND THE OWNER CHECK IS THE SCRIPT'S, NOT THIS FAKE'S. Applied
+  // unconditionally, the fake enforced a rule whether or not the Lua it was
+  // handed contained one, so deleting the `get(KEYS[1]) == ARGV[1]` comparison
+  // from either script left every case below green over a lease that no longer
+  // compared anything: the three cases that exist to pin exactly that
+  // comparison were vacuous, and only the real-Redis suite (which skips
+  // without a server) could tell. The clause is detected instead, and a script
+  // without it performs the unconditional write a real Redis would run.
   async eval(script: string, _numKeys: number, ...args: (string | number)[]): Promise<unknown> {
     const [key, owner, ttl] = args as [string, string, number | undefined];
     const current = this.store.get(key as string);
-    if (script.includes('redis.call(\'set\'')) {
-      if (current !== owner) return null;
+    const ownerChecked = script.includes("redis.call('get', KEYS[1]) == ARGV[1]");
+    if (script.includes("redis.call('set'")) {
+      if (ownerChecked && current !== owner) return null;
       this.store.set(key as string, owner);
       void ttl;
       return 'OK';
     }
-    if (script.includes('redis.call(\'del\'')) {
-      if (current !== owner) return 0;
+    if (script.includes("redis.call('del'")) {
+      if (ownerChecked && current !== owner) return 0;
       this.store.delete(key as string);
       return 1;
     }
@@ -101,6 +111,20 @@ describe('tickerShouldExit', () => {
       { maxTickerMs: 500 }
     );
     expect(exited).toBe(true);
+  });
+
+  it('exactly at the bound exits', () => {
+    // BOTH BOUNDS ARE `>=`, AND A `>` LOOKS EXACTLY AS RIGHT. The cases above
+    // pass `+ 1` and `- 1`, so neither of them can tell the two apart, and the
+    // bound is the one place the difference is observable at all. It is not a
+    // taste question either way round: `maxTickerMs` is chosen to leave the
+    // ticker room to finish its tick, write its final checkpoint and release
+    // the lease before the PLATFORM's own hard kill, so an exit deferred to
+    // the next iteration is spent out of that margin.
+    expect(tickerShouldExit({ now: MAX_TICKER_MS, startedAt: 0, emptySince: null })).toBe(true);
+    expect(tickerShouldExit({ now: MAX_TICKER_MS - 1, startedAt: 0, emptySince: null })).toBe(false);
+    expect(tickerShouldExit({ now: EMPTY_GRACE_MS, startedAt: 0, emptySince: 0 })).toBe(true);
+    expect(tickerShouldExit({ now: EMPTY_GRACE_MS - 1, startedAt: 0, emptySince: 0 })).toBe(false);
   });
 });
 
@@ -234,6 +258,36 @@ describe('acquireLease / renewLease / releaseLease against a fake Redis', () => 
     await acquireLease(redis, 'lease:x', 'owner-b');
     await releaseLease(redis, 'lease:x', 'owner-a'); // stale owner, must no-op
     expect(await acquireLease(redis, 'lease:x', 'owner-c')).toBe(false); // owner-b still holds it
+  });
+
+  it('RENEW_SCRIPT and RELEASE_SCRIPT each compare KEYS[1] against ARGV[1] before writing', async () => {
+    // BELT AND BRACES OVER THE FAKE. The three cases above go through an
+    // in-memory stand-in, and a stand-in can only report the semantics it was
+    // handed: it now reads the comparison out of the script text rather than
+    // applying one of its own, which is what makes those cases fail when the
+    // comparison goes. This asserts on the shipped Lua directly, so the
+    // guarantee does not rest on any fake being faithful. The scripts are not
+    // exported (they are an implementation detail of these three functions),
+    // so they are read off the wire the way Redis would see them.
+    const scripts: string[] = [];
+    const recorder = {
+      async eval(script: string): Promise<unknown> {
+        scripts.push(script);
+        return null;
+      },
+    } as unknown as RedisLike;
+
+    await renewLease(recorder, 'lease:x', 'owner-a');
+    await releaseLease(recorder, 'lease:x', 'owner-a');
+
+    expect(scripts).toHaveLength(2);
+    for (const script of scripts) {
+      expect(script).toContain("redis.call('get', KEYS[1]) == ARGV[1]");
+    }
+    // ...and each one still does its own job, so a script that compares and
+    // then writes the wrong thing is not read as a pass.
+    expect(scripts[0]).toContain("redis.call('set', KEYS[1], ARGV[1], 'PX', ARGV[2])");
+    expect(scripts[1]).toContain("redis.call('del', KEYS[1])");
   });
 });
 

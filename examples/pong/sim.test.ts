@@ -7,10 +7,16 @@
 // deserialize throws on garbage) so a change that quietly breaks one of them
 // fails here instead of only in production, where a checkpoint that silently
 // drops half a room looks exactly like a healthy one until the next handoff.
+//
+// IT ALSO PROVES THE CLAIM THE STAMPED PATH IS MADE OF: that a client running
+// `stepPaddleY` on the ticks it stamped and the server running the simulation
+// on those same stamped ticks land on the same y, tick for tick. That claim is
+// the reason client.ts predicts anything at all, and a comment asserting it is
+// worth nothing next to a test that runs both ends.
 
 import { describe, it, expect } from 'vitest';
 import type { ClientInput } from '../../src/core/index.js';
-import { pongRuntime, FIELD_W, FIELD_H, type PongState, type PongEvent } from './sim.js';
+import { pongRuntime, stepPaddleY, FIELD_W, FIELD_H, type PongState, type PongEvent } from './sim.js';
 
 const DT = 1 / pongRuntime.tickHz;
 
@@ -150,6 +156,139 @@ describe('pong: checkpoint round-trip', () => {
     // Non-vacuous: proves the PRNG was actually exercised again after the
     // restore, not just that two idle balls happened to coast in parallel.
     expect(originalGoalTicks.length).toBeGreaterThan(0);
+  });
+
+  it('the playout depth is deliberately dropped by the checkpoint, and the room round-trips and keeps simulating identically without it', () => {
+    const original = freshTwoPlayerRoom();
+    pongRuntime.onBufferHealth!(original, 'a', 5);
+    pongRuntime.onBufferHealth!(original, 'b', 2);
+    for (let i = 0; i < 20; i++) {
+      pongRuntime.applyInput(original, 'a', input(i, { dir: dirForTick(i, 0) }));
+      pongRuntime.applyInput(original, 'b', input(i, { dir: dirForTick(i, 1.7) }));
+      stepTick(original);
+    }
+
+    const restored = pongRuntime.deserialize(pongRuntime.serialize(original));
+
+    // NOT A DROPPED FIELD, A DELIBERATELY EXCLUDED ONE, and the difference is
+    // the reason this assertion is written as an empty Map rather than as an
+    // equality with the original. The depth describes the playout buffer of
+    // the ticker that is exiting, measured against a client whose stamping
+    // lead is about to be re-anchored across the handoff; carrying it over
+    // would hand the successor a reading about a buffer that no longer exists.
+    expect(restored.depth).toBeInstanceOf(Map);
+    expect(restored.depth.size).toBe(0);
+
+    // And the exclusion has to be invisible to the simulation itself: if any
+    // tick path ever read `depth`, the two rooms would part ways here.
+    for (let i = 20; i < 70; i++) {
+      for (const s of [original, restored]) {
+        pongRuntime.applyInput(s, 'a', input(i, { dir: dirForTick(i, 0) }));
+        pongRuntime.applyInput(s, 'b', input(i, { dir: dirForTick(i, 1.7) }));
+        stepTick(s);
+      }
+    }
+    expect(JSON.parse(pongRuntime.serialize(restored))).toEqual(JSON.parse(pongRuntime.serialize(original)));
+  });
+});
+
+describe('pong: a stamped input runs identically on both ends', () => {
+  /** The differential test, and the whole point of `targetTick`. The CLIENT
+   *  half is `stepPaddleY` on a bare number, exactly as `client.ts` runs it on
+   *  its own copy of its own paddle. The SERVER half is the runtime, applying
+   *  the record stamped for tick T on tick T, which is what `usesPlayout` and
+   *  the ticker's playout buffer arrange. Nothing is shared between the two
+   *  branches except that function, which is the point: a second copy of the
+   *  step rule in the client would pass a test that compared it to itself. */
+  it('a client stepping its own paddle lands on the identical y as the server, on every tick, not just at the end', () => {
+    const server = freshTwoPlayerRoom();
+    let clientY = server.paddles.get('a')!.y;
+    const clientTrace: number[] = [];
+    const serverTrace: number[] = [];
+
+    for (let t = 1; t <= 60; t++) {
+      const dir = dirForTick(t, 0);
+
+      // Client: applies its own record on its own tick t, the instant it is
+      // stamped, with no round trip in it.
+      clientY = stepPaddleY(clientY, dir, DT);
+      clientTrace.push(clientY);
+
+      // Server: the same record, applied on the same tick t. The second
+      // player is driven too, so this is not a one-paddle special case.
+      pongRuntime.applyInput(server, 'a', input(t, { dir }));
+      pongRuntime.applyInput(server, 'b', input(t, { dir: dirForTick(t, 1.7) }));
+      stepTick(server);
+      serverTrace.push(server.paddles.get('a')!.y);
+    }
+
+    // EXACT, not close. Both ends ran the identical function on the identical
+    // numbers, so a tolerance here would hide the exact class of divergence
+    // this test exists to catch: a client that got the rule nearly right.
+    expect(serverTrace).toEqual(clientTrace);
+    // Non-vacuous: a paddle that never moved matches trivially.
+    expect(new Set(clientTrace).size).toBeGreaterThan(1);
+    expect(clientY).not.toBe(FIELD_H / 2);
+  });
+
+  it('the same records applied on ARRIVAL instead of on the tick they name diverge from the client, which is what stamping buys', () => {
+    const stamped = freshTwoPlayerRoom();
+    const onArrival = freshTwoPlayerRoom();
+    let clientY = FIELD_H / 2;
+    const clientTrace: number[] = [];
+    const stampedTrace: number[] = [];
+    const arrivalTrace: number[] = [];
+    // One tick of delivery jitter, which is ordinary on any real link and is
+    // exactly what the playout buffer absorbs: the record shows up a tick
+    // after the one it was stamped for.
+    let inFlight = 0;
+
+    for (let t = 1; t <= 60; t++) {
+      const dir = dirForTick(t, 0);
+      clientY = stepPaddleY(clientY, dir, DT);
+      clientTrace.push(clientY);
+
+      pongRuntime.applyInput(stamped, 'a', input(t, { dir }));
+      stepTick(stamped);
+      stampedTrace.push(stamped.paddles.get('a')!.y);
+
+      pongRuntime.applyInput(onArrival, 'a', input(t, { dir: inFlight }));
+      inFlight = dir;
+      stepTick(onArrival);
+      arrivalTrace.push(onArrival.paddles.get('a')!.y);
+    }
+
+    expect(stampedTrace).toEqual(clientTrace);
+    // The unstamped room is a whole tick of paddle travel out for most of the
+    // run. That is invisible on a cursor and it is a mispredicted paddle here,
+    // which is the per-runtime decision examples/README.md describes.
+    expect(arrivalTrace).not.toEqual(clientTrace);
+  });
+});
+
+describe('pong: the server-depth feedback loop', () => {
+  it('onBufferHealth stores a depth per pid and encodeSnapshot puts it on the wire per paddle', () => {
+    const s = freshTwoPlayerRoom();
+    pongRuntime.onBufferHealth!(s, 'a', 4);
+    pongRuntime.onBufferHealth!(s, 'b', 0);
+
+    const snap = JSON.parse(pongRuntime.encodeSnapshot(s, 1_700_000_000_000) as string) as {
+      paddles: { pid: string; inputLead: number }[];
+    };
+    expect(snap.paddles.find((p) => p.pid === 'a')!.inputLead).toBe(4);
+    // ZERO IS A READING, not a missing field: it is what a client whose lead
+    // has been trimmed all the way down looks like, and the client's own
+    // `decodeSnapshot` has to be able to hand it back rather than treat it as
+    // absent. A player the hook has never fired for reads 0 as well, which is
+    // the honest default: no buffer means no depth.
+    expect(snap.paddles.find((p) => p.pid === 'b')!.inputLead).toBe(0);
+  });
+
+  it('leave drops the departed player depth, so the map cannot outlive the room players', () => {
+    const s = freshTwoPlayerRoom();
+    pongRuntime.onBufferHealth!(s, 'a', 3);
+    pongRuntime.leave(s, 'a');
+    expect(s.depth.has('a')).toBe(false);
   });
 });
 

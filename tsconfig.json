@@ -6,6 +6,12 @@
     "moduleResolution": "bundler",
     "strict": true,
     "noUncheckedIndexedAccess": false,
+    // ON because a stock `tsc --init` turns it on, so consumers compile under
+    // it whether they chose it or not. It forces this library's own optional
+    // fields to be declared `?: T | undefined`, which is what a consumer's
+    // spread or explicit `undefined` needs: the README quickstart did not
+    // compile under the default tsconfig of the ecosystem it ships into.
+    "exactOptionalPropertyTypes": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,

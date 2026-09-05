@@ -17,3 +17,4 @@ export * from './starvation.js';
 export * from './backpressure.js';
 export * from './rateLimit.js';
 export * from './metrics.js';
+export * from './wire.js';

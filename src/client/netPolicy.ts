@@ -97,13 +97,37 @@ export function stallDecision(s: StallInputs): StallDecision {
   return { stalled, silentMs, thresholdMs };
 }
 
+/** How far the client's own counter may sit from where it wants to be before a re-anchor is worth the visible correction. Two ticks: below that the playout buffer's own never-drop-late re-stamp already absorbs the difference invisibly, so correcting it would trade nothing for a snap. */
+export const REANCHOR_TOLERANCE_TICKS = 2;
+
+/** Minimum wall time between two rate-limited re-anchors, ms. The tolerance path fires on an error of two ticks, which ordinary clock noise reaches often; without a floor on the interval a client sitting near the boundary would snap several times a second. The runaway-ahead path is deliberately NOT rate limited, because that one is unbounded and gets worse while it waits. */
+export const REANCHOR_MIN_INTERVAL_MS = 2000;
+
 export interface ReanchorInputs {
   /** Has the client tick ever been anchored to a server tick estimate this epoch? */
   anchored: boolean;
   /** Has the client tick counter been initialised at all (has advance() ever run)? */
   initialized: boolean;
   clientTick: number;
-  serverTick: number;
+  /** Where the counter WANTS to be: the estimated server tick plus the connection's measured round trip, its configured input lead and any server-depth feedback. Not the raw server tick estimate, which the counter is supposed to lead. */
+  desiredTick: number;
+  /** The clock this decision is being made against. Passed in, never read internally, so the function stays pure. */
+  now: number;
+  /**
+   * Local-clock timestamp of the previous anchor, or `Number.NEGATIVE_INFINITY`
+   * when there has been none this epoch (or when the caller has deliberately
+   * dropped the rate limit). Paces the tolerance path only.
+   *
+   * NOT 0 FOR "NONE YET", which is the same sentinel-as-a-coordinate trap
+   * `PlayoutBuffer.aheadBase` exists for. `now` is a `performance.now()`
+   * reading, so 0 is a REAL timestamp roughly two seconds before the earliest
+   * moment a connection can have anchored at all: a client that connects
+   * inside the first `REANCHOR_MIN_INTERVAL_MS` of a page's life would read
+   * "never anchored" as "anchored two seconds ago" and refuse to correct.
+   */
+  lastReanchorAt: number;
+  /** Is the caller's server-clock estimate currently mid-STEP, i.e. running the escape hatch that decides whether its offset belongs to a timeline that no longer exists? Suppresses the tolerance path only. */
+  clockStepping: boolean;
 }
 
 /**
@@ -115,15 +139,44 @@ export interface ReanchorInputs {
  * input it sends targets a tick the server has not reached yet and never
  * will in time, which starves the server-side playout buffer forever.
  *
- * DIRECTIONAL ON PURPOSE: this only fires when the client is AHEAD. Running
- * BEHIND is an ordinary latency spike or a still-converging clock estimate,
- * and the playout buffer already absorbs that without a jump (a late input
- * is re-stamped forward onto the first free tick rather than dropped, see
- * `PlayoutBuffer`'s never-drop-late rule). Re-anchoring on a behind-schedule
- * client would trade a harmless, invisible re-stamp for a visible corrective
- * snap, which is strictly worse.
+ * IT USED TO FIRE ON THE AHEAD SIDE ONLY, AND THAT WAS MEASURED WRONG IN BOTH
+ * DIRECTIONS. The reasoning was that running behind is an ordinary latency
+ * spike the playout buffer absorbs with a never-drop-late re-stamp, so
+ * correcting it would trade an invisible re-stamp for a visible snap. True of
+ * a spike; false of everything that leaves the counter behind PERMANENTLY. A
+ * routine 300 to 600ms handoff gap leaves the lead inflated by 6 to 12 ticks
+ * with nothing to correct it, so every input applies hundreds of milliseconds
+ * later than it needed to for the rest of the epoch; and a frame longer than
+ * the render loop's own dt cap (a backgrounded tab) drops the missing time
+ * outright, measured at 591 ticks behind fifteen seconds after a 30 second
+ * background. So the predicate is now two-sided:
+ *
+ * - MORE THAN half `PLAYOUT_MAX_AHEAD` AHEAD fires immediately, unchanged.
+ *   That error is unbounded and every input sent while it stands is wasted.
+ * - `REANCHOR_TOLERANCE_TICKS` or more of error in EITHER direction fires at
+ *   most once per `REANCHOR_MIN_INTERVAL_MS`, and NOT AT ALL while
+ *   `clockStepping`. The rate limit is what keeps the two-sided rule from
+ *   turning ordinary clock noise into a stream of corrections, and it is why
+ *   the tolerance can be as tight as two ticks.
+ *
+ * THE `clockStepping` GATE IS THE SAME LESSON AS THE INTERPOLATOR'S
+ * SUSPENDED TIME PRUNE. `desiredTick` is computed from a server-clock
+ * estimate, and while the caller's step escape is deciding whether that
+ * estimate belongs to a timeline that still exists, the estimate is precisely
+ * what the caller has stopped believing: acting on it corrects the counter by
+ * the size of the clock step, and then the re-seed corrects it straight back.
+ * Measured on a handoff onto a successor whose clock ran 600ms ahead: two
+ * opposite 12-tick snaps roughly two seconds apart, where suppressing the
+ * tolerance path for the ~650ms the escape needs produces none at all,
+ * because no real error ever accumulated. The unbounded-ahead rule is
+ * deliberately NOT gated: that one is a fact about the counter rather than
+ * about the clock, it gets worse while it waits, and a clock step cannot
+ * manufacture half of `PLAYOUT_MAX_AHEAD` on its own.
  */
 export function shouldReanchor(s: ReanchorInputs): boolean {
   if (!s.anchored || !s.initialized) return false;
-  return s.clientTick - s.serverTick > PLAYOUT_MAX_AHEAD / 2;
+  const error = s.clientTick - s.desiredTick;
+  if (error > PLAYOUT_MAX_AHEAD / 2) return true;
+  if (s.clockStepping) return false;
+  return Math.abs(error) >= REANCHOR_TOLERANCE_TICKS && s.now - s.lastReanchorAt >= REANCHOR_MIN_INTERVAL_MS;
 }

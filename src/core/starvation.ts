@@ -45,39 +45,55 @@ const STARVE_DECAY_FACTOR = 0.5;
 
 export interface StarveDecayOptions {
   /** Consecutive starves before decay begins. The first starve or two are assumed to be ordinary jitter, not a real gap. */
-  decayAfter?: number;
+  decayAfter?: number | undefined;
   /** Multiplier applied per starved tick once decay has begun. */
-  factor?: number;
+  factor?: number | undefined;
   /** Below this magnitude the value snaps straight to 0 rather than asymptotically approaching it forever. */
-  epsilon?: number;
+  epsilon?: number | undefined;
 }
 
 export interface StarveResult {
+  /** Echoed back exactly as passed in. This function does not increment it: see the docstring below for why owning that counter here was the bug. */
   streak: number;
   value: number;
 }
 
 /**
- * `streak` is the CONSECUTIVE starve count including this one (call with the
- * count BEFORE this starve; it returns the count and value AFTER). From the
- * `decayAfter`-th consecutive starve, `value` is multiplied by `factor` each
- * additional tick and snapped to exactly 0 once it falls under `epsilon`,
- * because an exponential decay never truly reaches zero and a held input
- * that asymptotically approaches neutral forever never actually lets the
- * simulation settle into an idle state.
+ * `streak` is the CONSECUTIVE starve count INCLUDING this one, taken exactly
+ * as `StarveTracker.onStarve` (or a host's own equivalent count) delivers
+ * it: 1 on the first consecutive starve, 2 on the second, and so on. This
+ * function does NOT increment it. It used to: the old signature took the
+ * count BEFORE this starve and bumped it internally, which reads as a
+ * convenience and is actually a trap, because the seam that hands this
+ * function a streak is `runtime.onStarve(state, pid, streak)` on the ticker
+ * side, and THAT streak is already the count AFTER, 1 on the first starve.
+ * The natural, unsurprising wiring `decayOnStarve(consecutiveStarves, held)`
+ * therefore fed an after-count into a function expecting a before-count, so
+ * it silently added one more starve than actually happened and halved the
+ * held value on the very FIRST starve, when the module's whole contract
+ * (see the file header) is repeat once, decay from the second. Only the
+ * in-tree test knew to compensate by passing `streak - 1`. Taking the streak
+ * as-delivered removes the seam's only footgun: whatever a host's own
+ * `onStarve` counter reports is exactly what this function wants, with no
+ * adjustment at the call site.
+ *
+ * From the `decayAfter`-th consecutive starve onward, `value` is multiplied
+ * by `factor` each additional tick and snapped to exactly 0 once it falls
+ * under `epsilon`, because an exponential decay never truly reaches zero and
+ * a held input that asymptotically approaches neutral forever never actually
+ * lets the simulation settle into an idle state.
  */
 export function decayOnStarve(streak: number, value: number, opts?: StarveDecayOptions): StarveResult {
   const decayAfter = opts?.decayAfter ?? STARVE_DECAY_AFTER;
   const factor = opts?.factor ?? STARVE_DECAY_FACTOR;
   const epsilon = opts?.epsilon ?? STARVE_DECAY_EPS;
 
-  const nextStreak = streak + 1;
-  if (nextStreak < decayAfter) {
-    return { streak: nextStreak, value };
+  if (streak < decayAfter) {
+    return { streak, value };
   }
   const decayed = value * factor;
   const snapped = Math.abs(decayed) < epsilon ? 0 : decayed;
-  return { streak: nextStreak, value: snapped };
+  return { streak, value: snapped };
 }
 
 /**

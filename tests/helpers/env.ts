@@ -22,15 +22,15 @@ export const TEST_REDIS_URL = process.env.TICKROOM_TEST_REDIS_URL ?? 'redis://12
  *
  * Skipping is correct on a laptop: `npx vitest run` has to stay green with no
  * services, which is the whole reason the probe exists. It is exactly wrong in
- * CI, where the job's ENTIRE purpose is to run these six files against the
+ * CI, where the job's ENTIRE purpose is to run these twelve files against the
  * Redis service container. A misnamed service, a wrong port, a container that
  * failed its healthcheck, or a typo in `TICKROOM_TEST_REDIS_URL` would all
  * produce a green integration job that asserted nothing at all, and a gate that
  * cannot fail is worse than no gate.
  *
  * The check lives inside `probeRedisAvailable` rather than in each test file on
- * purpose: all six files funnel through this one function, so a seventh added
- * later inherits the guard instead of having to remember to opt in.
+ * purpose: all twelve files funnel through this one function, so a thirteenth
+ * added later inherits the guard instead of having to remember to opt in.
  */
 const REQUIRE_REDIS = process.env.TICKROOM_REQUIRE_REDIS === '1';
 

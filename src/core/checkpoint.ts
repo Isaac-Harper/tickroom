@@ -116,6 +116,19 @@ export function inspectCheckpoint(json: string | null): CheckpointInspection {
   if (candidate.geom !== undefined && typeof candidate.geom !== 'string') {
     return { ok: false, reason: 'malformed', foundVersion: candidate.v };
   }
+  // `gridAt` IS OPTIONAL AND ITS ABSENCE MOVES NO VERSION. The rule this file
+  // states elsewhere is that a wire change bumps the version when it changes
+  // MEANING, not merely SHAPE, and an ADDITIVE OPTIONAL field changes neither
+  // for a reader that does not know about it: every field an older build reads
+  // still means exactly what it meant, and a newer build reading an older
+  // envelope simply finds the field absent and falls back to the behaviour it
+  // already had. Bumping here would be strictly worse than not bumping, since
+  // the bump itself is what wipes every live room in the fleet. The type check
+  // is still exact, because a `gridAt` that is present and not a number would
+  // propagate into grid arithmetic.
+  if (candidate.gridAt !== undefined && typeof candidate.gridAt !== 'number') {
+    return { ok: false, reason: 'malformed', foundVersion: candidate.v };
+  }
   return {
     ok: true,
     envelope: {
@@ -123,6 +136,7 @@ export function inspectCheckpoint(json: string | null): CheckpointInspection {
       tick: candidate.tick,
       graceUntilTick: candidate.graceUntilTick,
       geom: candidate.geom,
+      gridAt: candidate.gridAt,
       incarnation: candidate.incarnation,
       body: candidate.body,
     },

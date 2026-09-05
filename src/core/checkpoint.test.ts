@@ -52,6 +52,49 @@ describe('packCheckpoint / unpackCheckpoint', () => {
   });
 });
 
+// `gridAt` carries the SCHEDULED GRID TIME of the tick a checkpoint describes,
+// so a successor continues its predecessor's timeline instead of restarting it
+// at its own clock. See `CheckpointEnvelope.gridAt` for what the restart costs
+// a client, and `server/ticker.ts` for the one-tick window that decides
+// whether continuing is safe.
+describe('gridAt is optional and additive, so it moves no version', () => {
+  it('round-trips when present', () => {
+    const env = envelope({ gridAt: 1_700_000_000_123 });
+    expect(unpackCheckpoint(packCheckpoint(env))?.gridAt).toBe(1_700_000_000_123);
+  });
+
+  it('an envelope written before the field existed still restores, with gridAt undefined', () => {
+    // THE WHOLE REASON THE FIELD IS OPTIONAL. A build that adds a field and
+    // bumps the version wipes every live room in the fleet on deploy; an
+    // additive optional field changes the SHAPE and not the MEANING of
+    // anything an older reader looks at, so both directions keep working and
+    // the bump would be strictly worse than not bumping.
+    const older = JSON.stringify({
+      v: CHECKPOINT_VERSION,
+      tick: 42,
+      graceUntilTick: 0,
+      incarnation: 'inc',
+      body: '{}',
+    });
+    const restored = unpackCheckpoint(older);
+    expect(restored).not.toBeNull();
+    expect(restored?.tick).toBe(42);
+    expect(restored?.gridAt).toBeUndefined();
+  });
+
+  it('a present-but-not-a-number gridAt is malformed, not silently carried', () => {
+    // It would otherwise propagate straight into the successor's grid
+    // arithmetic, where a NaN makes every comparison false and the window
+    // check silently stops meaning anything.
+    const bad = JSON.stringify({ ...envelope(), gridAt: 'soon' });
+    expect(inspectCheckpoint(bad)).toEqual({ ok: false, reason: 'malformed', foundVersion: CHECKPOINT_VERSION });
+  });
+
+  it('adding it did not move CHECKPOINT_VERSION', () => {
+    expect(CHECKPOINT_VERSION).toBe(1);
+  });
+});
+
 describe('the version check, which used to be documented and not performed', () => {
   // THE FAILURE THIS PREVENTS IS THE GEOMETRY-DIGEST ONE, REACHED THROUGH A
   // DIFFERENT DOOR. A checkpoint whose `v` this build does not implement is

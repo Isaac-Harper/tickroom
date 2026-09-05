@@ -134,6 +134,58 @@ d('checkpoint / real Redis', () => {
     expect(back).toBeNull();
   });
 
+  // THE OWNER-CHECKED WRITE IS A LUA SCRIPT, AND A FAKE CANNOT PROVE A SCRIPT
+  // RUNS. `testFakeRedis` recognises this one by a substring of its text and
+  // then re-implements its semantics in TypeScript, so every unit test of it
+  // is really a test of that re-implementation: whether the script itself
+  // parses, whether `KEYS[2]` is the key it thinks it is, and whether a Buffer
+  // argument survives Lua intact are questions only a real server answers.
+  it('the owner-checked write lands, byte for byte, while this writer holds the lease', async () => {
+    const key = `${namespace}:oc-state`;
+    const leaseKey = `${namespace}:oc-lease`;
+    await raw.set(leaseKey, 'me', 'PX', 30_000);
+    const body = realisticPayload();
+
+    const reply = await writeCheckpoint(redis, key, body, STATE_TTL_S, { leaseKey, owner: 'me' });
+    expect(reply).toBe('OK');
+    // Through the SCRIPT rather than through `SET`, so the gzip bytes cross a
+    // different boundary: a Lua argument that was not binary-safe would
+    // destroy them exactly the way a plain `get` destroys a read.
+    expect(await readCheckpoint(redis, key)).toBe(body);
+    // And the TTL rides it, as it does on the unconditional form.
+    const ttl = await raw.ttl(key);
+    expect(ttl).toBeGreaterThan(0);
+    expect(ttl).toBeLessThanOrEqual(STATE_TTL_S);
+  });
+
+  it('THE SPLIT-BRAIN CASE: an ex-owner\u0027s write is refused and the successor\u0027s state is untouched', async () => {
+    const key = `${namespace}:oc-moved`;
+    const leaseKey = `${namespace}:oc-moved-lease`;
+    await raw.set(leaseKey, 'the-successor', 'PX', 30_000);
+
+    const successorState = realisticPayload();
+    expect(await writeCheckpoint(redis, key, successorState, STATE_TTL_S, { leaseKey, owner: 'the-successor' })).toBe(
+      'OK'
+    );
+
+    // The predecessor, whose lease was taken while its last renew was in
+    // flight, still believes it owns the room. Measured against a real Redis
+    // before the check existed: three such overwrites inside 1.5 seconds.
+    const stale = JSON.stringify({ tick: 1, players: [] });
+    const reply = await writeCheckpoint(redis, key, stale, STATE_TTL_S, { leaseKey, owner: 'the-predecessor' });
+
+    expect(reply).toBeNull();
+    expect(await readCheckpoint(redis, key)).toBe(successorState);
+  });
+
+  it('is refused when nobody holds the lease at all', async () => {
+    const key = `${namespace}:oc-absent`;
+    const leaseKey = `${namespace}:oc-absent-lease`;
+    const reply = await writeCheckpoint(redis, key, realisticPayload(), STATE_TTL_S, { leaseKey, owner: 'me' });
+    expect(reply).toBeNull();
+    expect(await readCheckpoint(redis, key)).toBeNull();
+  });
+
   it('MEASURED: compression ratio on a realistic payload', async () => {
     const body = realisticPayload();
     const raw_bytes = Buffer.byteLength(body, 'utf8');

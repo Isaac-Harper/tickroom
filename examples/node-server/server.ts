@@ -20,17 +20,18 @@
 // every few minutes instead of every few weeks, which is a much better way to
 // find out whether your handoff actually works.
 //
-// Run:
-//   REDIS_URL=redis://localhost:6379 SESSION_SECRET=dev npx tsx examples/node-server/server.ts
+// Run (see README.md beside this file for the environment knobs, the session
+// endpoint, the socket URL shape and a headless client to point at it):
+//   REDIS_URL=redis://127.0.0.1:6399 SESSION_SECRET=dev PORT=3100 npm run example:node
 
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { WebSocketServer, type WebSocket } from 'ws';
 import Redis from 'ioredis';
 
-import { roomKeys } from '../../src/core/index.js';
+import { MAX_TICKER_MS, roomKeys } from '../../src/core/index.js';
 import type { ClientInput, RedisLike, RoomRuntime } from '../../src/core/index.js';
-import { attachRelay, checkAdmission, runTicker, makeToken, verifyToken } from '../../src/server/index.js';
+import { admitSocket, runTicker, makeToken, verifyToken } from '../../src/server/index.js';
 import { pongRuntime } from '../pong/sim.js';
 import { cursorsRuntime } from '../cursors/sim.js';
 
@@ -38,6 +39,26 @@ const PORT = Number(process.env.PORT ?? 3100);
 const REDIS_URL = process.env.REDIS_URL ?? 'redis://localhost:6379';
 const SECRET = process.env.SESSION_SECRET ?? 'dev-secret-do-not-ship';
 const MAX_PLAYERS = 20;
+
+// THE THREE KNOBS THAT MAKE THE TWO HANDOFFS WATCHABLE ON A LAPTOP, and the
+// only reason they are environment variables rather than constants: on the
+// defaults this example demonstrates neither. The ticker's own lifetime cap is
+// 700 seconds and the relay has no cap at all, so an hour of staring at this
+// process shows you a room that simply keeps ticking. That is the correct
+// PRODUCTION default and a useless development one, which is exactly the shape
+// an env knob is for. See README.md beside this file for the two recipes.
+//
+// All three default to today's behaviour, so an unset environment changes
+// nothing.
+
+/** The ticker's own duration cap, i.e. how often the PLANNED handoff runs. Default `MAX_TICKER_MS` (700s), the same number a serverless ticker gets. Set it to 8000 and a handoff happens every eight seconds. */
+const TICKER_MAX_RUN_MS = Number(process.env.TICKER_MAX_RUN_MS ?? MAX_TICKER_MS);
+/** Passed to the SUCCESSOR's `runTicker` as `standbyMs` when the spawn that asked for it carried `{ standby: true }`. Zero (the default) is `runTicker`'s own historical behaviour: fail the acquire, return 'busy'. Must comfortably exceed `standbyLeadMs` (3000) plus the incumbent's own exit; see `standbyMs`'s doc comment. */
+const STANDBY_MS = Number(process.env.STANDBY_MS ?? 0);
+/** The relay's own lifetime cap, i.e. how often the WARM SWAP runs. Unset (the default) means no cap, which is right for a process nothing kills on a schedule. Set it to 15000 and every socket announces `relay-expiring` and is swapped every fifteen seconds. There is NO FLOOR here: `MIN_RELAY_LIFETIME_MS` (11000) is checked by the Vercel route on a lifetime it DERIVES from `maxDurationS`, and this file passes an explicit one straight through, so a number under two expiry leads is yours to avoid. */
+const RELAY_LIFETIME_MS = process.env.RELAY_LIFETIME_MS ? Number(process.env.RELAY_LIFETIME_MS) : undefined;
+/** How often the per-socket abuse counters below are flushed to the log. NEVER per event: see the comment on `onBadInput`. */
+const COUNTER_FLUSH_MS = 10_000;
 
 // A host that serves several different simulations does not, and cannot, know
 // which state type it is holding at the dispatch point: the room name only
@@ -73,7 +94,22 @@ const newSubscriber = () => new Redis(REDIS_URL) as never;
 // ---------------------------------------------------------------------------
 
 async function keepTicking(room: RoomName): Promise<void> {
+  // What the NEXT iteration runs as. `runTicker` calls `spawnSuccessor` twice
+  // over a healthy lifetime, and the flag it carries is the whole difference:
+  // `{ standby: true }` fires `standbyLeadMs` (3000) BEFORE the duration cap and
+  // names the designated successor, `{ standby: false }` fires from the exit
+  // `finally`. On serverless the first one is a second invocation that boots,
+  // pays its `init` and sits on the lease poll while the incumbent is still
+  // ticking. In THIS process the loop below is the successor and it cannot start
+  // early, so what the flag buys here is the POLL rather than the head start:
+  // the next run waits `STANDBY_MS` for the lease instead of returning 'busy'
+  // the moment it finds the predecessor still unwinding, and it pays its `init`
+  // in front of the acquire the way a real standby does. That is the same code
+  // path a serverless standby takes, which is the point of running it at all.
+  let standbyMs = 0;
+
   for (;;) {
+    let standbyAsked = false;
     const result = await runTicker({
       runtime: RUNTIMES[room],
       redis,
@@ -85,10 +121,18 @@ async function keepTicking(room: RoomName): Promise<void> {
       // simulation of a world the current build no longer has. See
       // docs/ARCHITECTURE.md section 3.
       geomKey: () => `${room}:v1`,
-      spawnSuccessor: async () => {
+      // Unset, this is `MAX_TICKER_MS` and the planned handoff happens once
+      // every 700 seconds, which is a correct production number and a useless
+      // one to watch. See `TICKER_MAX_RUN_MS`.
+      maxRunMs: TICKER_MAX_RUN_MS,
+      standbyMs,
+      spawnSuccessor: async (_id, opts) => {
         // On serverless this is an authenticated HTTP request to the ticker
-        // route. In-process, the loop below IS the successor, so there is
-        // nothing to spawn.
+        // route, carrying `standby=1` when `opts.standby` is set. In-process,
+        // the loop above IS the successor, so there is nothing to spawn: all
+        // this does is remember WHICH spawn it was, so the next iteration knows
+        // whether it is the designated standby.
+        if (opts.standby) standbyAsked = true;
       },
       onEvents: (events) => {
         for (const ev of events) console.log(`[${room}] event`, ev);
@@ -98,6 +142,11 @@ async function keepTicking(room: RoomName): Promise<void> {
 
     console.log(`[${room}] ticker exited: ${result.reason} after ${result.ticks} ticks`);
 
+    // The successor runs as a STANDBY only when the run that just ended asked
+    // for one, and only for that one run: an unasked-for poll would turn every
+    // ordinary 'busy' into a `STANDBY_MS` wait.
+    standbyMs = standbyAsked ? STANDBY_MS : 0;
+
     // 'busy' means another owner holds the lease, which in-process means a
     // previous loop has not finished unwinding. Back off rather than spinning.
     if (result.reason === 'busy') {
@@ -106,9 +155,13 @@ async function keepTicking(room: RoomName): Promise<void> {
     }
     // 'empty' means the room drained. Stop; the next joiner starts it again.
     if (result.reason === 'empty') return;
-    // 'duration' and 'lease-lost' both mean go again immediately. This is the
-    // handoff, and running it in a tight loop on a long-lived host is a cheap
-    // way to keep exercising the path serverless takes every few minutes.
+    // 'duration', 'input-dead' and 'lease-lost' all mean go again immediately.
+    // This is the handoff, and running it in a tight loop on a long-lived host
+    // is a cheap way to keep exercising the path serverless takes every few
+    // minutes. 'input-dead' belongs here rather than with an error backoff for
+    // one specific reason: the ticker's inbound subscriber is opened once per
+    // run, so a subscription that stopped delivering is repaired only by a
+    // fresh run opening a fresh one.
   }
 }
 
@@ -165,87 +218,106 @@ http.on('upgrade', (req, socket, head) => {
   }
 
   wss.handleUpgrade(req, socket, head, (ws: WebSocket) => {
+    // THE TWO ABUSE SIGNALS, COUNTED IN PROCESS AND FLUSHED ON A CADENCE THE
+    // CLIENT CANNOT DRIVE. Both hooks fire on a path whose rate a client owns
+    // (`onRateDrop` once per frame the token bucket rejects, `onBadInput` once
+    // per frame `decodeInput` throws on), so a `console.log` inside either one
+    // hands an abuser a log amplifier: the refused frame becomes more expensive
+    // than the accepted one, which is precisely the lever the rate limiter
+    // exists to take away. Counting is free; the flush below is once per socket
+    // per ten seconds no matter what arrives.
+    //
+    // WITHOUT THIS THE RELAY IS SILENT ON BOTH, BY DESIGN. The bucket drops the
+    // frame before `decodeInput` runs and a decoder that throws is swallowed, so
+    // the only symptom of a broken decoder is ONE PLAYER whose inputs stop while
+    // the room, the roster, the snapshots and every other player stay perfectly
+    // healthy. Nothing in a log, nothing in `RoomStats`, and the socket does not
+    // even close. Wire these two and it is one line every ten seconds instead.
+    const abuse = { bad: 0, dropped: 0 };
+    const flush = setInterval(() => {
+      if (abuse.bad === 0 && abuse.dropped === 0) return;
+      console.log(`[relay ${room}] warn relay.input-refused pid=${pid} badInput=${abuse.bad} rateDropped=${abuse.dropped}`);
+      abuse.bad = 0;
+      abuse.dropped = 0;
+    }, COUNTER_FLUSH_MS);
+    // `unref` so a socket's counter cannot hold the process open, and the close
+    // listener so a long-lived server does not accumulate one timer per socket
+    // it has ever served.
+    flush.unref();
+    ws.on('close', () => clearInterval(flush));
+
     void (async () => {
-      const admission = await checkAdmission({
-        redis,
-        roomId: room,
-        pid,
-        subject: String(claims.sub),
-        maxPlayers: MAX_PLAYERS,
-      });
-
-      if (!admission.admit) {
-        ws.send(JSON.stringify({ t: admission.reason === 'full' ? 'room-full' : 'conn-limit' }));
-        ws.close(admission.reason === 'full' ? 4002 : 4003);
-        return;
-      }
-
-      // The per-user socket cap fails OPEN on a Redis fault, which is right
-      // (refusing during a blip would lock users out of a healthy deployment)
-      // but it must never do so quietly: a degraded Redis disables the cap in
-      // exactly the conditions the cap is load-bearing, since every socket
-      // holds its own subscriber connection. See
-      // `AdmissionResult.socketCapEvaluated`.
-      if (!admission.socketCapEvaluated) {
-        console.log(
-          `[relay ${room}] warn relay.socket-cap-unevaluated admitted without applying maxSocketsPerSubject: the connection set could not be read`,
-        );
-      }
-
-      // CLAIM THE SLOT. `checkAdmission` is a QUERY and deliberately writes
-      // nothing, so that a REFUSED connection never has to be un-registered.
-      // That means registration is the caller's job, and skipping it does not
-      // fail loudly: the cap keeps passing because the set it counts is always
-      // empty, so `maxSocketsPerSubject` silently enforces nothing at all.
+      // ONE CALL FOR THE WHOLE ADMISSION PROTOCOL, and that is the part of this
+      // file worth copying. It used to be forty lines written out right here:
+      // check capacity, warn when the per-subject socket cap could not be
+      // evaluated, send the matching refusal frame, close with the matching
+      // code, ZADD the connection into the registry, re-score it on a timer so
+      // a live socket never prunes as stale, and ZREM it on close. Every one of
+      // those lines also existed in both adapters, including the close codes
+      // the CLIENT latches a terminal reconnect state off, so "the same
+      // protocol" was three copies free to drift with nothing in any gate able
+      // to see it. Worse, the registration half is the half that fails
+      // SILENTLY when it is left out: `checkAdmission` deliberately writes
+      // nothing, so a host that forgets to register counts an always-empty set
+      // and `maxSocketsPerSubject` enforces nothing at all while looking like
+      // it does. An example that hand-rolls this is an example teaching that
+      // mistake.
       //
-      // The periodic re-score is what makes it self-healing. A process killed
-      // without running cleanup leaves its member behind, and only a score that
-      // stops being refreshed lets the pruning pass age it out; without the
-      // touch, one hard kill costs that subject a slot permanently. Touch well
-      // inside `connStaleMs` (30s by default) so a live socket is never mistaken
-      // for an abandoned one.
-      const CONN_TOUCH_MS = 10_000;
-      const CONN_TTL_S = 60;
-      const touch = () => {
-        redis.zadd(admission.connKey, Date.now(), admission.connId).catch(() => {});
-        redis.expire(admission.connKey, CONN_TTL_S).catch(() => {});
-      };
-      touch();
-      const touchTimer = setInterval(touch, CONN_TOUCH_MS);
-
-      attachRelay({
+      // `admitSocket` returns null for a refused socket, already refused and
+      // closed; there is nothing further for a host to do about it.
+      await admitSocket({
         socket: ws as never,
         redis,
         createSubscriber: newSubscriber,
         roomId: room,
         pid,
-        joinMeta: { name: url.searchParams.get('n') ?? `player-${handle}` },
-        // JSON on the wire here for readability. Production uses the binary
-        // codec: this runs at the sim rate and is delivered once PER PLAYER, so
-        // it is the largest bandwidth line in the system. See src/codec/.
-        //
-        // `decodeInput`'s parameter is `unknown` (see its doc comment in
-        // `server/relay.ts`) because what actually arrives depends on the
-        // transport: this server runs on plain `ws`, which hands its
-        // `'message'` listener a `Buffer`, or an array of them for a
-        // fragmented message, never a browser-style `ArrayBuffer`. Normalise
-        // before decoding, exactly as any other host must.
-        decodeInput: (buf): ClientInput[] => {
-          const bytes = Array.isArray(buf) ? Buffer.concat(buf) : (buf as Buffer);
-          const parsed = JSON.parse(new TextDecoder().decode(bytes)) as ClientInput | ClientInput[];
-          return Array.isArray(parsed) ? parsed : [parsed];
-        },
-        spawnTicker: async (id) => {
-          if (isRoomName(id)) ensureTicker(id);
-        },
+        subject: claims.sub,
+        maxPlayers: MAX_PLAYERS,
+        // The cap-unevaluated warning goes here. It fails OPEN on a Redis
+        // fault, which is right (refusing during a blip would lock users out of
+        // a healthy deployment) but it must never do so quietly: a degraded
+        // Redis disables the cap in exactly the conditions the cap is
+        // load-bearing, since every socket holds its own subscriber connection.
         log: (e) => console.log(`[relay ${room}] ${e.lvl} ${e.kind} ${e.msg ?? ''}`),
-        // Free the slot immediately on a normal disconnect, so a player who
-        // closes one tab can open another at once instead of waiting out the
-        // staleness horizon. The periodic touch above is what covers the case
-        // where this never runs at all.
-        onClose: () => {
-          clearInterval(touchTimer);
-          redis.zrem(admission.connKey, admission.connId).catch(() => {});
+        // Everything a HOST owns about the relay itself rides this one bag, so
+        // an option added to `RelayOptions` later is reachable from here
+        // without this file changing.
+        relay: {
+          joinMeta: { name: url.searchParams.get('n') ?? `player-${handle}` },
+          // JSON on the wire here for readability. Production uses the binary
+          // codec: this runs at the sim rate and is delivered once PER PLAYER, so
+          // it is the largest bandwidth line in the system. See src/codec/.
+          //
+          // `decodeInput`'s parameter is `unknown` (see its doc comment in
+          // `server/relay.ts`) because what actually arrives depends on the
+          // transport: this server runs on plain `ws`, which hands its
+          // `'message'` listener a `Buffer`, or an array of them for a
+          // fragmented message, never a browser-style `ArrayBuffer`. Normalise
+          // before decoding, exactly as any other host must.
+          decodeInput: (buf): ClientInput[] => {
+            const bytes = Array.isArray(buf) ? Buffer.concat(buf) : (buf as Buffer);
+            const parsed = JSON.parse(new TextDecoder().decode(bytes)) as ClientInput | ClientInput[];
+            return Array.isArray(parsed) ? parsed : [parsed];
+          },
+          spawnTicker: async (id) => {
+            if (isRoomName(id)) ensureTicker(id);
+          },
+          log: (e) => console.log(`[relay ${room}] ${e.lvl} ${e.kind} ${e.msg ?? ''}`),
+          // COUNT, NEVER LOG. See the counters and their flush above the
+          // `admitSocket` call; these two lines are the entire wiring.
+          onBadInput: () => void (abuse.bad += 1),
+          onRateDrop: () => void (abuse.dropped += 1),
+          // NO `lifetimeMs` BY DEFAULT. On Vercel the relay route derives one
+          // from the function's own `maxDuration`, so a socket about to be
+          // killed by the platform announces `relay-expiring` first and the
+          // client swaps to a replacement with no visible gap. Nothing kills
+          // this process on a schedule, so there is no cap to announce and a
+          // socket lives as long as the client wants it to. `RELAY_LIFETIME_MS`
+          // is how you watch the swap happen anyway: it is passed straight
+          // through, with none of the route's `MIN_RELAY_LIFETIME_MS` floor,
+          // because that floor guards a lifetime the ROUTE derives by
+          // subtraction and this one is stated outright.
+          ...(RELAY_LIFETIME_MS === undefined ? {} : { lifetimeMs: RELAY_LIFETIME_MS }),
         },
       });
 
@@ -259,4 +331,10 @@ http.listen(PORT, () => {
   console.log(`rooms: ${Object.keys(RUNTIMES).join(', ')}`);
   console.log(`redis: ${REDIS_URL}`);
   console.log(`keys:  ${Object.values(roomKeys('pong')).join(' ')}`);
+  // Echo the three lifetimes back, because "nothing happened" and "the knob did
+  // not take" look identical from outside and the whole point of these is that
+  // you are waiting to watch something.
+  console.log(
+    `ticker maxRunMs=${TICKER_MAX_RUN_MS} standbyMs=${STANDBY_MS} | relay lifetimeMs=${RELAY_LIFETIME_MS ?? 'none'}`,
+  );
 });

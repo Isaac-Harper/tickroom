@@ -9,23 +9,31 @@ describe('decayOnStarve', () => {
     let value = 1;
     const trace: number[] = [value];
     for (let i = 0; i < 6; i++) {
+      // Mirrors the real seam: whatever hands this function a streak (a
+      // host's own StarveTracker, or the ticker's onStarve handoff) has
+      // already incremented it BEFORE calling. decayOnStarve itself does not.
+      streak += 1;
       const result = decayOnStarve(streak, value);
-      streak = result.streak;
       value = result.value;
       trace.push(value);
     }
     expect(trace).toEqual([1, 1, 0.5, 0.25, 0.125, 0.0625, 0]);
   });
 
-  it('increments streak every call regardless of whether decay has started', () => {
-    const r1 = decayOnStarve(0, 1);
+  it('echoes the streak back unchanged: incrementing it is the caller\'s job now, not this function\'s', () => {
+    // This is the shape of the bug F1 fixed: decayOnStarve used to bump the
+    // streak itself, which silently added a phantom starve on top of
+    // whatever a host's own counter already reported. Pinning the echo
+    // directly is what would catch a regression back to that behaviour.
+    const r1 = decayOnStarve(1, 1);
     expect(r1.streak).toBe(1);
-    const r2 = decayOnStarve(r1.streak, r1.value);
+    const r2 = decayOnStarve(2, r1.value);
     expect(r2.streak).toBe(2);
   });
 
   it('does not decay before decayAfter consecutive starves', () => {
-    const r = decayOnStarve(0, 42);
+    // streak=1 is the FIRST starve, delivered exactly as onStarve reports it.
+    const r = decayOnStarve(1, 42);
     expect(r.value).toBe(42);
   });
 
@@ -50,8 +58,8 @@ describe('decayOnStarve', () => {
   });
 
   it('honours a custom decayAfter', () => {
-    // decayAfter=1 means decay begins on the very first starve.
-    const r = decayOnStarve(0, 1, { decayAfter: 1 });
+    // decayAfter=1 means decay begins on the very first starve, streak=1.
+    const r = decayOnStarve(1, 1, { decayAfter: 1 });
     expect(r.value).toBe(0.5);
   });
 
@@ -118,12 +126,15 @@ describe('StarveTracker', () => {
   });
 
   it('a decayOnStarve loop driven by StarveTracker reproduces the same full-lock table', () => {
+    // The value straight through: StarveTracker.onStarve already returns the
+    // count AFTER this starve (1 on the first), which is exactly what
+    // decayOnStarve now wants, no `streak - 1` translation needed.
     const t = new StarveTracker();
     let value = 1;
     const trace: number[] = [value];
     for (let i = 0; i < 6; i++) {
       const streak = t.onStarve('car-1');
-      const result = decayOnStarve(streak - 1, value);
+      const result = decayOnStarve(streak, value);
       value = result.value;
       trace.push(value);
     }

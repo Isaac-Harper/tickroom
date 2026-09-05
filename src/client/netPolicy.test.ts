@@ -1,5 +1,14 @@
 import { describe, it, expect } from 'vitest';
-import { stallDecision, shouldReanchor, STALL_MS, STALL_COLD_MS, type StallInputs } from './netPolicy.js';
+import {
+  stallDecision,
+  shouldReanchor,
+  STALL_MS,
+  STALL_COLD_MS,
+  REANCHOR_TOLERANCE_TICKS,
+  REANCHOR_MIN_INTERVAL_MS,
+  type StallInputs,
+  type ReanchorInputs,
+} from './netPolicy.js';
 import { PLAYOUT_MAX_AHEAD } from '../core/index.js';
 
 // A connection attempt is considered "in progress" only once connectStartedAt
@@ -111,33 +120,116 @@ describe('stallDecision', () => {
 describe('shouldReanchor', () => {
   const half = PLAYOUT_MAX_AHEAD / 2;
 
+  // Every case anchors on a non-zero clock, because `lastReanchorAt` of 0 is
+  // "never anchored" and would make the rate limit vacuously satisfied in the
+  // one direction the tests most need to control.
+  const NOW = 1_000_000;
+  function inputs(over: Partial<ReanchorInputs> = {}): ReanchorInputs {
+    return {
+      anchored: true,
+      initialized: true,
+      clientTick: 0,
+      desiredTick: 0,
+      now: NOW,
+      lastReanchorAt: NOW - REANCHOR_MIN_INTERVAL_MS,
+      clockStepping: false,
+      ...over,
+    };
+  }
+
   it('does nothing before the first anchor', () => {
-    expect(shouldReanchor({ anchored: false, initialized: true, clientTick: 1000, serverTick: 0 })).toBe(false);
+    expect(shouldReanchor(inputs({ anchored: false, clientTick: 1000 }))).toBe(false);
   });
 
   it('does nothing before the counter is initialized', () => {
-    expect(shouldReanchor({ anchored: true, initialized: false, clientTick: 1000, serverTick: 0 })).toBe(false);
+    expect(shouldReanchor(inputs({ initialized: false, clientTick: 1000 }))).toBe(false);
   });
 
-  it('fires only on the AHEAD side: running behind by a large margin never re-anchors', () => {
-    const behind = shouldReanchor({ anchored: true, initialized: true, clientTick: 0, serverTick: 1000 });
-    expect(behind).toBe(false);
+  it('running far AHEAD fires immediately, without waiting out the rate limit', () => {
+    // The unbounded direction. Every input stamped while the counter runs this
+    // far ahead targets a tick the server will not reach in time, so waiting
+    // two seconds to correct it is two seconds of wasted input.
+    const justAnchored = inputs({ clientTick: half + 1, lastReanchorAt: NOW });
+    expect(shouldReanchor(justAnchored)).toBe(true);
   });
 
-  it('does not fire at exactly half PLAYOUT_MAX_AHEAD ahead, fires just past it', () => {
-    const atThreshold = shouldReanchor({ anchored: true, initialized: true, clientTick: half, serverTick: 0 });
-    expect(atThreshold).toBe(false);
+  it('does not fire at exactly half PLAYOUT_MAX_AHEAD ahead on the IMMEDIATE path, fires just past it', () => {
+    const atThreshold = inputs({ clientTick: half, lastReanchorAt: NOW });
+    expect(shouldReanchor(atThreshold)).toBe(false);
 
-    const pastThreshold = shouldReanchor({
-      anchored: true,
-      initialized: true,
-      clientTick: half + 1,
-      serverTick: 0,
-    });
-    expect(pastThreshold).toBe(true);
+    const pastThreshold = inputs({ clientTick: half + 1, lastReanchorAt: NOW });
+    expect(shouldReanchor(pastThreshold)).toBe(true);
   });
 
-  it('does not fire for a small, ordinary lead', () => {
-    expect(shouldReanchor({ anchored: true, initialized: true, clientTick: 4, serverTick: 0 })).toBe(false);
+  it('running BEHIND re-anchors, once per interval', () => {
+    // THIS CASE USED TO PIN THE OPPOSITE, and the opposite was measured wrong.
+    // The predicate fired on the ahead side only, on the reasoning that a
+    // behind-schedule client is an ordinary latency spike the playout buffer
+    // re-stamps away. That holds for a spike and for nothing else: a routine
+    // 300 to 600ms handoff leaves the lead inflated by 6 to 12 ticks with
+    // nothing to correct it, and a backgrounded tab comes back hundreds of
+    // ticks behind, both for the rest of the epoch.
+    const behind = inputs({ clientTick: 0, desiredTick: 1000 });
+    expect(shouldReanchor(behind)).toBe(true);
+
+    // ...and the rate limit is what makes the two-sided rule safe: the same
+    // error, a moment after a correction, waits.
+    const tooSoon = inputs({ clientTick: 0, desiredTick: 1000, lastReanchorAt: NOW - REANCHOR_MIN_INTERVAL_MS + 1 });
+    expect(shouldReanchor(tooSoon)).toBe(false);
+  });
+
+  it('a one-tick wobble never re-anchors, however long it has been since the last one', () => {
+    // The tolerance is what stops the two-sided rule from snapping on ordinary
+    // clock noise. One tick of error is under it in both directions, at any age.
+    const ahead = inputs({ clientTick: 1, lastReanchorAt: 0 });
+    const behind = inputs({ clientTick: 0, desiredTick: 1, lastReanchorAt: 0 });
+    expect(shouldReanchor(ahead)).toBe(false);
+    expect(shouldReanchor(behind)).toBe(false);
+  });
+
+  it('the tolerance path fires at exactly REANCHOR_TOLERANCE_TICKS, in both directions', () => {
+    const aheadJustUnder = inputs({ clientTick: REANCHOR_TOLERANCE_TICKS - 1 });
+    const aheadAt = inputs({ clientTick: REANCHOR_TOLERANCE_TICKS });
+    expect(shouldReanchor(aheadJustUnder)).toBe(false);
+    expect(shouldReanchor(aheadAt)).toBe(true);
+
+    const behindJustUnder = inputs({ desiredTick: REANCHOR_TOLERANCE_TICKS - 1 });
+    const behindAt = inputs({ desiredTick: REANCHOR_TOLERANCE_TICKS });
+    expect(shouldReanchor(behindJustUnder)).toBe(false);
+    expect(shouldReanchor(behindAt)).toBe(true);
+  });
+
+  it('a clock step in flight suppresses the tolerance path, and only the tolerance path', () => {
+    // `desiredTick` is computed from a server-clock estimate, and while the
+    // caller's step escape is deciding whether that estimate belongs to a
+    // timeline that still exists, the estimate is exactly what the caller has
+    // stopped believing. Measured on a handoff onto a successor 600ms ahead:
+    // acting on it snapped the counter 12 ticks one way and the re-seed
+    // snapped it 12 ticks back, for an error that was never real.
+    const stepping = inputs({ clientTick: 0, desiredTick: 12, clockStepping: true });
+    expect(shouldReanchor(stepping)).toBe(false);
+    expect(shouldReanchor({ ...stepping, clockStepping: false })).toBe(true);
+
+    // The unbounded-ahead rule is NOT gated: it is a fact about the counter
+    // rather than about the clock, it gets worse while it waits, and a clock
+    // step cannot manufacture half of PLAYOUT_MAX_AHEAD on its own.
+    expect(shouldReanchor(inputs({ clientTick: half + 1, clockStepping: true }))).toBe(true);
+  });
+
+  it('"no anchor yet" is NEGATIVE_INFINITY and not 0, because 0 is a real clock reading', () => {
+    // Same sentinel-as-a-coordinate trap as `PlayoutBuffer.aheadBase`. `now` is
+    // a `performance.now()` reading, so a client that connects inside the first
+    // REANCHOR_MIN_INTERVAL_MS of a page's life reads a 0 sentinel as "anchored
+    // two seconds ago" and refuses to correct for the whole of its first epoch.
+    const early = 300; // 300ms into the page's life
+    expect(shouldReanchor(inputs({ clientTick: 10, now: early, lastReanchorAt: Number.NEGATIVE_INFINITY }))).toBe(true);
+    expect(shouldReanchor(inputs({ clientTick: 10, now: early, lastReanchorAt: 0 }))).toBe(false);
+  });
+
+  it('the rate limit is measured from the LAST anchor, and clears at exactly REANCHOR_MIN_INTERVAL_MS', () => {
+    const justUnder = inputs({ clientTick: 10, lastReanchorAt: NOW - REANCHOR_MIN_INTERVAL_MS + 1 });
+    const at = inputs({ clientTick: 10, lastReanchorAt: NOW - REANCHOR_MIN_INTERVAL_MS });
+    expect(shouldReanchor(justUnder)).toBe(false);
+    expect(shouldReanchor(at)).toBe(true);
   });
 });

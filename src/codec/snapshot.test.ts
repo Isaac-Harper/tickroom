@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { ByteWriter, CodecError } from './bytes.js';
+import { ByteWriter, CodecError, ProtocolVersionError } from './bytes.js';
 import {
   DEFAULT_SNAPSHOT_VERSION,
   encodeDefaultSnapshot,
@@ -92,6 +92,155 @@ describe('default snapshot codec', () => {
   it('a buffer truncated right after the header throws', () => {
     const header = new ByteWriter().u8(1).u32(0).f64(0).u16(5).finish(); // claims 5 entities, has none
     expect(() => decodeDefaultSnapshot(header)).toThrow();
+  });
+});
+
+describe('decodeDefaultSnapshot checks the version FIRST, before any other field is read', () => {
+  it('throws ProtocolVersionError on a version mismatch, carrying expected/found on the instance', () => {
+    const buf = encodeDefaultSnapshot({
+      version: DEFAULT_SNAPSHOT_VERSION,
+      tick: 1,
+      serverTime: 0,
+      entities: [],
+    });
+    const mismatched = new Uint8Array(buf);
+    mismatched[0] = DEFAULT_SNAPSHOT_VERSION + 1;
+
+    expect(() => decodeDefaultSnapshot(mismatched)).toThrow(ProtocolVersionError);
+
+    let caught: unknown;
+    try {
+      decodeDefaultSnapshot(mismatched);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(CodecError);
+    expect((caught as ProtocolVersionError).name).toBe('ProtocolVersionError');
+    expect((caught as ProtocolVersionError).expected).toBe(DEFAULT_SNAPSHOT_VERSION);
+    expect((caught as ProtocolVersionError).found).toBe(DEFAULT_SNAPSHOT_VERSION + 1);
+  });
+
+  it('a version mismatch throws even when there is nothing else in the buffer to misread', () => {
+    // ONE byte on the wire, and it is the wrong version. A decoder that
+    // checked the version anywhere but first would have to read past it,
+    // hit the truncated buffer, and report THAT error instead of the version
+    // mismatch that is the one actually worth reporting.
+    const bogus = new Uint8Array([DEFAULT_SNAPSHOT_VERSION + 1]);
+    expect(() => decodeDefaultSnapshot(bogus)).toThrow(ProtocolVersionError);
+  });
+
+  it('the matching version still decodes normally', () => {
+    const buf = encodeDefaultSnapshot({
+      version: DEFAULT_SNAPSHOT_VERSION,
+      tick: 9,
+      serverTime: 0,
+      entities: [],
+    });
+    expect(() => decodeDefaultSnapshot(buf)).not.toThrow();
+  });
+});
+
+describe('encodeDefaultSnapshot refuses more entities or extra bytes than a u16 length field can carry', () => {
+  it('refuses more than 65535 entities rather than wrapping the entityCount header', () => {
+    // Measured: 65537 entities wrapped entityCount to 1 and the decoder
+    // returned a one-entity snapshot with the other 65536 silently dropped.
+    const entities = Array.from({ length: U16.max + 2 }, (_, i) => ({
+      id: i % (U16.max + 1),
+      x: 0,
+      y: 0,
+    }));
+    const snap: DefaultSnapshot = {
+      version: DEFAULT_SNAPSHOT_VERSION,
+      tick: 1,
+      serverTime: 0,
+      entities,
+    };
+    expect(() => encodeDefaultSnapshot(snap)).toThrow(CodecError);
+    // AND THE MESSAGE NAMES THE FIELD, which is the whole reason the check is
+    // up front: `ByteWriter.u16` already refuses to wrap `entityCount`, so
+    // asserting the TYPE alone is equally true with this check deleted, and a
+    // caller would be told "ByteWriter.u16: value must be an integer in
+    // 0..65535" from partway through an encode it cannot see.
+    expect(() => encodeDefaultSnapshot(snap)).toThrow(/entities/);
+  });
+
+  it('refuses an extra payload past 65535 bytes rather than wrapping the extraLength header', () => {
+    // Measured: a 70000-byte extra block wrote a wrapped u16 length (4464)
+    // and the decoder handed back 4464 bytes, silently dropping the rest.
+    const snap: DefaultSnapshot = {
+      version: DEFAULT_SNAPSHOT_VERSION,
+      tick: 1,
+      serverTime: 0,
+      entities: [],
+      extra: new Uint8Array(70000),
+    };
+    expect(() => encodeDefaultSnapshot(snap)).toThrow(CodecError);
+    // Same reasoning as the entity count above: the generic `ByteWriter.u16`
+    // message says nothing about `extra`, so naming the field is the only
+    // assertion that can tell the two checks apart.
+    expect(() => encodeDefaultSnapshot(snap)).toThrow(/extra/);
+  });
+
+  it('accepts exactly 65535 entities and exactly 65535 extra bytes, the boundary itself', () => {
+    // WITH 65535 REAL ENTITIES, not an empty list: this case named the entity
+    // bound and passed `entities: []`, so it asserted the extra-byte boundary
+    // twice and the entity boundary not at all. A refusal at the bound rather
+    // than past it is exactly the off-by-one this case exists to catch, and an
+    // empty list cannot see it.
+    const entities = Array.from({ length: U16.max }, (_, i) => ({ id: i, x: 0, y: 0 }));
+    const snap: DefaultSnapshot = {
+      version: DEFAULT_SNAPSHOT_VERSION,
+      tick: 1,
+      serverTime: 0,
+      entities,
+      extra: new Uint8Array(U16.max),
+    };
+    const back = decodeDefaultSnapshot(encodeDefaultSnapshot(snap));
+    expect(back.entities).toHaveLength(U16.max);
+    expect(back.entities[0].id).toBe(0);
+    expect(back.entities[U16.max - 1].id).toBe(U16.max - 1);
+    expect(back.extra).toHaveLength(U16.max);
+  });
+});
+
+describe('decodeDefaultSnapshot is a trust boundary: only CodecError (or its ProtocolVersionError subtype) ever escapes', () => {
+  it('every truncation length of a real, valid snapshot either decodes or throws CodecError, nothing else', () => {
+    const snap: DefaultSnapshot = {
+      version: DEFAULT_SNAPSHOT_VERSION,
+      tick: 42,
+      serverTime: 1_700_000_000_000,
+      entities: [
+        { id: 1, x: 1, y: 1, heading: 0.1, state: 1 },
+        { id: 2, x: 2, y: 2, heading: 0.2, state: 2 },
+      ],
+      extra: new Uint8Array([1, 2, 3, 4]),
+    };
+    const full = encodeDefaultSnapshot(snap);
+    for (let len = 0; len <= full.length; len++) {
+      const truncated = full.slice(0, len);
+      try {
+        decodeDefaultSnapshot(truncated);
+      } catch (err) {
+        expect(err).toBeInstanceOf(CodecError);
+      }
+    }
+  });
+
+  it('a fuzz of random bytes at random lengths never throws anything but CodecError', () => {
+    // Not a property-testing library, just a wide sweep over buffer shapes a
+    // hostile or simply broken peer could hand the decoder: this is the
+    // decoder's trust-boundary contract exercised directly rather than only
+    // asserted in a comment.
+    for (let trial = 0; trial < 500; trial++) {
+      const len = Math.floor(Math.random() * 64);
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) bytes[i] = Math.floor(Math.random() * 256);
+      try {
+        decodeDefaultSnapshot(bytes);
+      } catch (err) {
+        expect(err).toBeInstanceOf(CodecError);
+      }
+    }
   });
 });
 
@@ -265,6 +414,25 @@ describe('default input window codec', () => {
   it('decodeInputWindow returns [] for a header with no bytes at all', () => {
     expect(decodeInputWindow(new Uint8Array(0))).toEqual([]);
     expect(decodeInputWindow(new Uint8Array([1, 1]))).toEqual([]); // only 2 of the 3 header bytes
+  });
+
+  it('decodeInputWindow returns [] rather than throwing for a runtime value that is not an ArrayBuffer or a view over one', () => {
+    // `decodeInputWindow` is typed `ArrayBuffer | Uint8Array`, but a caller
+    // past a permissive boundary (an any-typed message bus, an unvalidated
+    // JSON.parse) can hand over anything at runtime. `new ByteReader` used to
+    // build a `DataView` straight from whatever it got, and `DataView`'s own
+    // constructor throws a bare, uncaught `TypeError` on a string, `null`, or
+    // an array of `Buffer`s (all measured), breaking this function's one
+    // promise: that a caller never needs a try/catch around it. Cast through
+    // `unknown` because the declared type does not admit these; that mismatch
+    // between what TypeScript promises and what can actually arrive at
+    // runtime is exactly the case this guard exists for.
+    expect(decodeInputWindow('not a buffer' as unknown as Uint8Array)).toEqual([]);
+    expect(decodeInputWindow(null as unknown as Uint8Array)).toEqual([]);
+    expect(decodeInputWindow(undefined as unknown as Uint8Array)).toEqual([]);
+    expect(decodeInputWindow([Buffer.from([1, 2, 3])] as unknown as Uint8Array)).toEqual([]);
+    expect(decodeInputWindow(42 as unknown as Uint8Array)).toEqual([]);
+    expect(decodeInputWindow({} as unknown as Uint8Array)).toEqual([]);
   });
 
   it('a crafted count:255 with no record bytes behind it does NOT allocate 255 records', () => {

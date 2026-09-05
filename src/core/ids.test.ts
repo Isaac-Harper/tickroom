@@ -16,6 +16,8 @@ describe('roomKeys', () => {
       stats: 'room:park:stats',
       meta: 'room:park:meta',
       metaout: 'room:park:metaout',
+      crashes: 'room:park:crashes',
+      timeline: 'room:park:timeline',
     });
   });
 

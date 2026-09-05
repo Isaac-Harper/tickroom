@@ -34,7 +34,53 @@ export class CodecError extends Error {
   }
 }
 
+/**
+ * A `CodecError` subtype for exactly one failure: the version byte on a wire
+ * frame does not match what the decoder reading it expects. Exported as its
+ * own class, not just a differently worded `CodecError`, because a caller
+ * recovering from protocol skew (a rolling deploy where an old client meets a
+ * new server, or the reverse) needs to tell "this frame is not what I speak"
+ * apart from every other reason a decode can fail (a truncated buffer, a
+ * corrupt length prefix), and `error.name === 'ProtocolVersionError'` is
+ * something a catch block can check without this codec having to export a
+ * distinct error CODE for every decoder it ships. `expected`/`found` are
+ * carried on the instance, not only baked into the message string, so a
+ * caller can log or branch on the actual numbers without parsing them back
+ * out of `error.message`.
+ */
+export class ProtocolVersionError extends CodecError {
+  readonly expected: number;
+  readonly found: number;
+
+  constructor(expected: number, found: number) {
+    super(`protocol version mismatch: expected ${expected}, got ${found}`);
+    this.name = 'ProtocolVersionError';
+    this.expected = expected;
+    this.found = found;
+  }
+}
+
 const DEFAULT_INITIAL_CAPACITY = 64;
+
+// WRAP, NEVER SILENT. `DataView`'s `setUintN`/`setIntN` truncate an
+// out-of-range value modulo the field width rather than refusing it: a `u8`
+// handed 300 stores 44, a `u32` handed -1 stores 4294967295, a `u16` handed
+// 259 (an OR'd-together button mask, say) stores 3. That is the exact
+// "teleports to the opposite side of the value space" failure `quantize.ts`
+// refuses for positions and angles, one layer down: a discrete field like a
+// state byte, a button mask, or a stamped input's `targetTick` has no nearby
+// value to CLAMP to the way a coordinate does (the same reasoning that makes
+// `CodecEntity.id` in `snapshot.ts` throw rather than clamp or wrap), so
+// every integer setter below checks its value is both an integer and inside
+// its field's range before it ever reaches `DataView`, and refuses the frame
+// with `CodecError` rather than silently writing a corrupted byte.
+function checkRange(v: number, min: number, max: number, method: string): void {
+  if (!Number.isInteger(v) || v < min || v > max) {
+    throw new CodecError(
+      `ByteWriter.${method}: value must be an integer in ${min}..${max}, got ${v}`
+    );
+  }
+}
 
 /**
  * A growable little-endian byte buffer. Every setter returns `this` so a
@@ -73,6 +119,7 @@ export class ByteWriter {
   }
 
   u8(v: number): this {
+    checkRange(v, 0, 255, 'u8');
     this.ensure(1);
     this.view.setUint8(this.len, v);
     this.len += 1;
@@ -80,6 +127,7 @@ export class ByteWriter {
   }
 
   i8(v: number): this {
+    checkRange(v, -128, 127, 'i8');
     this.ensure(1);
     this.view.setInt8(this.len, v);
     this.len += 1;
@@ -87,6 +135,7 @@ export class ByteWriter {
   }
 
   u16(v: number): this {
+    checkRange(v, 0, 65535, 'u16');
     this.ensure(2);
     this.view.setUint16(this.len, v, true);
     this.len += 2;
@@ -94,6 +143,7 @@ export class ByteWriter {
   }
 
   i16(v: number): this {
+    checkRange(v, -32768, 32767, 'i16');
     this.ensure(2);
     this.view.setInt16(this.len, v, true);
     this.len += 2;
@@ -101,6 +151,7 @@ export class ByteWriter {
   }
 
   u32(v: number): this {
+    checkRange(v, 0, 4294967295, 'u32');
     this.ensure(4);
     this.view.setUint32(this.len, v, true);
     this.len += 4;
@@ -108,6 +159,7 @@ export class ByteWriter {
   }
 
   i32(v: number): this {
+    checkRange(v, -2147483648, 2147483647, 'i32');
     this.ensure(4);
     this.view.setInt32(this.len, v, true);
     this.len += 4;

@@ -16,11 +16,28 @@ import {
 import { runTicker, assignRoom, readCheckpoint, type Subscriber } from '../src/server/index.js';
 import { createCounterRuntime } from './helpers/toyRuntime.js';
 import { TEST_REDIS_URL, probeRedisAvailable, newNamespace, flushNamespace, skipReason, waitFor } from './helpers/env.js';
+import { TOO_JITTERY, jitterSkipReason } from './helpers/jitter.js';
 
 const REDIS_AVAILABLE = await probeRedisAvailable();
 if (!REDIS_AVAILABLE) console.warn(`[tickroom integration: ticker] ${skipReason()}`);
 
+// THREE CASES BELOW COUNT WHAT A FIXED WALL-CLOCK WINDOW PRODUCED, and that
+// is a measurement of the host as much as of the loop: the rate case's band
+// is +-25% around 20Hz, and the two geometry cases run a 200Hz loop for a few
+// hundred milliseconds and then assert a FLOOR on the tick it reached, with a
+// CEILING on the fresh room's tick right underneath it. Those bounds
+// interlock (before > 30, after < 20), so widening the floor to survive a
+// loaded runner would collide with the ceiling and stop discriminating a
+// fresh start from a wrong restore, which is the whole point of the pair.
+// They keep the tight bar and skip loudly on a host too loaded to measure
+// them: see `helpers/jitter.ts`. Everything else in this file is either
+// polled to a condition or bounded generously enough to survive load, and
+// runs regardless.
+if (TOO_JITTERY) console.warn(jitterSkipReason('ticker'));
+
 const d = REDIS_AVAILABLE ? describe : describe.skip;
+/** For the wall-clock-count cases only. Redis reachability gates the whole file; this gates the cases the machine's own scheduling decides. */
+const itSteady = it.skipIf(TOO_JITTERY);
 
 d('ticker / real Redis', () => {
   const namespace = newNamespace('ticker');
@@ -54,7 +71,7 @@ d('ticker / real Redis', () => {
     return `room-${label}-${randomUUID().slice(0, 6)}`;
   }
 
-  it('ticks at roughly its configured rate over real wall time, and a real subscriber receives real published snapshots', async () => {
+  itSteady('ticks at roughly its configured rate over real wall time, and a real subscriber receives real published snapshots', async () => {
     const roomId = freshRoomId('rate');
     const keys = roomKeys(roomId, namespace);
     const tickHz = 20; // the game default this whole architecture was measured against
@@ -265,7 +282,7 @@ d('ticker / real Redis', () => {
     expect(handoffMs).toBeLessThan(3000);
   }, 15_000);
 
-  it('a geometry digest mismatch discards the old checkpoint and starts fresh, rather than restoring a deleted world', async () => {
+  itSteady('a geometry digest mismatch discards the old checkpoint and starts fresh, rather than restoring a deleted world', async () => {
     const roomId = freshRoomId('geom-mismatch');
     const keys = roomKeys(roomId, namespace);
 
@@ -315,7 +332,7 @@ d('ticker / real Redis', () => {
     expect((checkpointAfter as { tick: number }).tick).toBeGreaterThan(0);
   }, 10_000);
 
-  it('omitting geomKey on a restore still restores (by design) but fires the ticker.no-geom-key warning exactly once a checkpoint exists', async () => {
+  itSteady('omitting geomKey on a restore still restores (by design) but fires the ticker.no-geom-key warning exactly once a checkpoint exists', async () => {
     const roomId = freshRoomId('no-geom-key');
     const keys = roomKeys(roomId, namespace);
 

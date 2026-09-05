@@ -29,6 +29,7 @@ jobs:
   check:
     name: typecheck, unit tests, build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -61,6 +62,7 @@ jobs:
   integration:
     name: integration tests (real Redis)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     services:
       redis:

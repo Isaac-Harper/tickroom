@@ -42,6 +42,26 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # THE SAME REDIS SERVICE CI USES, AND THE SAME REQUIRE FLAG. Without them
+    # `npm test` below still passes: the nine real-Redis files skip cleanly when
+    # nothing listens on 6399, exit 0, and the release is the one build in which
+    # the lease, the checkpoint, the handoff, the subscriber, the smoothness and
+    # the fault-injection suites ran zero assertions. A gate that cannot fail is
+    # worse than no gate, and this is the gate whose version number is burned
+    # forever.
+    services:
+      redis:
+        image: redis:8
+        ports:
+          - 6399:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v4
 
@@ -61,7 +81,11 @@ jobs:
       # is burned forever.
       - run: npm run build
       - run: npm run typecheck
-      - run: npm test
+      - name: unit and integration tests, Redis required
+        env:
+          TICKROOM_TEST_REDIS_URL: redis://127.0.0.1:6399
+          TICKROOM_REQUIRE_REDIS: '1'
+        run: npm test
 
       # The tag and package.json must agree. Without this, `git tag v0.2.0` on a
       # tree still saying 0.1.9 silently republishes nothing useful, or fails

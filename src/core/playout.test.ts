@@ -76,6 +76,52 @@ describe('NEVER-DROP-LATE', () => {
     expect(buf.lateCount).toBe(0);
   });
 
+  it('a 6-record redundancy window delivered every tick on a healthy link keeps lateCount at 0', () => {
+    // The whole point of the redundancy window (see codec/snapshot.ts) is
+    // that every packet re-sends the last few stamped ticks alongside the
+    // newest one, so a single lost packet is invisible. On a healthy,
+    // zero-loss link, applying the newest record of each window first (the
+    // one on-time push that fills a slot for real) means every older,
+    // already-delivered record in the same window loses the freshness check
+    // and is rejected without ever landing, so lateCount must read 0 however
+    // many redundant re-sends actually happened.
+    const buf = new PlayoutBuffer<number>();
+    const WINDOW = 6;
+    for (let tick = 0; tick < 30; tick++) {
+      for (let back = 0; back < WINDOW; back++) {
+        const t = tick - back;
+        if (t < 0) continue;
+        buf.push(t, t);
+      }
+      buf.consume(tick); // the tick just sent arrives before it is due
+    }
+    expect(buf.lateCount).toBe(0);
+  });
+
+  it('a redundancy window arriving one tick late every time climbs lateCount by exactly one per packet', () => {
+    // Same window, but the whole packet is a tick behind schedule: its
+    // newest record is for the tick the consumer has ALREADY passed. That
+    // one record genuinely carries information the buffer never saw on
+    // time, so it lands and counts; the rest of the window is now stale
+    // relative to it and loses the freshness check exactly as in the
+    // healthy case above, so the count climbs by exactly one per packet
+    // rather than by the whole window size.
+    const buf = new PlayoutBuffer<number>();
+    const WINDOW = 6;
+    for (let tick = 0; tick < 30; tick++) {
+      for (let back = 0; back < WINDOW; back++) {
+        const t = tick - 1 - back; // one tick behind the consumer's schedule
+        if (t < 0) continue;
+        buf.push(t, t);
+      }
+      buf.consume(tick);
+    }
+    // Tick 0 has nothing to push in this shifted scheme (every t < 0), so the
+    // one-genuine-landing-per-packet climb runs from tick 1 through tick 29:
+    // 29 packets, 29 landings.
+    expect(buf.lateCount).toBe(29);
+  });
+
   it('a fresher straggler does not clobber an entry already re-stamped into the same slot', () => {
     const buf = new PlayoutBuffer<string>();
     buf.consume(10);

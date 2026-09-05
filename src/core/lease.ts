@@ -56,13 +56,13 @@ import type { RedisLike } from './redisLike.js';
 
 export interface LeaseConfig {
   /** How long a held lease key survives with no renew. */
-  leaseTtlMs?: number;
+  leaseTtlMs?: number | undefined;
   /** How often a renew is attempted. Must stay well under `leaseTtlMs` so a single missed attempt does not lose the lease. */
-  leaseRenewMs?: number;
+  leaseRenewMs?: number | undefined;
   /** A ticker exits on its own past this age, ahead of a hard platform kill, so it controls its own handoff instead of being cut off mid-publish. */
-  maxTickerMs?: number;
+  maxTickerMs?: number | undefined;
   /** A ticker with nobody in the room exits after this much idle time, rather than paying for a loop nobody is watching. */
-  emptyGraceMs?: number;
+  emptyGraceMs?: number | undefined;
 }
 
 export const LEASE_TTL_MS = 5000;
@@ -70,7 +70,13 @@ export const LEASE_RENEW_MS = 1500;
 export const MAX_TICKER_MS = 700_000;
 export const EMPTY_GRACE_MS = 30_000;
 
-function resolveConfig(cfg?: LeaseConfig): Required<LeaseConfig> {
+// Every `LeaseConfig` field with its default filled in. `Required<LeaseConfig>`
+// no longer says that: under `exactOptionalPropertyTypes` the `| undefined` each
+// field is declared with is part of its TYPE rather than of its optionality, so
+// `-?` strips the question mark and leaves the `undefined` behind.
+type ResolvedLeaseConfig = { [K in keyof LeaseConfig]-?: NonNullable<LeaseConfig[K]> };
+
+function resolveConfig(cfg?: LeaseConfig): ResolvedLeaseConfig {
   return {
     leaseTtlMs: cfg?.leaseTtlMs ?? LEASE_TTL_MS,
     leaseRenewMs: cfg?.leaseRenewMs ?? LEASE_RENEW_MS,

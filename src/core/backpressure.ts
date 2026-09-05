@@ -6,9 +6,9 @@ export const MAX_DRAIN_PER_TICK = 1024;
 export const PER_SENDER_CAP = 64;
 
 export interface InboxOptions {
-  cap?: number;
-  perSenderCap?: number;
-  maxDrainPerTick?: number;
+  cap?: number | undefined;
+  perSenderCap?: number | undefined;
+  maxDrainPerTick?: number | undefined;
 }
 
 /**

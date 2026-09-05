@@ -1,5 +1,24 @@
 import { describe, it, expect } from 'vitest';
-import { ByteWriter, ByteReader, CodecError } from './bytes.js';
+import { ByteWriter, ByteReader, CodecError, ProtocolVersionError } from './bytes.js';
+
+describe('ProtocolVersionError', () => {
+  it('is a CodecError subtype named "ProtocolVersionError", carrying expected/found', () => {
+    const err = new ProtocolVersionError(1, 2);
+    expect(err).toBeInstanceOf(CodecError);
+    expect(err).toBeInstanceOf(ProtocolVersionError);
+    expect(err.name).toBe('ProtocolVersionError');
+    expect(err.expected).toBe(1);
+    expect(err.found).toBe(2);
+    expect(err.message).toMatch(/version mismatch/);
+  });
+
+  it('CodecError itself is still named "CodecError"', () => {
+    // Pinned so a future edit to ProtocolVersionError's constructor (which
+    // calls `super()` before overwriting `this.name`) cannot regress the
+    // base class's own name as a side effect.
+    expect(new CodecError('x').name).toBe('CodecError');
+  });
+});
 
 describe('ByteWriter / ByteReader round trips', () => {
   it('round-trips u8', () => {
@@ -138,6 +157,79 @@ describe('ByteWriter / ByteReader round trips', () => {
     // writer's 256-byte one, not a 1-byte buffer of its own.
     expect(buf.byteOffset).toBe(0);
     expect(buf.buffer.byteLength).toBe(1);
+  });
+});
+
+describe('ByteWriter integer setters refuse to wrap: CLAMP-NEVER-WRAP one layer down', () => {
+  // `DataView.setUintN`/`setIntN` truncate modulo the field width rather than
+  // refusing an out-of-range value, which is the same "opposite side of the
+  // value space" failure `quantize.ts` forbids for positions, one layer down
+  // where there is no nearby value to clamp to (a state, a button mask, a
+  // stamped input's targetTick). Each case below is a measured wire bug from
+  // before this guard existed, pinned so it cannot come back silently.
+  it('u8 throws instead of wrapping a value past 255 (measured: state 300 -> 44)', () => {
+    expect(() => new ByteWriter().u8(300)).toThrow(CodecError);
+  });
+  it('u8 throws on a negative value', () => {
+    expect(() => new ByteWriter().u8(-1)).toThrow(CodecError);
+  });
+  it('u8 throws on a non-integer value', () => {
+    expect(() => new ByteWriter().u8(1.5)).toThrow(CodecError);
+  });
+  it('i8 throws outside -128..127', () => {
+    expect(() => new ByteWriter().i8(128)).toThrow(CodecError);
+    expect(() => new ByteWriter().i8(-129)).toThrow(CodecError);
+  });
+  it('u16 throws instead of wrapping a value past 65535 (measured: an extraLength of 70000 -> 4464)', () => {
+    expect(() => new ByteWriter().u16(70000)).toThrow(CodecError);
+    expect(() => new ByteWriter().u16(65536)).toThrow(CodecError);
+  });
+  it('u8 throws instead of wrapping a value past 255 (measured: a buttons mask 259 -> 3)', () => {
+    expect(() => new ByteWriter().u8(259)).toThrow(CodecError);
+  });
+  it('u16 throws on a negative value', () => {
+    expect(() => new ByteWriter().u16(-1)).toThrow(CodecError);
+  });
+  it('i16 throws outside -32768..32767', () => {
+    expect(() => new ByteWriter().i16(32768)).toThrow(CodecError);
+    expect(() => new ByteWriter().i16(-32769)).toThrow(CodecError);
+  });
+  it('u32 throws instead of wrapping a value past 4294967295 (measured: targetTick -1 -> 4294967295)', () => {
+    expect(() => new ByteWriter().u32(-1)).toThrow(CodecError);
+    expect(() => new ByteWriter().u32(4294967296)).toThrow(CodecError);
+  });
+  it('i32 throws outside -2147483648..2147483647', () => {
+    expect(() => new ByteWriter().i32(2147483648)).toThrow(CodecError);
+    expect(() => new ByteWriter().i32(-2147483649)).toThrow(CodecError);
+  });
+  it('every integer setter still accepts both ends of its own legal range', () => {
+    // The guard has to be a bound, not a narrowing: it must not take a single
+    // legal value with it.
+    expect(() =>
+      new ByteWriter()
+        .u8(0)
+        .u8(255)
+        .i8(-128)
+        .i8(127)
+        .u16(0)
+        .u16(65535)
+        .i16(-32768)
+        .i16(32767)
+        .u32(0)
+        .u32(4294967295)
+        .i32(-2147483648)
+        .i32(2147483647)
+    ).not.toThrow();
+  });
+  it('u32 throws on NaN and on Infinity, not only on out-of-range finite values', () => {
+    expect(() => new ByteWriter().u32(NaN)).toThrow(CodecError);
+    expect(() => new ByteWriter().u32(Infinity)).toThrow(CodecError);
+  });
+  it('a rejected write leaves nothing behind: the guard runs before the buffer is touched', () => {
+    const w = new ByteWriter().u8(1);
+    expect(() => w.u16(70000)).toThrow(CodecError);
+    expect(w.length).toBe(1);
+    expect(Array.from(w.finish())).toEqual([1]);
   });
 });
 

@@ -4,7 +4,7 @@ export interface TokenBucketOptions {
   /** Sustained rate the bucket refills at. */
   refillPerSecond: number;
   /** Injectable clock, defaulting to `Date.now`, so a test can drive time deterministically instead of sleeping. */
-  now?: () => number;
+  now?: (() => number) | undefined;
 }
 
 /**

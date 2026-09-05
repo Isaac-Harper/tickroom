@@ -17,12 +17,28 @@ export interface RoomKeys {
   stats: string;
   meta: string;
   metaout: string;
+  /** Short-TTL count of consecutive ticker invocations that exited by THROWING, so a deterministic crash on restored state starts the room fresh instead of looping forever. */
+  crashes: string;
+  /**
+   * The last `serverTime` this room PUBLISHED, written only by an exit that
+   * saves no final checkpoint (today, one that threw) and deleted by any exit
+   * that does.
+   *
+   * The checkpoint's own `gridAt` is normally the end of the room's timeline,
+   * but a thrown ticker leaves the last PERIODIC checkpoint standing and has
+   * already published past it. A successor continuing from that `gridAt`
+   * therefore re-stamps times its predecessor's snapshots already carried, and
+   * `serverTime` repeats rather than advancing. This key is the high-water
+   * mark that makes the successor's first stamp strictly greater than anything
+   * anyone has seen.
+   */
+  timeline: string;
 }
 
 export const DEFAULT_NAMESPACE = 'room';
 export const MAX_ROOMS_PER_BASE = 50;
 
-const KEY_SUFFIXES = ['in', 'out', 'lease', 'state', 'stats', 'meta', 'metaout'] as const;
+const KEY_SUFFIXES = ['in', 'out', 'lease', 'state', 'stats', 'meta', 'metaout', 'crashes', 'timeline'] as const;
 
 /** `${namespace}:${roomId}:${suffix}` for every suffix tickroom needs. */
 export function roomKeys(roomId: string, namespace: string = DEFAULT_NAMESPACE): RoomKeys {
@@ -92,7 +108,7 @@ export interface NormalizeOptions {
   /** Returned whenever `raw` cannot be validated. Must itself be a valid, trusted room id: it is returned unchecked. */
   fallback: string;
   /** Defaults to `MAX_ROOMS_PER_BASE`. Index 0 is always allowed regardless of this bound (it is the base id itself, not a numbered instance). */
-  maxRooms?: number;
+  maxRooms?: number | undefined;
 }
 
 const DANGEROUS_BASE_NAMES = new Set(['constructor', '__proto__', 'toString']);

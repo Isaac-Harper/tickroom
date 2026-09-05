@@ -1,6 +1,6 @@
 {
   "name": "tickroom",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Authoritative realtime rooms on serverless: a leased fixed-timestep tick loop, a WebSocket relay, and Redis pub/sub as the bus.",
   "license": "MIT",
   "author": "Isaac Harper",
@@ -28,6 +28,10 @@
       "types": "./dist/server/index.d.ts",
       "default": "./dist/server/index.js"
     },
+    "./server/memoryRedis": {
+      "types": "./dist/server/memoryRedis.d.ts",
+      "default": "./dist/server/memoryRedis.js"
+    },
     "./client": {
       "types": "./dist/client/index.d.ts",
       "default": "./dist/client/index.js"
@@ -53,11 +57,12 @@
   ],
   "scripts": {
     "prepare": "npm run build",
-    "build": "tsc -p tsconfig.build.json",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:integration": "vitest run tests"
+    "test:integration": "vitest run tests",
+    "example:node": "tsx examples/node-server/server.ts"
   },
   "keywords": [
     "realtime",
@@ -76,7 +81,7 @@
   },
   "peerDependenciesMeta": {
     "ioredis": {
-      "optional": false
+      "optional": true
     }
   },
   "devDependencies": {
@@ -84,6 +89,7 @@
     "@types/ws": "^8.18.1",
     "esbuild": "^0.28.2",
     "ioredis": "^5.11.1",
+    "tsx": "^4.23.13",
     "typescript": "^5.6.0",
     "vitest": "^2.1.9",
     "ws": "^8.21.3"

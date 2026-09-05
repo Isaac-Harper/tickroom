@@ -4,6 +4,8 @@ import {
   OFFSET_SLEW_MAX,
   OFFSET_FLOOR_SLACK_MS,
   TIMELINE_STEP_FRAMES,
+  RESUME_GLIDE_MAX_MS,
+  type InterpolatedEntity,
   type SnapshotFrame,
 } from './interpolation.js';
 
@@ -61,8 +63,8 @@ function drive(
   xs: number[];
   lastX: number;
   lastNow: number;
-  /** Every rendered frame of the whole run, warmup included, so a test can measure how long a disturbance took to clear rather than only the steady state after it. */
-  track: { now: number; x: number; extrapolated: boolean }[];
+  /** Every rendered frame of the whole run, warmup included, so a test can measure how long a disturbance took to clear rather than only the steady state after it. `delay` rides along because the adaptive delay is subtracted from the playhead: a profile's rendered speed and the delay's movement are the same measurement seen twice. */
+  track: { now: number; x: number; extrapolated: boolean; delay: number }[];
   frameMs: number;
 } {
   const hz = opts.hz ?? 60;
@@ -71,7 +73,7 @@ function drive(
   const key = opts.key ?? 'a';
   const speeds: number[] = [];
   const xs: number[] = [];
-  const track: { now: number; x: number; extrapolated: boolean }[] = [];
+  const track: { now: number; x: number; extrapolated: boolean; delay: number }[] = [];
   let next = 0;
   let prev: { x: number; y: number } | null = null;
   let lastX = NaN;
@@ -90,7 +92,7 @@ function drive(
       continue;
     }
     lastX = e.x;
-    track.push({ now, x: e.x, extrapolated: e.extrapolated });
+    track.push({ now, x: e.x, extrapolated: e.extrapolated, delay: interp.delayMs });
     if (now >= opts.warmupMs && prev) {
       speeds.push(Math.hypot(e.x - prev.x, e.y - prev.y) / dt);
       xs.push(e.x);
@@ -176,6 +178,127 @@ function serverTimeStep(opts: {
     serverTime += opts.tickMs;
   }
   return out;
+}
+
+/**
+ * A CLEAN TICKER HANDOFF, which is the profile the extrapolation unwind is
+ * measured against and is not the same thing as a network gap.
+ *
+ * The predecessor dies and the successor takes the lease a moment later, so
+ * nothing simulates the room for the length of the gap: the WORLD PAUSES. The
+ * successor then stamps `serverTime` from its own `Date.now()`, which has kept
+ * running the whole time, so the axis playback runs on advances across a gap
+ * the entity did not move through. A client that extrapolated forward into the
+ * gap therefore finds, when the stream comes back, that the truth is where the
+ * entity already was rather than ahead of it.
+ */
+function tickerHandoff(opts: {
+  ticks: number;
+  tickMs: number;
+  speed: number;
+  latencyMs: number;
+  gapStartTick: number;
+  gapTicks: number;
+}): Arrival[] {
+  const out: Arrival[] = [];
+  let worldMs = 0;
+  for (let i = 0; i < opts.ticks; i++) {
+    if (i >= opts.gapStartTick && i < opts.gapStartTick + opts.gapTicks) continue;
+    out.push({
+      serverTime: i * opts.tickMs,
+      receivedAt: i * opts.tickMs + opts.latencyMs,
+      entities: { a: { x: (opts.speed * worldMs) / 1000, y: 0 } },
+    });
+    worldMs += opts.tickMs;
+  }
+  return out;
+}
+
+/**
+ * A 450ms head-of-line hold covering nine ticks of a 20Hz stream, all nine
+ * delivered as a burst the moment it clears, on a link that is otherwise calm
+ * at 40ms. Once at tick `at`, and again every `repeatEvery` ticks if given.
+ *
+ * The one-off is a single hiccup, the ordinary shape of a bad moment on a good
+ * connection; the repeating one is what `INTERP_MAX_MS`'s ceiling is sized
+ * against. The delay has to cover the second and unwind after the first, which
+ * is why one constant is measured against both.
+ */
+function holdProfile(opts: { ticks: number; at: number; repeatEvery?: number }): Arrival[] {
+  return straightLine({
+    ticks: opts.ticks,
+    tickMs: 50,
+    speed: 100,
+    latency: (i) => {
+      if (i < opts.at) return 40;
+      const n = opts.repeatEvery ? (i - opts.at) % opts.repeatEvery : i - opts.at;
+      if (n < 9) return 40 + 450 - n * 50 + n * 0.75;
+      return 40;
+    },
+  });
+}
+
+/**
+ * A RECONNECT THE WAY `RoomConnection` PERFORMS ONE. The socket drops and its
+ * snapshots are lost rather than delayed; the host keeps drawing the poses it
+ * last had; the epoch turns over at reopen (`clear()`, plus `resumeFrom` when
+ * `seed` is set); the stream comes back on the same timeline, having carried on
+ * without the client the whole time.
+ *
+ * The track is the HOST's rendered pose, which is deliberately NOT the same as
+ * the interpolator's output: while the new epoch has no snapshot yet `sample()`
+ * returns nothing at all and the host is still drawing the held pose. Measuring
+ * the interpolator's own output would skip exactly the frames where the snap
+ * and the freeze live.
+ */
+function reconnectRun(
+  interp: SnapshotInterpolator<string>,
+  opts: { arrivals: Arrival[]; dropAtMs: number; outageMs: number; untilMs: number; seed: boolean },
+): { track: { now: number; x: number }[]; frameMs: number; reopenAt: number; firstLiveAt: number } {
+  const frameMs = 1000 / 60;
+  const reopenAt = opts.dropAtMs + opts.outageMs;
+  // A dropped socket loses its snapshots; it does not queue them.
+  const arrivals = opts.arrivals.filter((a) => a.receivedAt < opts.dropAtMs || a.receivedAt >= reopenAt);
+  const track: { now: number; x: number }[] = [];
+  let next = 0;
+  let reconnected = false;
+  let firstLiveAt = Infinity;
+  // What the host is still drawing: the MAP `sample()` last returned, kept whole
+  // the way `RoomConnection` keeps it, so the seed carries the measured speed
+  // and not just a position. Handing a bare `{x, y}` here is what hid the fact
+  // that the clamp had nothing to clamp against.
+  let held = new Map<string, InterpolatedEntity>();
+
+  for (let now = 0; now <= opts.untilMs; now += frameMs) {
+    while (next < arrivals.length && arrivals[next]!.receivedAt <= now) {
+      const a = arrivals[next]!;
+      interp.push(frame(a.serverTime, a.receivedAt, a.entities));
+      next++;
+    }
+    if (!reconnected && now >= reopenAt) {
+      // EXACTLY `RoomConnection.beginEpoch()`'s ORDER, which is the whole point
+      // of driving it this way: clear, then hand back what is still on screen.
+      reconnected = true;
+      interp.clear();
+      if (opts.seed) interp.resumeFrom(held);
+    }
+    const out = interp.sample(1 / 60, now);
+    if (out.size > 0) {
+      held = out;
+      // The first frame the NEW epoch actually rendered. Before it there is
+      // nothing buffered at all and holding is the only option there is; after
+      // it, holding is a choice.
+      if (reconnected && firstLiveAt === Infinity) firstLiveAt = now;
+    }
+    track.push({ now, x: held.get('a')?.x ?? 0 });
+  }
+
+  return { track, frameMs, reopenAt, firstLiveAt };
+}
+
+/** Per-frame rendered SPEED after `fromMs`, signed, so a rewind reads as a negative rather than as a magnitude. */
+function speedsAfter(track: { now: number; x: number }[], fromMs: number, frameMs: number): number[] {
+  return stepsAfter(track, fromMs).map((d) => d / (frameMs / 1000));
 }
 
 /** Newest pose DELIVERED by local time `now`, for the streams above: every tick lands exactly `latencyMs` after it was emitted. */
@@ -908,11 +1031,29 @@ describe('SnapshotInterpolator', () => {
 
     // Two seconds after the step, playback tracks the newest delivered pose
     // again, no more than a delay or so behind it.
+    //
+    // A DELAY OR SO IS NOW A LONGER TAIL THAN IT WAS, DELIBERATELY. The
+    // re-anchor snaps the delay to a target the step's own jitter has pushed to
+    // the 500ms ceiling, and it then unwinds under `DELAY_SLEW_MAX` at 8% of
+    // wall time rather than at the ease's uncapped 224ms per second. So the
+    // staleness sits at 43 units for a moment where it used to be under 40, and
+    // the entities are 400ms behind for two seconds instead of running 20% fast
+    // for one, which is the trade that constant exists to make. What the bound
+    // is here for is unchanged: playback must be BEHIND by a bounded amount and
+    // converging, not stranded.
     for (const t of track) {
       if (t.now < 12_000) continue;
       const stale = newestDeliveredX(t.now, 50, 100, 1040) - t.x;
-      expect(stale).toBeLessThan(40); // 40 units = 400ms of world time
+      expect(stale).toBeLessThan(45); // 45 units = 450ms of world time, under the 500ms ceiling
       expect(stale).toBeGreaterThan(-5);
+    }
+
+    // And it does converge rather than merely being bounded: the delay is back
+    // near its floor a few seconds later and playback is right behind the
+    // newest pose. Measured at 11.6 units at 16s, 7.4 at 20s.
+    for (const t of track) {
+      if (t.now < 16_000) continue;
+      expect(newestDeliveredX(t.now, 50, 100, 1040) - t.x).toBeLessThan(20);
     }
   });
 
@@ -1326,6 +1467,367 @@ describe('SnapshotInterpolator', () => {
 
     expect(injected).toBe(true);
     expect(interp.reanchors).toBe(0);
+  });
+
+  it('ONE 450ms hold does not leave every entity running fast and then slow for seconds afterwards', () => {
+    // THE DELAY IS THE OTHER TERM OF THE PLAYHEAD. `now - offset - delay`, so
+    // moving the delay moves playback in time exactly the way moving the offset
+    // does, and the offset has been capped at 5% of wall time since the day it
+    // was written because more than a few percent is visible. The delay had no
+    // cap at all: `INTERP_ADAPT_LAMBDA` eases 0.7 of the DIFFERENCE per second,
+    // which on this profile is 224ms of playback time per second.
+    //
+    // One hold, on a link that is otherwise calm, is enough to pay for it
+    // twice. Measured uncapped on exactly this profile: 48 frames as slow as
+    // 0.83x true speed while the delay grew 80 -> 432, then, seconds later when
+    // the burst's samples aged out of the offset window, 78 frames as fast as
+    // 1.21x while it came back down. 126 rendered frames outside +-10% of true
+    // speed, bought by a single hiccup. The repeating-stall test below is the
+    // reason this was never noticed: its delay saturates at the ceiling and
+    // never comes back down, so the whole second half of the cost is invisible
+    // there.
+    //
+    // THIS TEST BINDS THE CAP FROM ABOVE and its sibling binds it from below.
+    // 0.10 leaves 106 frames outside the band and 0.12 leaves 178; the sibling
+    // goes red at 0.06. See `DELAY_SLEW_MAX` for the whole sweep.
+    const interp = new SnapshotInterpolator<string>();
+    const { track, frameMs } = drive(interp, holdProfile({ ticks: 1200, at: 200 }), {
+      untilMs: 40_000,
+      warmupMs: 40_000,
+    });
+
+    // The delay still does its job: it grew to cover the hold. Without this the
+    // whole test passes on an interpolator that simply never adapts.
+    expect(Math.max(...track.map((t) => t.delay))).toBeGreaterThan(380);
+
+    // From well after the burst has been delivered, playback is bracketing
+    // again and the delay's own movement is the only thing left that can put
+    // the rendered speed anywhere other than 100.
+    const speeds = speedsAfter(track, 11_000, frameMs);
+    expect(speeds.length).toBeGreaterThan(1500); // an empty run satisfies every bound here
+    expect(speeds.filter((s) => s < 90 || s > 110).length).toBe(0);
+    expect(Math.max(...speeds)).toBeLessThan(109); // the cap IS the bound: 100 * (1 + DELAY_SLEW_MAX)
+    expect(Math.min(...speeds)).toBeGreaterThan(91);
+  });
+
+  it('a REPEATING 450ms stall is still absorbed at the capped slew rate', () => {
+    // THE OTHER HALF OF THE SAME CONSTANT, and the half that stops it being
+    // free. A stall that recurs has to be covered before it comes round again,
+    // which is the whole argument for `INTERP_MAX_MS` being 500 rather than
+    // 250, and a delay that cannot climb fast enough to reach that depth
+    // between stalls is a delay that snaps on every one of them.
+    //
+    // Swept on this profile: at `DELAY_SLEW_MAX` 0.08 the stall is absorbed
+    // completely, peak 100.0 u/s on a 100 u/s entity with nothing outside
+    // +-10%; at 0.06 the buffer no longer quite gets there between stalls and
+    // 12 frames land outside, peaking at 117; at 0.04, 29 frames and 173; at
+    // 0.02, 83 frames and 275. That is the floor under the constant, and the
+    // one-off hold above is the ceiling over it.
+    const interp = new SnapshotInterpolator<string>();
+    const { track, frameMs } = drive(interp, holdProfile({ ticks: 1200, at: 40, repeatEvery: 40 }), {
+      untilMs: 40_000,
+      warmupMs: 40_000,
+    });
+
+    const speeds = speedsAfter(track, 5000, frameMs);
+    expect(speeds.length).toBeGreaterThan(1500); // an empty run satisfies every bound here
+    expect(speeds.filter((s) => s < 90 || s > 110).length).toBe(0);
+    expect(Math.max(...speeds)).toBeLessThan(110);
+    expect(Math.min(...speeds)).toBeGreaterThan(-1); // and no rewind while it absorbs them
+  });
+
+  it('a clean ticker handoff unwinds the extrapolation as a glide, not as a 10 unit rewind', () => {
+    // THE PRICE OF NEVER FREEZING, PAID BACK. Extrapolation is a guess, and
+    // when the stream resumes the guess has to be reconciled with the truth:
+    // the entity was rendered at `pose + v * t` and the confirmed pose is
+    // somewhere else. Spending that whole difference in one frame is a step,
+    // and on a ticker handoff it is a BACKWARD one, because the world paused
+    // while `serverTime` kept running: the truth is where the entity already
+    // was, not ahead of it.
+    //
+    // Measured on this profile before the glide: ONE backward step of 10.41
+    // units at -625 u/s, on an entity whose true speed is 100. After: four
+    // backward frames of at most 1.16 units, worst -69 u/s, peak rendered speed
+    // 625 -> 100. The same total correction, spread across the `EXTRAP_CAP_MS`
+    // the guess itself was allowed to run for. The bound is structural rather than tuned: the offset can
+    // never exceed the extrapolation's own displacement (v times at most the
+    // cap) and is spent over exactly that cap, so the glide can never move an
+    // entity faster than it was already moving.
+    const interp = new SnapshotInterpolator<string>();
+    const arrivals = tickerHandoff({
+      ticks: 800,
+      tickMs: 50,
+      speed: 100,
+      latencyMs: 40,
+      gapStartTick: 200,
+      gapTicks: 16, // 800ms, the middle of the documented handoff range
+    });
+    const { track, frameMs } = drive(interp, arrivals, { untilMs: 40_000, warmupMs: 40_000 });
+
+    // A handoff is an ordinary event, not a broken clock: nothing here should
+    // reach for the re-anchor.
+    expect(interp.reanchors).toBe(0);
+
+    const steps = stepsAfter(track, 9000);
+    expect(steps.length).toBeGreaterThan(1500); // an empty run satisfies every bound here
+    expect(Math.min(...steps)).toBeGreaterThan(-3);
+    const speeds = steps.map((d) => Math.abs(d) / (frameMs / 1000));
+    expect(Math.max(...speeds)).toBeLessThan(200);
+  });
+
+  it('a real teleport still snaps, because the glide may only hide the extrapolation it made itself', () => {
+    // THE CLAMP IS WHAT SEPARATES A SMOOTHER FROM A LIE. The offset that
+    // absorbs the step out of extrapolation is capped at the displacement THIS
+    // MODULE applied, so an entity that genuinely moved somewhere else while
+    // the stream was down arrives there immediately, exactly as it does today.
+    // Without the clamp the glide would happily spend a second pretending a
+    // respawn was a walk.
+    const interp = new SnapshotInterpolator<string>({ minDelayMs: 100, maxDelayMs: 100, startDelayMs: 100 });
+    interp.push(frame(0, 40, { a: { x: 0, y: 0 } }));
+    interp.push(frame(50, 90, { a: { x: 5, y: 0 } })); // 100 u/s, so the guess is worth 15 units at the cap
+
+    // Well past the newest frame: extrapolating, and held at the cap.
+    const guessed = interp.sample(1 / 60, 400).get('a')!;
+    expect(guessed.extrapolated).toBe(true);
+    expect(guessed.x).toBeCloseTo(20, 6); // 5 + 100 * 0.15
+
+    // The stream comes back with the entity 1000 units away: a teleport, not a
+    // walk. It brackets between the two new frames at server time 950.
+    interp.push(frame(900, 940, { a: { x: 1000, y: 0 } }));
+    interp.push(frame(1000, 1040, { a: { x: 1000, y: 0 } }));
+    const landed = interp.sample(1 / 60, 1090).get('a')!;
+    expect(landed.extrapolated).toBe(false);
+    // Only the 15 units the extrapolator itself added may be glided, and it
+    // glides them the way it applied them, from behind; the other 965 arrive at
+    // once, which is a teleport rendered as a teleport.
+    expect(landed.x).toBeCloseTo(1000 - 15, 6);
+    expect(landed.x).toBeGreaterThan(980);
+  });
+
+  it('a discontinuous render frame reports a real speed rather than a 10,000 u/s spike', () => {
+    // `dt` AND `nowMs` DISAGREE AFTER A RENDER GAP, AND BOTH CALLERS ARE RIGHT.
+    // `RoomConnection.frame()` clamps `dt` to 0.25s, which is correct (one
+    // stalled frame must not advance a whole simulation at once), and passes
+    // the REAL `nowMs`, which is also correct (the playhead runs on the wall
+    // clock, and a `dt`-accumulated one is the defect this file already carries
+    // a test for). The playhead therefore moves 30 seconds while `dt` says a
+    // quarter of one.
+    //
+    // Dividing that displacement by `dt` is how `speed`, documented right here
+    // as the animation driver, came to read four figures on an entity moving at
+    // 100: a backgrounded tab regaining focus, rendered as every remote player
+    // sprinting. Measured on this profile: a peak of 10,524 u/s with 18 frames
+    // still above 1000 and 34 above 200 while the low-pass walked it back,
+    // against a flat 100.0 once the elapsed local time is believed.
+    const interp = new SnapshotInterpolator<string>();
+    const arrivals = straightLine({ ticks: 800, tickMs: 50, speed: 100, latency: () => 40 });
+    let next = 0;
+    const deliver = (until: number) => {
+      while (next < arrivals.length && arrivals[next]!.receivedAt <= until) {
+        const a = arrivals[next]!;
+        interp.push(frame(a.serverTime, a.receivedAt, a.entities));
+        next++;
+      }
+    };
+
+    const frameMs = 1000 / 60;
+    let now = 0;
+    for (; now <= 5000; now += frameMs) {
+      deliver(now);
+      interp.sample(1 / 60, now);
+    }
+
+    // Thirty seconds in the background. The socket kept delivering; nothing
+    // rendered.
+    now = 35_000;
+    deliver(now);
+    const speeds: number[] = [];
+    for (let k = 0; k < 60; k++) {
+      // Exactly what `RoomConnection.frame()` passes: a clamped dt beside the
+      // true clock.
+      const dt = Math.min(0.25, k === 0 ? 30 : 1 / 60);
+      const e = interp.sample(dt, now).get('a')!;
+      speeds.push(e.speed);
+      now += frameMs;
+      deliver(now);
+    }
+
+    expect(Math.max(...speeds)).toBeLessThan(200);
+    // ...and it is a real reading rather than a suppressed one: the entity is
+    // moving at 100 and the filter says so within a few frames.
+    expect(speeds[speeds.length - 1]).toBeGreaterThan(80);
+  });
+
+  it('sampling twice at the same nowMs leaves the measured speed alone instead of zeroing it', () => {
+    // A host that renders two views of one room, or samples once for physics
+    // and once for drawing, calls this twice on the same clock reading. The
+    // second call moves no time, so it can measure no motion, and the old code
+    // stored that as a speed of ZERO: the animation driver reporting a standing
+    // entity for every entity on screen, for whichever of the two calls the
+    // renderer happened to read.
+    const interp = new SnapshotInterpolator<string>({ minDelayMs: 100, maxDelayMs: 100, startDelayMs: 100 });
+    const arrivals = straightLine({ ticks: 40, tickMs: 50, speed: 100, latency: () => 40 });
+    let next = 0;
+    let now = 0;
+    for (; now <= 800; now += 1000 / 60) {
+      while (next < arrivals.length && arrivals[next]!.receivedAt <= now) {
+        const a = arrivals[next]!;
+        interp.push(frame(a.serverTime, a.receivedAt, a.entities));
+        next++;
+      }
+      interp.sample(1 / 60, now);
+    }
+
+    const moved = interp.sample(1 / 60, now).get('a')!;
+    expect(moved.speed).toBeGreaterThan(90);
+
+    const again = interp.sample(0, now).get('a')!;
+    expect(again.speed).toBe(moved.speed);
+    expect(again.x).toBe(moved.x);
+  });
+
+  it('a reconnect resumes from the held poses as a glide, instead of a snap and then a freeze', () => {
+    // THE EPOCH BOUNDARY IS NOT A REASON TO TELEPORT. `clear()` is right to drop
+    // every estimate (a new socket may take a new route, and the buffered
+    // frames belong to a connection that no longer exists), but the one thing
+    // worth carrying across it is where the player last SAW each entity, which
+    // is the only continuity that exists from their side. `resumeFrom` is how
+    // the host hands that back.
+    //
+    // What it replaces was measured end to end through a real socket and is
+    // reproduced by this profile: the new epoch's first rendered frame steps
+    // the entity forward by the whole outage's motion at once, and then
+    // playback sits completely STILL for five frames, because a freshly cleared
+    // playhead starts `INTERP_START_MS` behind the first buffered frame and the
+    // hold branch renders that frame's pose exactly. Snap, then freeze, from
+    // one event. Measured over the three seconds after reopen on this 350ms
+    // outage, without the seed and with it:
+    //
+    //   worst single-frame step   25.00 units   ->  4.47 units
+    //   peak rendered speed       1500 u/s      ->  268 u/s
+    //   motionless frames         5             ->  0
+    //
+    // The peak that remains IS the outage's motion, spread over
+    // `EXTRAP_CAP_MS`: the world really did move while the socket was down, and
+    // a glide the player can watch beats a jump between two frames, which is
+    // the same trade `ErrorOffset` makes for the local player.
+    const arrivals = straightLine({ ticks: 400, tickMs: 50, speed: 100, latency: () => 40 });
+    const interp = new SnapshotInterpolator<string>();
+    const { track, frameMs, reopenAt, firstLiveAt } = reconnectRun(interp, {
+      arrivals,
+      dropAtMs: 5000,
+      outageMs: 350,
+      untilMs: 12_000,
+      seed: true,
+    });
+
+    const steps = stepsAfter(track, reopenAt);
+    expect(steps.length).toBeGreaterThan(300); // an empty run satisfies every bound here
+    expect(Math.max(...steps)).toBeLessThan(6);
+    expect(Math.max(...steps.map((d) => Math.abs(d))) / (frameMs / 1000)).toBeLessThan(400);
+
+    // NOT FROZEN, which is the half a speed bound structurally cannot see: a
+    // snap and a stall are both "one odd frame" to a peak, and the stall is the
+    // one a player reads as the connection still being broken. Counted from the
+    // first frame the new epoch actually rendered, because before that there is
+    // nothing buffered at all and holding is the only thing anyone could do.
+    const settling = stepsAfter(track, firstLiveAt + 1);
+    expect(settling.length).toBeGreaterThan(300);
+    expect(settling.filter((d) => Math.abs(d) < 1e-9).length).toBe(0);
+
+    // ...and it lands back on the live timeline rather than trailing it, one
+    // delay behind the newest delivered pose and no further.
+    for (const t of track) {
+      if (t.now < reopenAt + 2000) continue;
+      const stale = newestDeliveredX(t.now, 50, 100, 40) - t.x;
+      expect(stale).toBeLessThan(15); // 15 units = 150ms, an INTERP_MIN_MS delay plus an interval
+      expect(stale).toBeGreaterThan(-5);
+    }
+  });
+
+  it('a respawn across a reconnect is clamped to RESUME_GLIDE_MAX_MS of the held speed, not swept in from where it was', () => {
+    // THE CLAMP HAS TO BE FED BY THE CALLER, AND THAT IS THE FINDING RATHER
+    // THAN A DETAIL. `resumeFrom` bounds its glide by the entity's measured
+    // speed, and the first version read that speed from `this.motion`, the map
+    // `clear()` empties one line earlier in the connection's own epoch
+    // turnover. So the bound was `Infinity` on the only path anything uses and
+    // the clamp was structurally dead: a value read from state the caller was
+    // just told to destroy is not a default, it is a guarantee the branch never
+    // runs. `InterpolatedEntity` carries `speed`, so the map `frame()` returned
+    // is a valid seed with the measurement already in it.
+    //
+    // The case that exposes it: an entity that RESPAWNED while the socket was
+    // down, 5000 units from where the player last saw it. Nothing was
+    // extrapolated, so the unwind clamp cannot bound this (it would be zero);
+    // what bounds it is a second of the entity's own speed. Measured on this
+    // profile, on an entity whose true speed is 100: with the pose's speed
+    // ignored the render starts at the held pose and sweeps 4823.17 units at
+    // 32,254 u/s; with it, it starts 100.00 units back from the confirmed pose
+    // (exactly `RESUME_GLIDE_MAX_MS` of that speed) and peaks at 767 u/s.
+    const interp = new SnapshotInterpolator<string>({ minDelayMs: 100, maxDelayMs: 100, startDelayMs: 100 });
+    const arrivals = straightLine({ ticks: 60, tickMs: 50, speed: 100, latency: () => 40 });
+
+    let next = 0;
+    let held = new Map<string, InterpolatedEntity>();
+    for (let now = 0; now <= 2000; now += 1000 / 60) {
+      while (next < arrivals.length && arrivals[next]!.receivedAt <= now) {
+        const a = arrivals[next]!;
+        interp.push(frame(a.serverTime, a.receivedAt, a.entities));
+        next++;
+      }
+      const out = interp.sample(1 / 60, now);
+      if (out.size > 0) held = out;
+    }
+    const heldPose = held.get('a')!;
+    expect(heldPose.speed).toBeGreaterThan(90); // the seed genuinely carries a measurement
+    expect(heldPose.x).toBeLessThan(300);
+
+    // The connection's exact sequence.
+    interp.clear();
+    interp.resumeFrom(held);
+
+    // The new epoch: same entity, 5000 units away.
+    interp.push(frame(10_000, 10_040, { a: { x: 5000, y: 0 } }));
+    interp.push(frame(10_050, 10_090, { a: { x: 5005, y: 0 } }));
+    interp.push(frame(10_100, 10_140, { a: { x: 5010, y: 0 } }));
+
+    // Offset seeds at 40 and the delay is pinned at 100, so the playhead is the
+    // midpoint of the bracket [10_050, 10_100]: an interpolated pose of 5007.5.
+    const allowed = (heldPose.speed * RESUME_GLIDE_MAX_MS) / 1000;
+    const first = interp.sample(1 / 60, 10_215).get('a')!;
+    expect(first.x).toBeLessThanOrEqual(5007.5);
+    expect(first.x).toBeGreaterThanOrEqual(5007.5 - allowed - 1e-6);
+    // ...which is emphatically not "start from where the player last saw it".
+    expect(first.x).toBeGreaterThan(4000);
+
+    // And the glide that follows is bounded by that clamp rather than by the
+    // distance the entity teleported.
+    const xs = [first.x];
+    for (let k = 1; k <= 20; k++) xs.push(interp.sample(1 / 60, 10_215 + k * (1000 / 60)).get('a')!.x);
+    const peak = Math.max(...xs.slice(1).map((x, i) => Math.abs(x - xs[i]!))) * 60;
+    expect(peak).toBeLessThan(1000);
+  });
+
+  it('a held pose that never reappears is dropped at the next clear(), not carried into a later epoch', () => {
+    // `resumeFrom` seeds a pose per entity and consumes it on that entity's
+    // first render, so an entity that never comes back (it left the room while
+    // the socket was down) leaves its seed sitting there. `clear()` is what
+    // retires it: the seed describes a specific epoch's held frame, and two
+    // epochs later it is a pose from a connection nobody remembers, which would
+    // glide a returning entity in from wherever it used to be.
+    const interp = new SnapshotInterpolator<string>({ minDelayMs: 100, maxDelayMs: 100, startDelayMs: 100 });
+    interp.resumeFrom(new Map([['a', { x: -500, y: 0 }]]));
+    interp.clear(); // a second epoch turnover, this one with nothing to seed from
+
+    interp.push(frame(0, 40, { a: { x: 0, y: 0 } }));
+    interp.push(frame(50, 90, { a: { x: 5, y: 0 } }));
+    interp.push(frame(100, 140, { a: { x: 10, y: 0 } }));
+
+    // Offset seeds at 40 and the delay is pinned at 100, so this is the exact
+    // midpoint of the bracket [50, 100]: the interpolated pose, with no glide
+    // in from a pose that belongs to a dead epoch.
+    const out = interp.sample(1 / 60, 215).get('a')!;
+    expect(out.x).toBeCloseTo(7.5, 6);
   });
 
   it('the re-anchor re-derives the playhead in the same call, so the correction is ONE step', () => {
