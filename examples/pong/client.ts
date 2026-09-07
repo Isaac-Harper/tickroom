@@ -299,7 +299,12 @@ export function createPongClient(opts: PongClientOptions): PongClient {
     conn,
     // THE SAME FUNCTION THE SIMULATION RUNS, on the same input, on the tick
     // the record names. That is the whole promise of stamping, and it is one
-    // line because `stepPaddleY` is shared rather than copied.
+    // line because `stepPaddleY` is shared rather than copied. The fourth
+    // argument is the tick this call is producing, ignored here because a
+    // paddle collides with nothing that changes over time; a game whose
+    // collision context does change (a closing arena, a grid that moved two
+    // ticks ago) indexes it with that number rather than with the newest one,
+    // since a replay runs several ticks inside one snapshot.
     step: (pose, input, dt) => ({ x: pose.x, y: stepPaddleY(pose.y, input.dir, dt) }),
     // Bounds the correction glide (a paddle sliding back onto the server's
     // answer faster than a paddle can move on its own reads as a second,

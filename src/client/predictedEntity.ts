@@ -57,6 +57,15 @@ import { ErrorOffset } from './errorOffset.js';
  * A 2D pose with an optional heading in radians: the same fields
  * `EntitySample` interpolates, so an owned entity and a remote one are drawn
  * from one shape. The heading is wrapped to (-pi, pi] by everything here.
+ *
+ * THESE THREE FIELDS ARE ALL A REPLAY KEEPS, and it is worth saying loudly
+ * because a `step` may return whatever it likes. This class stores, shifts and
+ * interpolates exactly `x`, `y` and `heading`; anything else riding on a pose
+ * (a velocity, a stun timer, a grounded flag, an ammo count) is dropped the
+ * moment a record is replayed or a correction shifts the history. State like
+ * that belongs in the host's own object, derived from the pose, or on the wire
+ * from the server. A field the prediction carries and the replay does not is a
+ * divergence with no symptom until a snapshot lands.
  */
 export interface Pose {
   x: number;
@@ -80,8 +89,17 @@ export interface PredictedEntityOptions<TInput> {
    * no symptom until one of the two is edited. It must not keep state, and it
    * should return a new pose rather than mutate the one it was given (the
    * replay runs it up to `INPUT_HISTORY` times per snapshot from a copy).
+   *
+   * `tick` IS THE TICK THE STEP PRODUCES, which is the record's own
+   * `targetTick`, and it is passed on every call: the per-frame stamping, the
+   * speculation past the newest stamp, and every record a replay runs. A step
+   * whose collision context is time dependent (a grid that changed two ticks
+   * ago, an arena that closes in every other tick) needs it, because a replay
+   * runs several ticks inside one snapshot and the newest tick's world is the
+   * wrong answer for all but the last of them. A step that does not need it
+   * ignores the fourth argument and compiles unchanged.
    */
-  step: (pose: Pose, input: TInput, dt: number) => Pose;
+  step: (pose: Pose, input: TInput, dt: number, tick: number) => Pose;
   /**
    * The fastest this entity can move, units per second. It bounds how fast a
    * correction may glide (the glide adds at most this on top of the entity's
@@ -491,7 +509,7 @@ export class PredictedEntity<TInput> {
       data = JSON.parse(json) as TInput;
       for (let t = from; t <= value; t++) {
         this.records.push({ targetTick: t, data });
-        const next = this.step(this.curr, data, this.dt);
+        const next = this.step(this.curr, data, this.dt, t);
         if (isFinitePose(next)) {
           this.curr = next;
         } else {
@@ -621,7 +639,7 @@ export class PredictedEntity<TInput> {
     let replayed: Pose = { ...authoritative };
     if (!restarted) {
       for (const rec of this.records) {
-        if (rec.targetTick > snapTick) replayed = this.step(replayed, rec.data, this.dt);
+        if (rec.targetTick > snapTick) replayed = this.step(replayed, rec.data, this.dt, rec.targetTick);
       }
     }
     this.lastAuthoritative = { ...authoritative };
@@ -856,7 +874,7 @@ export class PredictedEntity<TInput> {
     const limit = Math.min(at, newest.tick + PLAYHEAD_SNAP_TICKS);
     let pose: Pose = { ...newest.pose };
     for (let t = newest.tick + 1; t - 1 < limit; t++) {
-      const next = this.step(pose, data, this.dt);
+      const next = this.step(pose, data, this.dt, t);
       if (!isFinitePose(next)) return;
       pose = next;
       this.spec.push({ tick: t, pose });

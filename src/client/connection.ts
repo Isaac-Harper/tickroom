@@ -187,11 +187,19 @@ export type WebSocketConstructor = new (url: string) => WebSocketLike;
  * reconnect, with the previous socket's path delay carried into the new
  * estimate. The connection already does the identical thing for the one other
  * epoch-scoped component it holds, one line away, in `markUnanchored()`.
+ *
+ * AND IT FIXES THE CALL ORDER `teleport` NEEDS, which is the one thing a host
+ * still has to get right by hand. `SnapshotInterpolator.teleport(key)` reads
+ * the destination out of the buffer, so it has to run AFTER the frame carrying
+ * the destination is pushed; with this option the push happens here and
+ * `onSnapshot` runs after it (see the ordering comment in `processSnapshot`), so
+ * `onSnapshot` is where a host calls it and the order is satisfied by
+ * construction rather than by remembering.
  */
 export interface SnapshotInterpolationOptions<TSnap, K extends string | number> {
   /** The interpolator to push into and to clear on every epoch change. Its key type decides `K`, and `SnapshotInterpolator` has no default key type, so the host states it once here. */
   into: SnapshotInterpolator<K>;
-  /** Pull the entities that MOVE out of one decoded snapshot. Everything else in the snapshot (scores, a winner, a serve countdown) is discrete state that has no meaning half way between two values, so it belongs in `onSnapshot` rather than here. */
+  /** Pull the entities that MOVE out of one decoded snapshot. Everything else in the snapshot (scores, a winner, a serve countdown) is discrete state that has no meaning half way between two values, so it belongs in `onSnapshot` rather than here. A jump the entity did NOT travel (a respawn, an elimination moving the player to the border) is neither: it belongs in `onSnapshot` too, as one `into.teleport(key)` call, because this frame is already buffered by then. */
   entities(snap: TSnap): Map<K, EntitySample>;
 }
 
@@ -240,7 +248,7 @@ export interface RoomConnectionOptions<TSnap extends DecodedSnapshotLike, K exte
   protocolVersion?: number | undefined;
   /** Drive an interpolator from this connection's own snapshot stream and epoch. See `SnapshotInterpolationOptions`. Omit it to keep a `SnapshotInterpolator` by hand, which is still supported and is what a host with several buffers, or with a render layer that owns its own playback, will want. */
   interpolate?: SnapshotInterpolationOptions<TSnap, K> | undefined;
-  /** Every decoded snapshot, in the concrete type `decodeSnapshot` returned. For the discrete state interpolation cannot smooth; the moving entities are `interpolate`'s job. */
+  /** Every decoded snapshot, in the concrete type `decodeSnapshot` returned. For the discrete state interpolation cannot smooth; the moving entities are `interpolate`'s job. It runs AFTER the frame has been pushed into `interpolate.into`, which is what makes it the place to call `teleport(key)` for an entity this snapshot says was PUT somewhere rather than walked there. */
   onSnapshot?: ((snap: TSnap) => void) | undefined;
   /** JSON control frames the host relay sends: a roster update, a capacity notice, a quota warning. Parsed for you; handed back as the parsed value, or the raw string if it did not parse as JSON. The library's OWN control frames (`pong`, `relay-expiring`) are consumed here and never reach this callback, because they are transport bookkeeping rather than anything a host has an opinion about. */
   onText?: ((msg: unknown) => void) | undefined;

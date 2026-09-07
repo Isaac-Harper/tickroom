@@ -1,4 +1,5 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { RoomConnection, type SessionInfo, type WebSocketConstructor, type WebSocketLike } from './connection.js';
 import {
   SnapshotInterpolator,
   OFFSET_SLEW_MAX,
@@ -1845,5 +1846,347 @@ describe('SnapshotInterpolator', () => {
     const steps = stepsAfter(track, 9000);
     expect(steps.length).toBeGreaterThan(1000); // an empty run satisfies every bound here
     expect(Math.min(...steps)).toBeGreaterThan(-10);
+  });
+});
+
+/**
+ * A WALK, THEN A JUMP THE ENTITY DID NOT TAKE, which is the profile the whole
+ * of `teleport` is measured against.
+ *
+ * Two seconds of walking at 4 units a second on 20Hz snapshots, then one
+ * snapshot that puts the entity 20 units away (a respawn, or an elimination
+ * moving the player to the border) and the walk resuming from there. The walk
+ * speed is deliberately slow against the jump: at 4 units a second one tick of
+ * honest motion is 0.2 units, so anything the interpolator renders larger than
+ * that is a step the entity did not take, and there is exactly one of those in
+ * the profile.
+ */
+const WALK_SPEED = 4;
+const SNAP_MS = 50;
+const WALK_PER_SNAP = (WALK_SPEED * SNAP_MS) / 1000; // 0.2, one tick of walking
+const TELEPORT_SNAP = 40; // two seconds in
+const JUMP = 20;
+const DEST_X = WALK_PER_SNAP * TELEPORT_SNAP + JUMP;
+
+/**
+ * Drive that profile, with `announce` standing in for whatever the host does
+ * about the jump ON the snapshot that carries the destination. That is where a
+ * real host stands: `RoomConnection` pushes the decoded frame into the
+ * interpolator and THEN calls `onSnapshot`, so a host callback always runs with
+ * the destination already buffered.
+ */
+function teleportRun(opts: {
+  delayMs?: number | undefined;
+  announce?: ((interp: SnapshotInterpolator<string>, key: string) => void) | undefined;
+}): { interp: SnapshotInterpolator<string>; track: { now: number; x: number; speed: number }[] } {
+  const interp =
+    opts.delayMs === undefined
+      ? new SnapshotInterpolator<string>()
+      : new SnapshotInterpolator<string>({
+          startDelayMs: opts.delayMs,
+          minDelayMs: opts.delayMs,
+          maxDelayMs: opts.delayMs,
+        });
+
+  const arrivals: Arrival[] = [];
+  for (let i = 0; i <= 80; i++) {
+    const x = WALK_PER_SNAP * i + (i >= TELEPORT_SNAP ? JUMP : 0);
+    arrivals.push({ serverTime: i * SNAP_MS, receivedAt: i * SNAP_MS + 40, entities: { a: { x, y: 0 } } });
+  }
+
+  const track: { now: number; x: number; speed: number }[] = [];
+  const frameMs = 1000 / 60;
+  let next = 0;
+  for (let now = 0; now <= 4200; now += frameMs) {
+    while (next < arrivals.length && arrivals[next]!.receivedAt <= now) {
+      const a = arrivals[next]!;
+      interp.push(frame(a.serverTime, a.receivedAt, a.entities));
+      if (next === TELEPORT_SNAP) opts.announce?.(interp, 'a');
+      next++;
+    }
+    const e = interp.sample(1 / 60, now).get('a');
+    if (e) track.push({ now, x: e.x, speed: e.speed });
+  }
+  return { interp, track };
+}
+
+/** Rendered steps larger than one tick of walking, which are the steps the entity did not take. */
+function stepsBeyondOneTick(track: { now: number; x: number }[], fromMs: number): number[] {
+  return stepsAfter(track, fromMs).filter((s) => Math.abs(s) > WALK_PER_SNAP + 1e-9);
+}
+
+describe('SnapshotInterpolator.teleport', () => {
+  // The default delay plus every delay a consumer is likely to pin, because the
+  // hold this has to get right is exactly `delayMs` long: the destination frame
+  // sits in the buffer's future for that long, and the bug this replaces got
+  // worse the deeper the buffer was.
+  for (const delayMs of [undefined, 80, 100, 200, 300, 500]) {
+    const label = delayMs === undefined ? 'the default delay' : `a pinned ${delayMs}ms delay`;
+
+    it(`ONE call is the whole answer at ${label}: one jump, then no streak`, () => {
+      const { track } = teleportRun({ delayMs, announce: (interp, key) => interp.teleport(key) });
+
+      // Exactly one rendered step bigger than a tick of walking, and it is the
+      // teleport itself rather than a fragment of one.
+      const big = stepsBeyondOneTick(track, 300);
+      expect(big).toHaveLength(1);
+      expect(big[0]).toBeGreaterThan(JUMP - WALK_SPEED);
+
+      // Everything after it is walking. The hold renders the destination
+      // exactly and the release lands on a bracket that starts there, so the
+      // resumption is not a second correction.
+      const jumpAt = track.findIndex((t, i) => i > 0 && t.x - track[i - 1]!.x > WALK_PER_SNAP);
+      expect(jumpAt).toBeGreaterThan(0);
+      for (let i = jumpAt + 1; i < track.length; i++) {
+        expect(Math.abs(track[i]!.x - track[i - 1]!.x)).toBeLessThanOrEqual(WALK_PER_SNAP);
+      }
+
+      // THE HELD FRAMES ARE STILL, AND SAY SO. `speed` is measured from this
+      // module's own rendered motion and drives a host's animation: an entity
+      // put somewhere did not run there, so the motion state goes with the
+      // history the teleport voided rather than decaying from the jump.
+      const held = track.filter((t, i) => i >= jumpAt && t.x === DEST_X);
+      expect(held.length).toBeGreaterThan(0);
+      for (const h of held) expect(h.speed).toBe(0);
+      // ...and the hold is the buffer depth, not a fixed number of frames.
+      expect(held.length).toBeGreaterThanOrEqual(Math.floor((delayMs ?? 80) / (1000 / 60)) - 2);
+    });
+  }
+
+  it('forget() alone still streaks, which is why teleport() exists', () => {
+    // THE MEASUREMENT THAT MOTIVATES THE METHOD, kept as a test so it cannot
+    // quietly become false. `forget` drops `lastSeenAt` and the motion state
+    // and leaves the FRAMES alone, so the key re-seeds one snapshot later
+    // INSIDE the bracket that spans the jump and the lerp walks it across at
+    // interpolation speed: several rendered steps of tens of units on an entity
+    // whose whole tick of motion is 0.2. A consumer's workaround was
+    // `ceil(delayMs / tickMs) + 1` consecutive forgets, one per rendered frame.
+    const forgotten = teleportRun({ delayMs: 100, announce: (interp, key) => interp.forget(key) });
+    const streak = stepsBeyondOneTick(forgotten.track, 300);
+    expect(streak.length).toBeGreaterThan(1);
+    // The jump arrives spread over several frames rather than as one honest
+    // step, which is the artifact: none of them is the whole distance.
+    expect(Math.max(...streak)).toBeLessThan(JUMP);
+
+    const teleported = teleportRun({ delayMs: 100, announce: (interp, key) => interp.teleport(key) });
+    expect(stepsBeyondOneTick(teleported.track, 300)).toHaveLength(1);
+  });
+
+  it('doing nothing at all is a streak too, and the same one', () => {
+    // The control for the case above: `forget` is not merely insufficient, it
+    // is no better than silence. Both leave the bracket spanning the jump.
+    const { track } = teleportRun({ delayMs: 100 });
+    expect(stepsBeyondOneTick(track, 300).length).toBeGreaterThan(1);
+  });
+
+  it('is a no-op for a key no buffered frame carries', () => {
+    const interp = new SnapshotInterpolator<string>({ startDelayMs: 100, minDelayMs: 100, maxDelayMs: 100 });
+    interp.push(frame(0, 40, { a: { x: 0, y: 0 } }));
+    interp.push(frame(50, 90, { a: { x: 5, y: 0 } }));
+    interp.push(frame(100, 140, { a: { x: 10, y: 0 } }));
+    interp.teleport('ghost');
+    expect(interp.sample(1 / 60, 215).get('a')!.x).toBeCloseTo(7.5, 6);
+  });
+
+  it('holds through an underrun rather than extrapolating away from the destination', () => {
+    // An underrun past the destination has one pose on this side of the jump
+    // and no second one to derive a velocity from, so the guess it would make
+    // is the pre-teleport velocity: the same streak by another route.
+    const interp = new SnapshotInterpolator<string>({ startDelayMs: 100, minDelayMs: 100, maxDelayMs: 100 });
+    for (let i = 0; i < 6; i++) interp.push(frame(i * 50, i * 50 + 40, { a: { x: i * 5, y: 0 } }));
+    interp.push(frame(300, 340, { a: { x: 500, y: 0 } }));
+    interp.teleport('a');
+
+    // The stream then stops, so the playhead runs past the newest frame.
+    const xs: number[] = [];
+    for (let k = 0; k <= 30; k++) xs.push(interp.sample(1 / 60, 360 + k * (1000 / 60)).get('a')!.x);
+    for (const x of xs) expect(x).toBe(500);
+  });
+
+  it('the pre-teleport samples are VOIDED, not merely stepped over by the hold', () => {
+    // The hold is what the player sees; the void is what makes the hold's
+    // release safe, and the two are independent because the hold is not the
+    // only thing that can end. `forget` ends it here (a `dropAfterMs` sweep
+    // during a quiet stretch is the same ending, several seconds slower), and
+    // what is left is the buffer itself: with the void there is no sample for
+    // this key older than the destination for any bracket to find, whatever
+    // the playhead does afterwards.
+    const interp = new SnapshotInterpolator<string>({ startDelayMs: 100, minDelayMs: 100, maxDelayMs: 100 });
+    for (let i = 0; i < 4; i++) interp.push(frame(i * 50, i * 50 + 40, { a: { x: i * 5, y: 0 } }));
+    interp.push(frame(200, 240, { a: { x: 500, y: 0 } }));
+    interp.teleport('a');
+    // A straggler from before the jump, which `push` documents as ordinary: it
+    // slots into the past where it belongs, carrying the pose the teleport
+    // just voided. The buffered frames and the late ones are voided by two
+    // different lines, so they are observed one bracket apart below.
+    interp.push(frame(160, 250, { a: { x: 16, y: 0 } }));
+
+    // The hold ends, and the entity comes back on the next frame that carries
+    // it, with the playhead still short of the destination.
+    interp.forget('a');
+    expect(interp.sample(1 / 60, 260).has('a')).toBe(false);
+    interp.push(frame(250, 290, { a: { x: 505, y: 0 } }));
+
+    // Playhead 125, inside the bracket the walk was rendered from before the
+    // jump: [100, 150], which read 10 and 15. Nothing renders it now.
+    expect(interp.sample(1 / 60, 265).has('a')).toBe(false);
+    // Playhead 155, the bracket [150, 160] whose newer end is the straggler.
+    expect(interp.sample(1 / 60, 295).has('a')).toBe(false);
+
+    // And it comes back the moment the playhead has post-teleport data, on the
+    // bracket [200, 250] four fifths of the way along.
+    expect(interp.sample(1 / 60, 380).get('a')!.x).toBeCloseTo(504, 6);
+  });
+
+  it('voids out of a COPY, so the frame the host pushed is not edited under it', () => {
+    // `push` takes the host's own map. A host that keeps a reference to the
+    // snapshot it decoded (a replay buffer, a debug overlay, its own
+    // non-moving state) would find entities disappearing out of it.
+    const interp = new SnapshotInterpolator<string>({ startDelayMs: 100, minDelayMs: 100, maxDelayMs: 100 });
+    const first = frame(0, 40, { a: { x: 0, y: 0 } });
+    interp.push(first);
+    interp.push(frame(50, 90, { a: { x: 500, y: 0 } }));
+    interp.teleport('a');
+    expect(first.entities.has('a')).toBe(true);
+  });
+
+  it('re-adopts a key that was forgotten, at the destination', () => {
+    // `forget` drops `lastSeenAt`, which every branch of `sample` gates on, so
+    // a teleport that only voided and held would leave the entity invisible
+    // for as long as the hold lasted. The mark is refreshed rather than
+    // dropped: the entity is drawn where it was put.
+    const interp = new SnapshotInterpolator<string>({ startDelayMs: 100, minDelayMs: 100, maxDelayMs: 100 });
+    interp.push(frame(0, 40, { a: { x: 0, y: 0 } }));
+    interp.push(frame(50, 90, { a: { x: 5, y: 0 } }));
+    interp.push(frame(100, 140, { a: { x: 900, y: 0 } }));
+    interp.forget('a');
+    interp.teleport('a');
+    const out = interp.sample(1 / 60, 215).get('a')!;
+    expect(out.x).toBe(900);
+    expect(out.speed).toBe(0);
+    expect(out.extrapolated).toBe(false);
+  });
+
+  it('clear() drops a pending hold, so a new epoch is not held at the old destination', () => {
+    // A hold is per-epoch state like the frames and the motion it is made of.
+    // The dead epoch's stamps are deliberately AHEAD of the new epoch's here,
+    // which is what a `serverTime` that stepped backwards across a ticker
+    // handoff looks like: the release condition compares against a destination
+    // the new timeline never reaches, so nothing but `clear()` retires it.
+    const interp = new SnapshotInterpolator<string>({ startDelayMs: 100, minDelayMs: 100, maxDelayMs: 100 });
+    interp.push(frame(4000, 4040, { a: { x: 0, y: 0 } }));
+    interp.push(frame(4050, 4090, { a: { x: 900, y: 0 } }));
+    interp.teleport('a');
+
+    interp.clear();
+    interp.push(frame(0, 40, { a: { x: 0, y: 0 } }));
+    interp.push(frame(50, 90, { a: { x: 5, y: 0 } }));
+    interp.push(frame(100, 140, { a: { x: 10, y: 0 } }));
+    expect(interp.sample(1 / 60, 215).get('a')!.x).toBeCloseTo(7.5, 6);
+  });
+});
+
+/**
+ * THE PATH A CONSUMER ACTUALLY TAKES, end to end: a `RoomConnection` with the
+ * `interpolate` option, a socket, and the host calling `teleport` from
+ * `onSnapshot`. The ordering `teleport` documents is the connection's own (it
+ * pushes the decoded frame and THEN calls the host back), and nothing but this
+ * test proves the two agree.
+ */
+class TeleportSocket implements WebSocketLike {
+  static last: TeleportSocket | null = null;
+  readyState = 0;
+  binaryType?: string;
+  onopen: ((ev: unknown) => void) | null = null;
+  onclose: ((ev: { code: number; reason?: string }) => void) | null = null;
+  onmessage: ((ev: { data: unknown }) => void) | null = null;
+  onerror: ((ev: unknown) => void) | null = null;
+
+  constructor() {
+    TeleportSocket.last = this;
+  }
+  send(): void {}
+  close(code = 1000): void {
+    if (this.readyState === 3) return;
+    this.readyState = 3;
+    this.onclose?.({ code });
+  }
+  open(): void {
+    this.readyState = 1;
+    this.onopen?.({});
+  }
+  deliver(): void {
+    this.onmessage?.({ data: new ArrayBuffer(4) });
+  }
+}
+
+describe('teleport through a RoomConnection', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /**
+   * The same walk-then-jump profile as above, driven through the connection:
+   * 20Hz snapshots, 60Hz render frames, and the host deciding what to do about
+   * the jump inside `onSnapshot`. `performance` is faked along with the timers
+   * because this class runs its clock, its arrival stamps and the
+   * interpolator's playhead on `performance.now()`.
+   */
+  async function drivenByConnection(announce: boolean): Promise<number[]> {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'performance'] });
+    const interp = new SnapshotInterpolator<string>();
+    let x = 0;
+    let jump = false;
+    const conn = new RoomConnection<{ tick: number; serverTime: number; x: number; jump: boolean }, string>({
+      tickHz: 20,
+      mint: async (): Promise<SessionInfo> => ({ token: 't', playerId: 'p1', handle: 1, room: 'r' }),
+      WebSocketImpl: TeleportSocket as unknown as WebSocketConstructor,
+      socketUrl: () => 'ws://x',
+      decodeSnapshot: () => ({ tick: 100, serverTime: performance.now(), x, jump }),
+      interpolate: { into: interp, entities: (snap) => new Map([['p2', { x: snap.x, y: 0 }]]) },
+      // THE WHOLE POINT: the frame carrying the destination is already in the
+      // buffer by the time this runs, so one call here is the whole answer.
+      onSnapshot: (snap) => {
+        if (snap.jump && announce) interp.teleport('p2');
+      },
+    });
+
+    await conn.start();
+    const sock = TeleportSocket.last!;
+    sock.open();
+
+    const drawn: number[] = [];
+    let sinceSnapshot = 0;
+    for (let f = 0; f < 240; f++) {
+      await vi.advanceTimersByTimeAsync(1000 / 60);
+      sinceSnapshot += 1000 / 60;
+      x = performance.now() * 0.004;
+      if (sinceSnapshot >= 50) {
+        sinceSnapshot -= 50;
+        // Two seconds in, the entity is PUT twenty units away and walks on
+        // from there.
+        if (f === 120) jump = true;
+        if (jump) x += JUMP;
+        sock.deliver();
+        jump = f > 120;
+      }
+      const pose = conn.frame().entities.get('p2');
+      if (pose) drawn.push(pose.x);
+    }
+    conn.stop();
+
+    const steps: number[] = [];
+    for (let i = 1; i < drawn.length; i++) if (i > 30) steps.push(drawn[i]! - drawn[i - 1]!);
+    return steps.filter((step) => Math.abs(step) > WALK_PER_SNAP + 1e-9);
+  }
+
+  it('one teleport() from onSnapshot is the whole answer on a real connection', async () => {
+    const big = await drivenByConnection(true);
+    expect(big).toHaveLength(1);
+    expect(big[0]).toBeGreaterThan(JUMP - WALK_SPEED); // the jump itself, not a fragment of it
+  });
+
+  it('and without it the same connection streaks, which is the control', async () => {
+    expect((await drivenByConnection(false)).length).toBeGreaterThan(1);
   });
 });

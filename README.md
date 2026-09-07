@@ -395,6 +395,8 @@ interface Snapshot {
   players: [string, { x: number; y: number }][];
   /** From `onBufferHealth`, per pid. Optional on the wire, optional here. */
   depth: [string, number][];
+  /** Pids this tick PUT somewhere rather than moved: a respawn, an elimination. See `onSnapshot`. */
+  respawned?: string[];
   /** The one field `RoomConnection` reads out of this: your own pid's depth. */
   inputLead?: number;
 }
@@ -510,9 +512,22 @@ const conn = new RoomConnection<Snapshot, string>({
   // YOUR OWN ENTITY'S AUTHORITATIVE POSE, once per snapshot. The entity
   // replays the records it stamped after `snap.tick` from it and glides any
   // difference away; on a healthy link that difference is zero.
+  //
+  // AND ANY ENTITY THIS SNAPSHOT PUT SOMEWHERE, once, here. A respawn or an
+  // elimination is not motion: interpolating across it walks the entity over
+  // the whole distance at playback speed. `teleport(key)` voids what the
+  // buffer knows about how it got there and holds it at the destination until
+  // playback catches up, and it belongs in THIS callback because the
+  // connection pushes the frame before calling you, so the destination is
+  // already buffered. One call is the whole answer at any delay; `forget` is
+  // not that call and measures worse than doing nothing.
   onSnapshot: (snap) => {
     const mine = snap.players.find(([pid]) => pid === myPid);
     if (mine) me.reconcile(mine[1], snap.tick);
+    for (const pid of snap.respawned ?? []) {
+      if (pid !== myPid) interp.teleport(pid);
+      else if (mine) me.snapTo(mine[1]); // yours is predicted, not interpolated
+    }
   },
 
   onStallChange: (stalled) => banner.toggle(stalled),
@@ -583,6 +598,12 @@ await conn.start();
 // connection throws rather than overwriting the first's records tick by tick.
 const me = new PredictedEntity<{ x: number; y: number }>({
   conn,
+  // `(pose, input, dt, tick)`. The fourth argument is the tick this call is
+  // PRODUCING, which is the record's own `targetTick`: a replay runs several
+  // ticks inside one snapshot, so a step whose world changes over time (a
+  // closing arena, a grid that moved two ticks ago) indexes it with that
+  // number rather than with the newest one. A step that does not care ignores
+  // it and compiles unchanged, which is what `stepPlayer` does here.
   step: stepPlayer,
   maxSpeed: PLAYER_SPEED,
   initial: { x: 50, y: 50 },
@@ -594,6 +615,9 @@ const me = new PredictedEntity<{ x: number; y: number }>({
 // `me.advance()` after it stamps whatever ticks the counter crossed with the
 // input as HELD STATE (a lost packet then costs nothing: the next tick
 // re-asserts the same intent), sends them, and returns the pose to draw.
+//
+// AND IT RUNS ON EVERY CALLBACK. No `if (now - last < 1000 / 60) return;`
+// frame gate: see the note below.
 function frame(now: number) {
   const { entities, dt } = conn.frame(now);
   const own = me.advance({ x: input.x, y: input.y }, dt);
@@ -603,6 +627,37 @@ function frame(now: number) {
 }
 requestAnimationFrame(frame);
 ```
+
+**Your `step` has to be pure of CLIENT-FRAME state, not just of its own.** It
+must not keep state, which the option's own docs say, and the part that is
+easier to miss: every hook it reads has to be evaluated *from the pose it is
+handed*, on the tick it is handed, and never from something latched on a
+different frame. A replay starts from the SERVER's pose and re-runs your
+records, so a collision test that answers for the raw prediction instead of for
+the pose in front of it answers a question about a place the replay is not.
+Measured on a real game: an own-bomb check computed once per frame from the raw
+pose made the replay from the server's pose unable to move at all, so every
+snapshot produced a correction, and the player rubberbanded on a link with
+nothing wrong with it. If your step needs "is this tile passable for me", it
+computes it from the pose argument and the `tick` argument, every call.
+
+**Render every `requestAnimationFrame`, and never gate on a minimum frame
+interval.** A `if (now - last < 1000 / 61) return;` looks like a frame limiter
+and is a frame *dropper*: rAF timestamps jitter by a millisecond or two either
+side of the display's period, so the ones that land under the threshold are
+skipped outright, and every skip is a visible hitch on a moving entity.
+Measured on a 60Hz display with a `1000 / 61` gate: 16% of frames dropped. The
+browser already paces you at the display rate; `conn.frame(now)` measures its
+own delta and every smoother in this library runs on real elapsed time, so a
+frame that arrives early costs a small `dt` and nothing else.
+
+**A `Pose` is `x`, `y` and an optional `heading`, and a replay keeps nothing
+else.** `PredictedEntity` stores, shifts and interpolates exactly those three
+fields, so anything else you return from `step` (a velocity, a stun timer, a
+grounded flag, an ammo count) is dropped the moment a record is replayed or a
+correction shifts the history. That state belongs in your own object, derived
+from the pose, or on the wire from the server: a field the prediction carries
+but the replay does not is a divergence with no symptom until a snapshot lands.
 
 **Throw `ProtocolVersionError` out of `decodeSnapshot` on a wire mismatch.** The connection's skew recovery (reload once, then latch `'version-skew'`) fires on a returned `version` field *or* on a thrown error whose `name` is `'ProtocolVersionError'`, and the second is what a binary codec actually does: `decodeDefaultSnapshot` checks the version before reading a single field and throws exactly that. It is duck-typed on the name, so your own codec can participate without importing anything. A decoder that swallows the mismatch instead leaves every old client silently dropping every frame after a deploy, with nothing reloading and nothing latching.
 
@@ -696,11 +751,11 @@ onText: (msg) => {
 | `Inbox` | Backpressure with a per-sender quota, so one flooder degrades only themselves. |
 | `RoomConnection` | Reconnect, resume, re-mint, clock sync, protocol-skew recovery, a **real measured round trip**, and a **warm swap** at the relay's lifetime cap that the player never sees. |
 | `conn.frame(now)` | The one per-frame call: advances the tick, polls the stall, returns the poses to draw. |
-| `conn.tick` | The monotonic counter an input's `targetTick` is stamped from. Anchored per epoch to a **measured** lead (RTT + jitter headroom + optional server-depth feedback), advanced by `frame()`. Its `fraction` is how far it is into the next tick, 0 to 1, and its `tickMs` is the interval it was built with: `PredictedEntity` reads both, the one as its render target and the other as its timestep, so there is no tick rate to state twice. |
-| `PredictedEntity` | Your own entity, the one the interpolation delay is wrong for. One object owns the whole stamped path's client half: one record per tick predicted through the **same pure step** the runtime runs, the last six re-sent on every packet, a replay from every snapshot into a bounded **glide** (a snap on the first confirmation and whenever the offset would grow past half a second of travel, so nothing is ever trimmed in silence), a render **playhead** that moves at real time (within a tenth) through the recent poses one tick behind the newest, so a counter re-anchor is caught up over a second and a frozen tab is one counted snap rather than a lurch, and the re-anchor handling read off the counter itself. `advance` once per frame, `reconcile` once per snapshot, `conn`, `step`, `maxSpeed` and `initial` the only options, and none for the four rules a host used to get wrong. |
+| `conn.tick` | The monotonic counter an input's `targetTick` is stamped from. Anchored per epoch to a **measured** lead (RTT + jitter headroom + optional server-depth feedback), advanced by `frame()`. Its `fraction` is how far it is into the next tick, 0 to 1, and its `tickMs` is the interval it was built with: `PredictedEntity` reads both, the one as its render target and the other as its timestep, so there is no tick rate to state twice. The tick a record names is also what `step` is told it is producing, so a time-dependent world can be indexed inside a replay. |
+| `PredictedEntity` | Your own entity, the one the interpolation delay is wrong for. One object owns the whole stamped path's client half: one record per tick predicted through the **same pure step** the runtime runs, the last six re-sent on every packet, a replay from every snapshot into a bounded **glide** (a snap on the first confirmation and whenever the offset would grow past half a second of travel, so nothing is ever trimmed in silence), a render **playhead** that moves at real time (within a tenth) through the recent poses one tick behind the newest, so a counter re-anchor is caught up over a second and a frozen tab is one counted snap rather than a lurch, and the re-anchor handling read off the counter itself. `advance` once per frame, `reconcile` once per snapshot, `conn`, `step`, `maxSpeed` and `initial` the only options, and none for the four rules a host used to get wrong. `step` is `(pose, input, dt, tick)`: the **tick it is producing**, passed on every stamp and every replayed record, so a step whose collision context changes over time indexes the right one instead of the newest. |
 | `conn.stats()` | `rttMs`, `jitterMs`, `snapshotsReceived`, `rejectedSnapshots`, `underrunRate`, `reconnects`, `relaySwaps`, `swapsAttempted`, `swapsFailed`, `serverTickHz`, `hostErrors`. Gauges reset per epoch, counters are lifetime. `serverTickHz` and `hostErrors` exist because a wrong `tickHz` and a throwing host callback were both completely silent. |
 | `swapsAttempted` / `swapsFailed` | Warm swaps **started** at a relay's lifetime cap, and warm swaps that ended **without delivering**. Both lifetime counters, and `swapsAttempted - relaySwaps - swapsFailed` is 0, or 1 while one is in flight. `swapsFailed` tracking `swapsAttempted` means every relay lifetime cap is still costing a visible reconnect; the usual cause is a session `maxAgeS` shorter than the relay lifetime chain, so **size the token against the chain rather than against one relay**. |
-| `SnapshotInterpolator` | Other entities move smoothly. Adapts to measured jitter, never freezes, and unwinds its own extrapolation as a glide. |
+| `SnapshotInterpolator` | Other entities move smoothly. Adapts to measured jitter, never freezes, and unwinds its own extrapolation as a glide. **`teleport(key)`** for the jump an entity did not travel (a respawn, an elimination): one call, from `onSnapshot`, voids the history behind it and holds the entity at the destination until playback catches up, where `forget` re-seeds inside the bracket and streaks. |
 | `ErrorOffset` | A correction becomes a glide instead of a teleport. |
 | `stallDecision` | Tell the player the world is gone, without crying wolf on a routine handoff. |
 | `ByteWriter` / `quantize` | The wire format, because fan-out bandwidth is the bill. Integer fields **refuse** rather than wrap; NaN is refused rather than encoded as the origin. |

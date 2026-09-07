@@ -63,6 +63,14 @@
 // extrapolation itself applied, so this smooths only what this module made up
 // and a real teleport still arrives as a teleport. See `finishEntity`.
 //
+// AND A JUMP THE HOST KNOWS ABOUT IS NOT THIS MODULE'S TO SMOOTH AT ALL. A
+// respawn or an elimination moves an entity somewhere it did not travel to, and
+// every mechanism above is built to render the path between two poses: left
+// alone, the bracket spanning the jump plays it back as a sprint across the
+// arena. `teleport(key)` is how a host says so, in one call, after the frame
+// carrying the destination is pushed. See that method for what `forget` does
+// instead and for the measurement that says why it is not the answer.
+//
 // EVERY RATE THIS CLASS MEASURES OR MOVES IS CAPPED AGAINST WALL TIME, and that
 // is one idea rather than three. `OFFSET_SLEW_MAX` and `DELAY_SLEW_MAX` bound
 // the two terms of the playhead because moving either one IS moving playback in
@@ -452,9 +460,9 @@ interface ExtrapGuess {
 
 /**
  * Per-entity render state, all of it about CONTINUITY between one rendered
- * frame and the next, and all of it dropped by `clear()` and `forget()` along
- * with the rest of the per-entity state (a new epoch has nothing to be
- * continuous with).
+ * frame and the next, and all of it dropped by `clear()`, `forget()` and
+ * `teleport()` along with the rest of the per-entity state (a new epoch, and a
+ * pose the entity was PUT at, have nothing to be continuous with).
  */
 interface EntityMotionState {
   /** The last pose this entity was RENDERED at, unwind offset included, because that is the pose the host actually drew and therefore the only one the next frame can be continuous with. */
@@ -565,6 +573,8 @@ export class SnapshotInterpolator<K extends string | number> {
   private motion = new Map<K, EntityMotionState>();
   /** Poses a reconnecting host was holding on screen, waiting for their entity's first render of the new epoch. Empty except in the moments after `resumeFrom`. See that method. */
   private resumeSeed = new Map<K, { x: number; y: number; heading?: number | undefined; speed: number }>();
+  /** Keys the host has declared teleported, each with the destination it holds at and the `serverTime` the playhead has to reach before ordinary interpolation resumes. Empty except between a `teleport` call and the playhead catching up with it. See that method. */
+  private teleports = new Map<K, { serverTime: number; sample: EntitySample }>();
 
   private localClockMs = 0;
   /** How far the playhead moved on THIS `sample()` call, in server-clock ms. Read by `finishEntity` to project a guess forward one frame; it is the same number for every entity, so it is computed once rather than passed nine arguments deep. */
@@ -702,6 +712,15 @@ export class SnapshotInterpolator<K extends string | number> {
     while (i > 0 && this.frames[i - 1]!.serverTime > frame.serverTime) i--;
     this.frames.splice(i, 0, frame);
     this.pruneFrames(frame.receivedAt);
+
+    // A frame that lands LATE from before a teleport carries exactly the
+    // sample the teleport voided, and an out-of-order arrival is documented
+    // above as ordinary rather than as an anomaly. The hold ignores the buffer
+    // while it lasts, but the bracket the playhead resumes on must not have a
+    // pre-teleport pose to scan back to, so the void is applied to it too.
+    for (const [key, dest] of this.teleports) {
+      if (frame.serverTime < dest.serverTime) this.voidKeyAt(i, key);
+    }
 
     for (const key of frame.entities.keys()) {
       this.lastSeenAt.set(key, frame.receivedAt);
@@ -1056,6 +1075,91 @@ export class SnapshotInterpolator<K extends string | number> {
   }
 
   /**
+   * One entity did not travel to where it now is: it was PUT there. A respawn,
+   * an elimination that moves the player to the border, a round reset. Void
+   * everything this buffer knows about how it got there, hold it at the
+   * destination, and resume ordinary interpolation once the playhead has two
+   * post-teleport frames to work between.
+   *
+   * CALL IT AFTER THE FRAME CARRYING THE DESTINATION HAS BEEN PUSHED, and that
+   * ordering IS the contract rather than a preference: this method reads the
+   * destination out of the buffer, so called before the push it finds the pose
+   * the entity was at BEFORE the jump and voids the history behind that
+   * instead. On a `RoomConnection` with the `interpolate` option the place
+   * that satisfies it is `onSnapshot`, because the connection pushes the frame
+   * into the interpolator and THEN calls the host back (see the ordering
+   * comment in `connection.ts`), so the destination is already buffered by the
+   * time a host callback can look at it. A host pushing by hand calls it on
+   * the line after its own `push`.
+   *
+   * WHY `forget` IS NOT THIS CALL, which is the whole reason this method
+   * exists. `forget` drops `lastSeenAt` and the motion state and leaves the
+   * FRAMES alone, so the key re-seeds from the next snapshot one frame later
+   * and is immediately bracketed between a pre-teleport pose and a
+   * post-teleport one: the lerp then walks the entity across the whole jump at
+   * interpolation speed. Measured on a 20 unit teleport of an entity whose
+   * walk speed is 4 units a second, at 20Hz snapshots and 60Hz rendering, one
+   * `forget` rendered steps of 21.2, 15.0, 7.1 and 7.1 units, which is worse
+   * than making no call at all: the streak is spread over four frames instead
+   * of arriving as one honest jump. A consumer's workaround was
+   * `ceil(delayMs / tickMs) + 1` consecutive forgets, one per frame, which is
+   * the buffer depth expressed as a call count. ONE call to this is the whole
+   * answer at any delay.
+   *
+   * The hold is the other half. The playhead runs `delayMs` behind the newest
+   * frame by construction, so the destination frame is in the buffer's FUTURE
+   * for as long as that delay lasts, and the samples that used to bracket the
+   * playhead are exactly the ones the teleport invalidated. So the entity is
+   * drawn AT the destination, held, `extrapolated: false`, with `speed` 0 (the
+   * motion state goes with the history: every number in it describes the path
+   * to somewhere the entity no longer is), until the playhead has a bracket
+   * made of two post-teleport frames. That is `ceil(delayMs / snapshot
+   * interval)` snapshots, about six rendered frames at the default delay and
+   * about thirty at a 500ms one, and it renders as one jump followed by
+   * stillness rather than as a sweep.
+   *
+   * A no-op for a key no buffered frame carries, since there is nowhere to
+   * hold it. If the newest frame omits the key (the snapshot that carried the
+   * teleport did not carry this entity), the newest frame that DOES carry it
+   * is the destination, which is the same rule stated for a gappy stream.
+   */
+  teleport(key: K): void {
+    let at = -1;
+    for (let k = this.frames.length - 1; k >= 0; k--) {
+      if (this.frames[k]!.entities.has(key)) {
+        at = k;
+        break;
+      }
+    }
+    if (at < 0) return;
+    const dest = this.frames[at]!;
+    this.voidKeyBefore(key, dest.serverTime);
+    this.teleports.set(key, { serverTime: dest.serverTime, sample: dest.entities.get(key)! });
+    this.motion.delete(key);
+    // `lastSeenAt` is REFRESHED rather than dropped the way `forget` drops it:
+    // every branch of `sample()` gates on it, and an entity voided out of the
+    // buffer and then not rendered at all is the same disappearance from the
+    // player's side that this method exists to prevent.
+    if ((this.lastSeenAt.get(key) ?? -Infinity) < dest.receivedAt) this.lastSeenAt.set(key, dest.receivedAt);
+  }
+
+  /** Drop `key` from every buffered frame older than `serverTime`. */
+  private voidKeyBefore(key: K, serverTime: number): void {
+    for (let k = 0; k < this.frames.length; k++) {
+      if (this.frames[k]!.serverTime < serverTime) this.voidKeyAt(k, key);
+    }
+  }
+
+  /** Drop `key` from the frame at `k`, out of a COPY of it rather than out of the map the host handed to `push`: the frame and its entities belong to the caller, and this class does not get to edit a value it was merely shown. */
+  private voidKeyAt(k: number, key: K): void {
+    const frame = this.frames[k]!;
+    if (!frame.entities.has(key)) return;
+    const entities = new Map(frame.entities);
+    entities.delete(key);
+    this.frames[k] = { ...frame, entities };
+  }
+
+  /**
    * Drop all buffered frames and per-entity state, and reset the adaptive
    * delay to its starting value.
    *
@@ -1089,6 +1193,7 @@ export class SnapshotInterpolator<K extends string | number> {
     this.frames = [];
     this.lastSeenAt.clear();
     this.motion.clear();
+    this.teleports.clear();
     this.localClockMs = 0;
     this.playheadStepMs = 0;
     this.lastPlayServerTime = null;
@@ -1303,13 +1408,19 @@ export class SnapshotInterpolator<K extends string | number> {
 
     let underranThisCall = false;
 
+    // AHEAD OF EVERY BRANCH BELOW, because a teleported key is precisely the
+    // key none of them can answer for yet: its history has been voided and its
+    // destination sits in the buffer's future until the playhead reaches it.
+    // Each branch skips a key this rendered.
+    if (this.teleports.size > 0) this.holdTeleports(out, i, smoothS);
+
     if (i === -1) {
       // Playback has not caught up to the oldest buffered frame yet (this is
       // normal for the first moment after a fresh connection or `clear()`):
       // hold at the earliest known pose rather than inventing one further back.
       const frame = this.frames[0]!;
       for (const [key, sample] of frame.entities) {
-        if (!this.lastSeenAt.has(key)) continue;
+        if (!this.lastSeenAt.has(key) || this.teleports.has(key)) continue;
         out.set(key, this.finishEntity(key, sample.x, sample.y, sample.heading ?? 0, sample, false, smoothS));
       }
     } else if (i === this.frames.length - 1) {
@@ -1330,7 +1441,7 @@ export class SnapshotInterpolator<K extends string | number> {
       const prevDtS = prev ? (curr.serverTime - prev.serverTime) / 1000 : 0;
 
       for (const [key, sample] of curr.entities) {
-        if (!this.lastSeenAt.has(key)) continue;
+        if (!this.lastSeenAt.has(key) || this.teleports.has(key)) continue;
         let vx = 0;
         let vy = 0;
         const before = prev?.entities.get(key);
@@ -1354,7 +1465,7 @@ export class SnapshotInterpolator<K extends string | number> {
 
       const keys = new Set<K>([...a.entities.keys(), ...b.entities.keys()]);
       for (const key of keys) {
-        if (!this.lastSeenAt.has(key)) continue;
+        if (!this.lastSeenAt.has(key) || this.teleports.has(key)) continue;
         const sa = a.entities.get(key);
         const sb = b.entities.get(key);
         if (sa && sb) {
@@ -1376,6 +1487,41 @@ export class SnapshotInterpolator<K extends string | number> {
 
     this.decayUnderrun(underranThisCall, dt);
     return out;
+  }
+
+  /**
+   * Render every key still held at a teleport destination, and release the
+   * ones the playhead has caught up with.
+   *
+   * THE RELEASE CONDITION IS THE BRACKET, not a timer and not a frame count:
+   * two buffered frames at or past the destination with the playhead between
+   * them is exactly what ordinary interpolation needs, and both of them are
+   * post-teleport by construction, since `teleport` voided the key from
+   * everything older and `push` voids it out of anything that lands late. So
+   * the frame the hold ends on is the first frame that can be interpolated
+   * honestly, and the pose it starts from is the destination the hold was
+   * already drawing: continuous, with no second correction to unwind.
+   *
+   * An underrun keeps the hold rather than extrapolating, which is the same
+   * rule seen from the other side: the velocity an extrapolation would use is
+   * derived from two frames, and the entity has only one pose on this side of
+   * the jump. A key swept out by `dropAfterMs` while the world went quiet
+   * releases here too, since holding a pose for an entity nothing is renewing
+   * is the freeze this module refuses everywhere else.
+   */
+  private holdTeleports(out: Map<K, InterpolatedEntity>, i: number, smoothS: number): void {
+    for (const [key, dest] of this.teleports) {
+      if (!this.lastSeenAt.has(key)) {
+        this.teleports.delete(key);
+        continue;
+      }
+      if (i >= 0 && i < this.frames.length - 1 && this.frames[i]!.serverTime >= dest.serverTime) {
+        this.teleports.delete(key);
+        continue;
+      }
+      const s = dest.sample;
+      out.set(key, this.finishEntity(key, s.x, s.y, s.heading ?? 0, s, false, smoothS));
+    }
   }
 
   /** Index of the last buffered frame at or before the playback point, or -1 if the playhead sits before every buffered frame. */

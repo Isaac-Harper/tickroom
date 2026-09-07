@@ -103,6 +103,87 @@ describe('PredictedEntity', () => {
     expect(entity.stats.stamped).toBe(4);
   });
 
+  it('the step is handed the tick it is producing, on every stamp and on every replayed record', () => {
+    // A step whose collision context is TIME DEPENDENT (a grid that changed
+    // two ticks ago, an arena that closes every other tick) cannot index it
+    // without this: a replay runs several ticks inside one snapshot, so the
+    // newest tick's world is the wrong answer for all but the last of them.
+    const seen: number[] = [];
+    const recorder = (pose: Pose, input: Dir, dt: number, tick: number): Pose => {
+      seen.push(tick);
+      return stepY(pose, input, dt);
+    };
+    const { entity, tick } = make(recorder);
+
+    tick.anchorTo(1000);
+    entity.advance({ dir: 1 }, FRAME);
+    expect(seen).toEqual([1000]);
+
+    // A frame that crossed three ticks owes three records, and each one is
+    // stepped under its own name, in order.
+    seen.length = 0;
+    tick.anchorTo(1003);
+    entity.advance({ dir: 1 }, FRAME);
+    expect(seen).toEqual([1001, 1002, 1003]);
+
+    // And the replay is the records `targetTick > snapTick`, under the same
+    // names they were stamped with.
+    seen.length = 0;
+    entity.reconcile(INITIAL, 1000);
+    expect(seen).toEqual([1001, 1002, 1003]);
+  });
+
+  it('the speculation names the ticks it is producing too, past the newest stamp', () => {
+    // The speculation is the history's continuation, so it is stepped on the
+    // ticks that continue it: the newest stored pose is tick 100, and what is
+    // drawn past it belongs to 101 onward.
+    const seen: number[] = [];
+    const recorder = (pose: Pose, input: Dir, dt: number, tick: number): Pose => {
+      seen.push(tick);
+      return stepY(pose, input, dt);
+    };
+    const { entity, tick } = make(recorder);
+    tick.anchorTo(100);
+    entity.reconcile(INITIAL, 99);
+    entity.advance({ dir: 1 }, FRAME);
+
+    seen.length = 0;
+    tick.markUnanchored();
+    entity.advance({ dir: 1 }, 2);
+    expect(seen).toEqual(Array.from({ length: PLAYHEAD_SNAP_TICKS }, (_, k) => 101 + k));
+  });
+
+  it('a step that depends on the tick replays to exactly where the server got to', () => {
+    // THE CASE THE ARGUMENT EXISTS FOR, stated as a measurement rather than as
+    // an interface. The world changes every other tick, so a replay that ran
+    // every record through the NEWEST tick's world lands somewhere the server
+    // never went, and the difference is glided away as a correction that was
+    // never a correction: rubberbanding with a healthy link behind it.
+    const speedAt = (t: number): number => (t % 2 === 0 ? SPEED : SPEED / 3);
+    const stepAtTick = (pose: Pose, input: Dir, dt: number, tick: number): Pose => ({
+      x: pose.x,
+      y: pose.y + input.dir * speedAt(tick) * dt,
+    });
+    const { entity, tick } = make(stepAtTick);
+    tick.anchorTo(1000);
+    entity.reconcile(INITIAL, 999);
+    for (let t = 1000; t <= 1010; t++) {
+      tick.anchorTo(t);
+      entity.advance({ dir: 1 }, FRAME);
+    }
+
+    // The server applying the same records to the same pose, which is the
+    // whole promise of stamping.
+    let server = INITIAL;
+    for (let t = 1000; t <= 1005; t++) server = stepAtTick(server, { dir: 1 }, DT, t);
+    entity.reconcile(server, 1005);
+
+    let truth = server;
+    for (let t = 1006; t <= 1010; t++) truth = stepAtTick(truth, { dir: 1 }, DT, t);
+    expect(entity.pose.y).toBe(truth.y);
+    expect(entity.stats.lastError).toBe(0);
+  });
+
   it('the payload is the last INPUT_WINDOW records, ascending, as a JSON array of exactly { targetTick, data }', () => {
     const { entity, tick, sent } = make();
     for (let t = 1000; t < 1010; t++) {

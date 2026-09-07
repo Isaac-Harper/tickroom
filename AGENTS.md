@@ -637,7 +637,18 @@ whole timing guarantee rests on nothing in it ever awaiting.
   overwrite each other's record for every tick. Each record keeps a JSON
   COPY of the input and predicts through the copy, so the replay is byte
   for byte what the server applied whatever the caller does to its input
-  object afterwards.
+  object afterwards. AND SINCE 0.3.0 THE STEP IS TOLD WHICH TICK IT IS
+  PRODUCING: `step(pose, input, dt, tick)`, where `tick` is the record's own
+  `targetTick`, passed at all three call sites (the per-frame stamping in
+  `advance`, every replayed record in `reconcile`, and the speculation, which
+  names the ticks that continue the history). A replay runs several ticks
+  inside one snapshot, so a host whose collision context is time dependent (a
+  grid as it stood two ticks ago, an arena that closes every other tick) could
+  only approximate it with the newest tick's world; a step that ignores the
+  fourth argument compiles unchanged. `Pose` is `x`, `y` and `heading` and a
+  replay keeps NOTHING else, which the type's own doc now says loudly: a field
+  a host hangs on the pose is dropped the moment a record is replayed or a
+  correction shifts the history.
   `snapTo(pose)` IS THE THIRD CALL AND THE ONLY ONE THE GAME DRIVES: a
   respawn, a teleport, a round reset. `reconcile` cannot tell one of those
   from an ordinary disagreement, so a respawn closer than `maxSpeed * 0.5` is
@@ -658,7 +669,7 @@ whole timing guarantee rests on nothing in it ever awaiting.
   what `reconcile` is for, and the glide is what makes an ordinary
   disagreement invisible. Pong does not use it, because no event in pong moves
   a paddle.
-  `predictedEntity.test.ts` (57 cases) includes the input change contract
+  `predictedEntity.test.ts` (60 cases) includes the input change contract
   end to end against a server model consuming the record stamped T on the
   step that produces T, with the historical off-by-one kept as the control
   (it reddens one tick of travel at exactly the three changes and nowhere
@@ -771,6 +782,26 @@ whole timing guarantee rests on nothing in it ever awaiting.
   `this.motion` kept as a genuine fallback for a host that seeds without
   clearing first), which costs the host nothing because `InterpolatedEntity`
   already carries `speed`: the map `frame()` handed back IS a valid argument.
+  AND 0.3.0 ADDS `teleport(key)`, THE ONE JUMP THIS MODULE MUST NOT SMOOTH. A
+  respawn, or an elimination that puts a player on the border, is not motion:
+  the bracket spanning it plays the whole distance back at playback speed.
+  `forget` is NOT the call for it (it drops `lastSeenAt` and the motion and
+  leaves the FRAMES, so the key re-seeds one snapshot later inside that same
+  bracket and streaks anyway: a consumer measured 21.2, 15.0, 7.1 and 7.1 unit
+  steps on a walk speed of 4, worse than making no call at all, and worked
+  around it with `ceil(delayMs / tickMs) + 1` consecutive forgets). `teleport`
+  voids the key out of every buffered frame older than the destination (out of
+  a COPY of each frame, since the maps belong to the host), drops its motion
+  state so `speed` reads 0, refreshes `lastSeenAt` rather than dropping it, and
+  HOLDS the entity at the destination, `extrapolated: false`, ahead of all
+  three branches of `sample()`, until the playhead has two post-teleport frames
+  to bracket. The hold is exactly `delayMs` long: measured at 5, 5, 6, 12, 18
+  and 30 rendered frames at 60Hz for the default delay and pinned delays of 80,
+  100, 200, 300 and 500ms. THE CALL ORDER IS THE CONTRACT, because it reads the
+  destination out of the buffer: call it AFTER the frame carrying the
+  destination was pushed, which on `RoomConnection`'s `interpolate` option
+  means from `onSnapshot`. A late arrival from before the destination is voided
+  as it lands, for the same reason.
 - `src/client/connection.ts` - `RoomConnection`. Reconnect, re-mint, clock sync,
   protocol-skew recovery, stall observation, AND the two epoch-scoped components
   it owns: the tick counter and (optionally) a `SnapshotInterpolator`. Generic in
@@ -811,7 +842,10 @@ whole timing guarantee rests on nothing in it ever awaiting.
   `new Impl(url)` synchronously. Every call out to host code goes through
   `emit()` (`onStatus`, `onStallChange`, `onTerminal`, `onTickReanchor`,
   `onText`, `onSnapshot`), and the close path schedules the reconnect BEFORE it
-  announces the status. `rttMs` is a SLIDING-WINDOW MINIMUM over `RTT_WINDOW`
+  announces the status. THE PUSH-BEFORE-`onSnapshot` ORDERING IS NOW A PUBLIC
+  CONTRACT rather than only a defence: `SnapshotInterpolator.teleport(key)`
+  reads the destination out of the buffer, so `onSnapshot` is the callback a
+  host calls it from, and both option docs say so. `rttMs` is a SLIDING-WINDOW MINIMUM over `RTT_WINDOW`
   (8) accepted samples, discarding anything above `RTT_MAX_SAMPLE_MS` (5000) or
   taken while the render loop was frozen. Once the server clock is seeded a
   snapshot more than `SNAPSHOT_TIME_PLAUSIBLE_MS` (60000) from `serverNow()`, or
@@ -1774,6 +1808,12 @@ whole timing guarantee rests on nothing in it ever awaiting.
   The clamp is the whole difference between a smoother and a lie: it can only
   ever hide this module's own guess, so a real teleport, a respawn or an
   authoritative correction still snaps.
+- A JUMP THE HOST KNOWS ABOUT IS THE HOST'S TO DECLARE, on both paths and from
+  the snapshot that carries it: `SnapshotInterpolator.teleport(key)` for a
+  remote entity (after the push, which `onSnapshot` guarantees) and
+  `PredictedEntity.snapTo(pose)` for the owned one. Neither smoother can tell a
+  respawn from a disagreement on its own, and both are built to render the path
+  between two poses, which is precisely what a jump has none of.
 - BOTH TERMS OF THE PLAYHEAD ARE SLEW-CAPPED: the offset at 5%, the delay at 8%
   of wall time. Both are subtracted from the playhead, so moving either quickly
   IS rendering every remote entity fast or slow for as long as the move lasts.
@@ -2573,6 +2613,54 @@ keeps the evidence either way, since `document.wasDiscarded` survives a reload
 where a fresh navigation to the same URL would clear it. Measured on 152: the
 reload revived it at 6.4s.
 
+A JUMP THE HOST KNOWS ABOUT IS NOT AN INTERPOLATION PROBLEM, AND `forget` IS
+THE TRAP ON THE WAY TO LEARNING THAT. Every mechanism in `interpolation.ts`
+exists to render the path between two poses, so an entity that was PUT
+somewhere (a respawn, an elimination moving a player to the border, a round
+reset) is the one input the whole design is wrong for: the bracket that spans
+the jump plays it back as a sprint. The obvious reach is `forget(key)`, and it
+is worse than doing nothing. It drops `lastSeenAt` and the motion state and
+leaves the frames, so the key re-seeds one snapshot later INSIDE the same
+bracket and streaks anyway, in pieces: 21.2, 15.0, 7.1 and 7.1 unit steps on an
+entity whose walk speed is 4, measured by a consumer on the released 0.2.0,
+against 4.3, 6.7, 6.7 and 2.7 for the same profile in this repo's own test with
+no call at all. The consumer's workaround was `ceil(delayMs / tickMs) + 1`
+CONSECUTIVE forgets, one per rendered frame, which is the buffer depth
+expressed as a call count and is exactly the sort of thing a library is
+supposed to own. `teleport(key)` is that call, once, and the hold it installs
+is the buffer depth measured rather than counted.
+
+AND ITS CALL ORDER IS A CONTRACT, NOT A PREFERENCE, because it reads the
+destination out of the buffer: called before the frame carrying the destination
+is pushed it finds the pose the entity had BEFORE the jump and voids the
+history behind THAT, which is the streak again with an extra step in it. On
+`RoomConnection`'s `interpolate` option the ordering is satisfied by
+construction from `onSnapshot`, since the connection pushes and then calls the
+host back, which is why that ordering is now stated in three places (the method
+doc, `SnapshotInterpolationOptions`, and `onSnapshot`'s own doc) instead of
+being a comment inside `processSnapshot`.
+
+A PREDICTION STEP HAS TO BE PURE OF CLIENT-FRAME STATE, NOT MERELY OF ITS OWN,
+AND THIS IS WHAT RUBBERBANDING ON A HEALTHY LINK LOOKS LIKE. `reconcile`
+replays the records from the SERVER's pose, so every hook the step reads has to
+be evaluated from the pose it is handed, on the tick it is handed. A consumer
+latched "am I standing on my own bomb" once per frame from the RAW prediction
+and read the latch inside the step: the replay, starting from the server's
+pose, was refused every move it tried, so every snapshot produced a correction
+the link had nothing to do with. The fix is the shape, not the value: hooks are
+functions of the arguments. The tick argument added in 0.3.0 is the other half
+of the same rule, since a replay runs several ticks inside one snapshot and the
+newest tick's world is the wrong answer for all but the last of them.
+
+A MINIMUM-FRAME-INTERVAL GATE IN A rAF LOOP IS A FRAME DROPPER. `if (now - last
+< 1000 / 61) return;` reads like a limiter and behaves like a filter on
+timestamp jitter: the callbacks that land a hair under the threshold are
+skipped outright, and every skip is a visible hitch on a moving entity.
+Measured on a 60Hz display with that exact gate: 16% of frames dropped. The
+browser already paces the loop at the display rate, `conn.frame(now)` measures
+its own delta, and every smoother in the client runs on real elapsed time, so
+an early frame costs a small `dt` and nothing else. Render every callback.
+
 ## Gates
 
 From the repo root:
@@ -2657,17 +2745,18 @@ nothing here saw it.
 
 ## Status
 
-MEASURED ON THIS TREE, not estimated: `npx vitest run` collects 1130 tests
+MEASURED ON THIS TREE, not estimated: `npx vitest run` collects 1149 tests
 across 43 files (with a local Redis up on 6399, so the TWELVE integration files
 run rather than skip; pointed at an unreachable one with
-`TICKROOM_TEST_REDIS_URL=redis://127.0.0.1:6499` it is 1067 passed and 63
+`TICKROOM_TEST_REDIS_URL=redis://127.0.0.1:6499` it is 1086 passed and 63
 skipped across 31 files run and 12 skipped, still exit 0, because
-`tests/memory.test.ts` needs nothing and runs either way); on fw13 with a real
-Redis the same suite is 1130 passed across 43 files, exit 0; `npx tsc --noEmit`
+`tests/memory.test.ts` needs nothing and runs either way); the last fw13 run of
+the same suite, at the 1130 it collected before the 0.3.0 client work, was
+exit 0 with a real Redis too; `npx tsc --noEmit`
 is clean repo-wide including `examples/`; `npm run build` emits `dist/`
-cleanly. Roughly 17,100 lines of source and 24,900 of tests. Per layer, and
+cleanly. Roughly 18,200 lines of source and 28,400 of tests. Per layer, and
 these SUM to the total rather than approximating it: core 208, server 361,
-client 273, codec 109, adapters 69, examples 46, `tests/` 64.
+client 292, codec 109, adapters 69, examples 46, `tests/` 64.
 
 THE LONG RUNS HAPPEN ON A SECOND MACHINE NOW, AND THAT IS WHY THE WALL-CLOCK
 CASES MOVED. Anything that takes minutes (the whole suite, the split-brain long
@@ -2699,7 +2788,7 @@ decides whether the host can measure at all and the files say why when it
 cannot.
 
 PER FILE, which is what a mutation row is measured against: `ticker.test.ts`
-146, `relay.test.ts` 124, `connection.test.ts` 122, `interpolation.test.ts` 48,
+146, `relay.test.ts` 124, `connection.test.ts` 122, `interpolation.test.ts` 64,
 `ids.test.ts` 64, `bytes.test.ts` 52, `netPolicy.test.ts` 18, `lease.test.ts`
 34, `snapshot.test.ts` 34, `playout.test.ts` 30, `quantize.test.ts` 23,
 `core/checkpoint.test.ts` 23, `server/checkpoint.test.ts` 22,
@@ -2707,7 +2796,7 @@ PER FILE, which is what a mutation row is measured against: `ticker.test.ts`
 `admission.test.ts` 16, `backpressure.test.ts` 16, `starvation.test.ts` 16,
 `balancer.test.ts` 20, `redis.test.ts` 14, `adapters/node.test.ts` 15,
 `errorOffset.test.ts` 10, `clientTick.test.ts` 13, `predictedEntity.test.ts`
-57, `rateLimit.test.ts` 8,
+60, `rateLimit.test.ts` 8,
 `bundling.test.ts` 5, and in the examples `pong/sim.test.ts` 23,
 `cursors/sim.test.ts` 19, `pong/codec.test.ts` 4.
 
