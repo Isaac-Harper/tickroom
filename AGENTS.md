@@ -2704,6 +2704,17 @@ browser already paces the loop at the display rate, `conn.frame(now)` measures
 its own delta, and every smoother in the client runs on real elapsed time, so
 an early frame costs a small `dt` and nothing else. Render every callback.
 
+A COLD START SAYS SO NOW. Every way a ticker could fail to restore had its own
+log line except the ordinary one, an absent checkpoint, which the inspection
+comment deliberately kept silent; a consumer's handoff test that failed one
+run in four on `ticker.restore-failed` (a fuse one tick outside its own
+deserializer's band) took a captured log to diagnose because a bare "no
+`ticker.restore`" cannot distinguish the branches. `ticker.fresh` is emitted at
+info from the fresh branch with `meta.checkpoint` set to `absent`, the refusal
+reason, or `not-restored` (after a geometry mismatch or a `deserialize` throw
+that already logged its own kind), so a room started clean is one positive
+event rather than an absence of one.
+
 A FRAGMENTED FRAME IS THE RELAY'S PROBLEM, AND IT USED TO BE EVERY HOST'S. `ws`
 delivers a fragmented message as an ARRAY of buffers rather than as one, a peer
 or a proxy chooses its own fragmentation, and nothing about a frame's size
@@ -2817,8 +2828,8 @@ skipped across 32 files run and 12 skipped, still exit 0, because
 the same suite, at the 1130 it collected at 0.2.0 before the 0.3.0 client work,
 `src/testing/lockstep.test.ts` and the relay's fragment cases, was exit 0 with
 a real Redis too; `npx tsc --noEmit` is clean repo-wide including `examples/`;
-`npm run build` emits `dist/` cleanly. Roughly 18,600 lines of source and
-28,800 of tests. Per layer, and these SUM to the total rather than
+`npm run build` emits `dist/` cleanly. Roughly 18,700 lines of source and
+28,700 of tests. Per layer, and these SUM to the total rather than
 approximating it: core 208, server 364, client 293, codec 109, adapters 69,
 testing 8, examples 46, `tests/` 64.
 

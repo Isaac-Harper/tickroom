@@ -1217,6 +1217,19 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
       } else {
         state = runtime.create(roomId);
         stateReady = true;
+        // SAY SO. Every way of NOT restoring above has its own line except
+        // the ordinary cold start, and a reader of the log could not tell
+        // "there was no checkpoint" from "the restore code was never reached"
+        // (a consumer's handoff test failed one run in four on a restore that
+        // threw, and it took a captured log to learn which). One positive
+        // event, at info, with what the checkpoint read looked like, closes
+        // that gap without making a cold room noisy.
+        log({
+          lvl: 'info',
+          kind: 'ticker.fresh',
+          room: roomId,
+          meta: { checkpoint: inspected.ok ? 'not-restored' : inspected.reason },
+        });
         // Fresh per room CREATION, preserved across every RESTORE (see the
         // `restored` branch above, which keeps the checkpoint's own
         // incarnation rather than minting one here). This is what lets a

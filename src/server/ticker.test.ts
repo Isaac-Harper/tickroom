@@ -224,6 +224,7 @@ describe('runTicker', () => {
     );
 
     let observedFirstTick = -1;
+    const logs: LogEvent[] = [];
     const result = await runTicker({
       runtime: makeCounterRuntime({
         tick: (state) => {
@@ -238,12 +239,19 @@ describe('runTicker', () => {
       namespace: NS,
       geomKey: () => 'new-geometry',
       emptyGraceMs: 10,
+      log: (ev) => logs.push(ev),
     });
 
     expect(observedFirstTick).toBe(0); // fresh room, not the stale 999
     const persisted = unpackCheckpoint(await readCheckpoint(redis, keys.state));
     expect(persisted?.incarnation).not.toBe('stale-incarnation'); // a fresh incarnation was minted
     expect(result.reason).toBe('empty');
+    // The mismatch has its own line, and the fresh start that follows it has
+    // one too, naming a checkpoint that was present but not restored.
+    expect(logs.some((ev) => ev.kind === 'ticker.geom-mismatch')).toBe(true);
+    const fresh = logs.filter((ev) => ev.kind === 'ticker.fresh');
+    expect(fresh).toHaveLength(1);
+    expect(fresh[0]?.meta).toEqual({ checkpoint: 'not-restored' });
   });
 
   it('stops publishing once the lease is stolen mid-run (split-brain guard)', async () => {
@@ -2783,9 +2791,10 @@ describe('runTicker: the tick grid across a handoff', () => {
     expect(stamps[0] as number).toBeLessThan(startedAt + 1000);
   });
 
-  it('a cold room with no checkpoint starts its grid at now, exactly as before', async () => {
+  it('a cold room with no checkpoint starts its grid at now, exactly as before, and says it started fresh', async () => {
     const redis = new FakeRedis();
     const stamps: number[] = [];
+    const logs: LogEvent[] = [];
     const startedAt = Date.now();
     await runTicker({
       runtime: makeCounterRuntime(recordingRuntime(stamps)),
@@ -2795,11 +2804,17 @@ describe('runTicker: the tick grid across a handoff', () => {
       namespace: NS,
       maxRunMs: 250,
       emptyGraceMs: 100_000,
-      log: () => {},
+      log: (ev) => logs.push(ev),
     });
     expect(stamps.length).toBeGreaterThan(0);
     expect(stamps[0] as number).toBeGreaterThanOrEqual(startedAt);
     expect(stamps[0] as number).toBeLessThan(startedAt + 1000);
+    // The one positive event a cold start emits, so a log reader can tell "no
+    // checkpoint" from "the restore path was never reached".
+    const fresh = logs.filter((ev) => ev.kind === 'ticker.fresh');
+    expect(fresh).toHaveLength(1);
+    expect(fresh[0]?.meta).toEqual({ checkpoint: 'absent' });
+    expect(logs.some((ev) => ev.kind === 'ticker.restore')).toBe(false);
   });
 });
 

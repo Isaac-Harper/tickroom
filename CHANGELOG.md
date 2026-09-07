@@ -5,9 +5,16 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] - Unreleased
+## [0.3.0] - 2026-09-07
 
 ### Added
+
+- `ticker.fresh`: a ticker that starts a room without restoring now logs one
+  info event saying so, with `meta.checkpoint` naming what the read found
+  (`absent`, a refusal reason, or `not-restored` after a geometry mismatch or a
+  `deserialize` throw that already logged its own line). A cold start used to
+  be silent, so a log reader could not tell "no checkpoint" from "the restore
+  path was never reached".
 
 - `SnapshotInterpolator.teleport(key)`: forget one entity's history and place it
   on the frame you have just pushed. Call it from `onSnapshot` AFTER the
