@@ -25,17 +25,21 @@ route. Releases go out from a version tag via `.github/workflows/release.yml`
 using npm trusted publishing (OIDC), so there is no stored npm token to leak;
 that workflow's header is the operating manual for cutting one. THE WORKFLOW HAS
 FAILED AT THE PUBLISH TWICE: v0.2.0 on 2026-09-05 (a 404 from npm) and v0.3.0
-on 2026-09-07, where the whole suite passed on the runner (on its second
-attempt; the first hit a load flake in `tests/example-cursors.redis.test.ts`,
-two 400ms probes coalescing into one tick) and `npm publish` then failed with
-`ENEEDAUTH`, which is what it says when the CLI never attempted the OIDC
-exchange at all. That means the npmjs.com trusted-publisher entry for this
-repository and workflow does NOT exist yet (Package tickroom, Settings,
-Trusted publishing, repository `Isaac-Harper/tickroom`, workflow
-`release.yml`); it is an account setting only the owner can add. Both 0.2.0
-and 0.3.0 were published from a laptop session (`npm publish --access public`
-against the tagged tree, no OTP prompt) and carry no provenance. The next tag
-after that entry exists is the workflow's real test.
+on 2026-09-07, where `npm publish` failed with `ENEEDAUTH`, which is what it
+says when the CLI never attempted the OIDC exchange at all: the npmjs.com
+trusted-publisher entry did not exist. IT EXISTS NOW, added on 2026-09-07
+(Package tickroom, Settings, Trusted Publisher: `Isaac-Harper/tickroom`,
+workflow `release.yml`, permissions npm publish and npm stage publish). The
+same tag's re-runs also showed the OTHER way the workflow fails: the suite it
+gates on is a wall-clock measurement, and the shared runner fired a timer late
+enough to miss two different bounds on two consecutive re-runs of a commit
+that was green locally both times (`example-cursors.redis.test.ts`, two 400ms
+probes coalesced into one tick; `splitbrain.redis.test.ts`, 780ms against a
+740ms theft bound). Both are fixed at the source (see their comments) and
+`vitest.config.ts` retries once when `CI` is set. Both 0.2.0 and 0.3.0 were
+published from a laptop session (`npm publish --access public` against the
+tagged tree, no OTP prompt) and carry no provenance; v0.3.1 is the workflow's
+real test.
 
 ## The architecture in one paragraph
 

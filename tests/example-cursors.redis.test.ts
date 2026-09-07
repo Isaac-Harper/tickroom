@@ -404,6 +404,7 @@ d('examples/cursors through a real socket', () => {
         if (mine) observed.add(`${mine.x},${mine.y}`);
       }
       const distinctProbePositions = probes.filter((p) => observed.has(`${p.x},${p.y}`)).length;
+      const coalescedProbes = probes.filter((p, i) => i > 0 && p.sentAt - (probes[i - 1] as Probe).sentAt < 1000 / TICK_HZ).length;
 
       // 5. AND THE ROOM NEVER FAULTED. `starves` is the one this file can
       //    assert a zero on that pong's cannot: a playout consume miss is only
@@ -455,7 +456,17 @@ d('examples/cursors through a real socket', () => {
         // never held, so this counts inputs that actually moved the room's
         // cursor. With the client's `conn.send` made a no-op the server's
         // cursor sits at 0.5, 0.5 for the whole run and this reads 0.
-        expect(distinctProbePositions, 'probe coordinates observed on the server cursor').toBe(probes.length);
+        // A probe timer that fires late enough to land inside the same tick
+        // as the previous probe has its coordinate overwritten on the server
+        // before any snapshot can carry it: on-arrival input keeps only the
+        // newest value per tick, by design. A shared runner did exactly that
+        // once in a full-suite run (12 of 13 observed with every probe
+        // arriving). So the line is exact when the timers fired on time and
+        // tolerates precisely the probes the host coalesced, never more.
+        expect(coalescedProbes, 'probes a starved timer landed inside one tick').toBeLessThanOrEqual(2);
+        expect(distinctProbePositions, 'probe coordinates observed on the server cursor').toBeGreaterThanOrEqual(
+          probes.length - coalescedProbes
+        );
 
         // THE PATH ITSELF, OBSERVED ON THE WIRE. The example sends unstamped,
         // so the ticker's stamped branch is never taken and no playout buffer

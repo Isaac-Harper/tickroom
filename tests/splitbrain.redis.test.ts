@@ -85,6 +85,7 @@ import { randomUUID } from 'node:crypto';
 import { type LogEvent, type RoomRuntime, roomKeys } from '../src/core/index.js';
 import { runTicker, getRedis, createSubscriber, resetRedisForTests } from '../src/server/index.js';
 import { createCounterRuntime, type CounterEvent, type CounterState } from './helpers/toyRuntime.js';
+import { TIMER_JITTER } from './helpers/jitter.js';
 import { startProxy, proxyTargetFrom, type FaultProxy, type ReplyShape } from './helpers/proxy.js';
 import {
   TEST_REDIS_URL,
@@ -133,8 +134,16 @@ const COMMAND_TIMEOUT_MS = 2000;
  * are themselves `setTimeout` durations (a checkpoint cadence, a reply delay),
  * and it is not a loosening: it is the granularity those terms have. The lapse
  * bound carries none, because nothing in it is a timer.
+ *
+ * SCALED BY THE HOST'S MEASURED TIMER LATENESS, capped at 3x, exactly as
+ * `ticker.test.ts` scales its one genuine wall-clock deadline: 100ms is the
+ * granularity on the idle machine these bounds were measured on, and a
+ * GitHub-hosted runner mid-suite fired the theft case's timers late enough to
+ * land 40ms past the fixed figure (780 against 740) with every term in the
+ * bound behaving. A late timer is more slack, not a wider claim about the
+ * library.
  */
-const SCHEDULING_SLACK_MS = 100;
+const SCHEDULING_SLACK_MS = Math.round(100 * Math.min(3, TIMER_JITTER));
 
 /** Between a renew leaving for Redis and the death, so Redis has demonstrably processed it and its reply is the one in flight when the path goes. */
 const RENEW_SETTLE_MS = 30;

@@ -1,6 +1,6 @@
 {
   "name": "tickroom",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Authoritative realtime rooms on serverless: a leased fixed-timestep tick loop, a WebSocket relay, and Redis pub/sub as the bus.",
   "license": "MIT",
   "author": "Isaac Harper",

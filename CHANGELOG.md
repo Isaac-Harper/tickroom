@@ -5,6 +5,15 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-09-07
+
+No library change. The release pipeline: the suite the workflow gates on now
+scales its split-brain scheduling slack by the host's measured timer lateness,
+tolerates probes a starved timer coalesced into one tick in the cursors
+end-to-end case, and retries a case once on CI only. This is the first release
+the workflow publishes itself, through npm trusted publishing, so it carries
+provenance; 0.3.0 and 0.2.0 were published by hand and do not.
+
 ## [0.3.0] - 2026-09-07
 
 ### Added
