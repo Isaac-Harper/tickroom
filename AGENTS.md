@@ -38,8 +38,11 @@ probes coalesced into one tick; `splitbrain.redis.test.ts`, 780ms against a
 740ms theft bound). Both are fixed at the source (see their comments) and
 `vitest.config.ts` retries once when `CI` is set. Both 0.2.0 and 0.3.0 were
 published from a laptop session (`npm publish --access public` against the
-tagged tree, no OTP prompt) and carry no provenance; v0.3.1 is the workflow's
-real test.
+tagged tree, no OTP prompt) and carry no provenance. v0.3.1 WAS THE WORKFLOW'S
+FIRST OWN PUBLISH, on 2026-09-07: the suite passed on the runner first time,
+npm accepted the OIDC exchange, and the package carries a signed provenance
+statement (transparency log index 2753833818). The release path is proven;
+`npm version` plus a pushed tag is the whole procedure from here.
 
 ## The architecture in one paragraph
 
