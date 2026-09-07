@@ -146,6 +146,26 @@ describe('browser bundling', () => {
   );
 
   it(
+    'bundles the testing entrypoint for the browser, which is the only place it is any use',
+    () => {
+      // `tickroom/testing` exists so a host can prove its client's step really
+      // is its server's step, and the runner that already has the client's
+      // step in it is the browser one. It drives a `RoomRuntime`, which is the
+      // half of the contract that usually implies `tickroom/server`, so the
+      // temptation to reach for something from there is real and the cost of
+      // giving in is that the harness stops loading where it is wanted.
+      const result = bundleForBrowser(
+        `import { runLockstep, sweepLockstep } from './src/testing/index.js';\n` +
+          `export const used = [runLockstep, sweepLockstep];\n`,
+        'testing',
+      );
+      expect(result.stderr).not.toMatch(/node:(zlib|util|crypto|fs|net|http)/);
+      expect(result.ok, `testing failed to bundle for the browser:\n${result.stderr}`).toBe(true);
+    },
+    60_000,
+  );
+
+  it(
     'still bundles the server entrypoint for node',
     () => {
       // The complement, so a future "fix" that moved the Node dependency out of

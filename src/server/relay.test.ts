@@ -564,6 +564,72 @@ describe('attachRelay', () => {
     expect(onClose).toHaveBeenCalledWith(1001);
   });
 
+  // A FRAGMENTED MESSAGE IS THIS FILE'S PROBLEM, NOT A HOST'S. `ws` delivers
+  // one as an ARRAY of buffers, a peer or a proxy chooses its own
+  // fragmentation, and before this every host wrote the same
+  // `Array.isArray(data) ? Buffer.concat(data) : data` arm in its own
+  // `decodeInput` (the README's step 2 example included) or watched one
+  // player's inputs stop with nothing anywhere saying why.
+  describe('what reaches decodeInput', () => {
+    it('joins a fragmented binary frame into one buffer', async () => {
+      const seen: unknown[] = [];
+      const decodeInput = vi.fn((data: unknown): ClientInput[] => {
+        seen.push(data);
+        return [];
+      });
+      const { socket, opts } = baseOptions({ decodeInput, inboundCapacity: 100 });
+      const handle = attachRelay(opts);
+      await new Promise((r) => setTimeout(r, 5));
+
+      const whole = Buffer.from('[{"targetTick":41,"data":{"dir":1}}]', 'utf8');
+      socket.fire('message', [whole.subarray(0, 9), whole.subarray(9, 20), whole.subarray(20)], true);
+
+      expect(seen).toHaveLength(1);
+      // One frame, not three pieces of one, and byte for byte what the peer
+      // sent: a host decodes this without knowing the message was split.
+      expect(Array.isArray(seen[0])).toBe(false);
+      expect(seen[0]).toBeInstanceOf(Uint8Array);
+      expect(Buffer.from(seen[0] as Uint8Array).equals(whole)).toBe(true);
+      handle.close();
+    });
+
+    it('hands a text frame through as the string it arrived as', async () => {
+      const seen: unknown[] = [];
+      const decodeInput = vi.fn((data: unknown): ClientInput[] => {
+        seen.push(data);
+        return [];
+      });
+      const { socket, opts } = baseOptions({ decodeInput, inboundCapacity: 100 });
+      const handle = attachRelay(opts);
+      await new Promise((r) => setTimeout(r, 5));
+
+      socket.fire('message', '[{"targetTick":41,"data":{"dir":1}}]', false);
+
+      expect(seen).toEqual(['[{"targetTick":41,"data":{"dir":1}}]']);
+      handle.close();
+    });
+
+    it('leaves an array that is not all bytes exactly as it arrived', async () => {
+      // ALL OF IT OR NONE OF IT. An array carrying something that is not a
+      // chunk of bytes is not a fragmented binary message, whatever else it
+      // is, and joining it would hand a host's decoder a frame nobody sent.
+      const seen: unknown[] = [];
+      const decodeInput = vi.fn((data: unknown): ClientInput[] => {
+        seen.push(data);
+        return [];
+      });
+      const { socket, opts } = baseOptions({ decodeInput, inboundCapacity: 100 });
+      const handle = attachRelay(opts);
+      await new Promise((r) => setTimeout(r, 5));
+
+      const odd = [Buffer.from('ab', 'utf8'), 'cd'];
+      socket.fire('message', odd, true);
+
+      expect(seen).toEqual([odd]);
+      handle.close();
+    });
+  });
+
   // TR-6. Both events happen on paths the host cannot otherwise observe:
   // the bucket rejects BEFORE `decodeInput` runs, and a decoder throw is
   // swallowed by a bare catch. Neither may be logged per message, so a

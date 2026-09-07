@@ -62,13 +62,7 @@ Four properties fall out of it:
 npm install tickroom ioredis
 ```
 
-**Everything documented here is 0.2.0**, which is what `package.json` says and what the audit's API changes landed in. **0.2.0 is not on npm yet**: the published version is 0.1.1, whose `conn.stats()` has a different shape, whose `TerminalReason` is missing three members, and whose relay has no warm swap. Until the release tag goes out, install from a checkout:
-
-```bash
-git clone https://github.com/Isaac-Harper/tickroom && cd tickroom
-npm install && npm pack          # -> tickroom-0.2.0.tgz
-npm install /path/to/tickroom-0.2.0.tgz   # from your own project
-```
+**0.2.0 is on npm** and is what the command above installs. `package.json` says 0.3.0 and this document is the 0.3.0 tree, so anything marked as new here (`SnapshotInterpolator.teleport`, the `tick` argument on a predicted step, `tickroom/testing`) lands with that release rather than being in your `node_modules` today. `CHANGELOG.md` has both, and its 0.2.0 entry is the migration guide from 0.1.x, whose `conn.stats()` had a different shape, whose `TerminalReason` was missing three members and whose relay had no warm swap.
 
 `ioredis` is an **optional** peer dependency, and it is needed only by `tickroom/server` and the two adapters, which is where the bus lives. A browser-only consumer of `tickroom/client`, `tickroom/core` and `tickroom/codec` installs `tickroom` alone:
 
@@ -285,16 +279,16 @@ export const GET = createRelayRoute({
   // dropped every ~13 minutes.
   maxDurationS: 800,
   // `decodeInput`'s parameter is `unknown`, not `ArrayBuffer`: the real
-  // transport behind this route is the `ws` package, which hands a
-  // `Buffer` (or an ARRAY of them for a fragmented message, which a peer or a
-  // proxy chooses for itself and which nothing about a frame's size
-  // prevents), so normalise before decoding rather than assuming a
-  // browser-style ArrayBuffer. `Buffer.concat` is the whole of it.
+  // transport behind this route is the `ws` package, which hands over a
+  // `Buffer` rather than a browser-style ArrayBuffer. A FRAGMENTED message
+  // (an array of buffers, which a peer or a proxy chooses for itself) is
+  // joined by the relay before it gets here, so there is nothing to
+  // normalise; a text frame arrives as a `string`.
   // One JSON array of `{ targetTick, data }` per message, which is what
   // `PredictedEntity` sends in step 3 (the last six ticks, re-sent whole, so
   // a lost packet is not a starved tick). A single object is accepted too.
   decodeInput: (buf) => {
-    const parsed = JSON.parse(new TextDecoder().decode(Array.isArray(buf) ? Buffer.concat(buf) : (buf as Buffer)));
+    const parsed = JSON.parse(new TextDecoder().decode(buf as Uint8Array));
     return Array.isArray(parsed) ? parsed : [parsed];
   },
   // WIRE `onBadInput`. A decoder that throws is caught and dropped in
@@ -733,6 +727,59 @@ onText: (msg) => {
   setPresence(Object.keys(msg.map)); // keyed by pid; values are your joinMeta
 },
 ```
+
+### Testing your step
+
+`PredictedEntity` replays your step from the server's pose. If that step reads
+any context the server does not read at the same tick, the replay is wrong and
+**nothing anywhere reports it**: the arithmetic is pure, the reconcile runs, the
+error stays small, and what a player sees is rubberbanding. No check inside this
+library can see it, because the context lives in your closure.
+
+`tickroom/testing` runs both ends against each other so it can. It drives your
+real `RoomRuntime` the way the ticker does, through your real codec so the
+client sees wire-quantised poses, with the real `PredictedEntity` stamping
+`lead` ticks ahead of a server whose snapshots arrive `delay` ticks late.
+
+```ts
+import { runLockstep, sweepLockstep } from 'tickroom/testing';
+
+const scenario = {
+  runtime: pongRuntime,
+  pid: 'p1',
+  setup: (s) => { pongRuntime.join(s, 'p1'); s.paddles.get('p1')!.y = 12; },
+  encode: (s) => encodePongSnapshot(s, s.tick * 50),
+  decode: (bytes) => decodePongSnapshot(bytes as Uint8Array),
+  ownPose: (snap) => {
+    const mine = snap.paddles.find((p) => p.pid === 'p1');
+    return mine === undefined ? null : { x: 0, y: mine.y };
+  },
+  step: (pose, input, dt) => ({ x: pose.x, y: stepPaddleY(pose.y, input.dir, dt) }),
+  maxSpeed: PADDLE_SPEED,
+  input: () => ({ dir: 1 }),
+  ticks: 20,
+};
+
+for (const { lead, delay, report } of sweepLockstep(scenario, [3, 6, 10], [2, 5])) {
+  expect(report.maxError, `lead ${lead}, delay ${delay}`).toBe(0);
+  expect(report.pinned).toEqual([]);
+}
+```
+
+**Sweep it, never sample it.** A step reading its context at the wrong tick is
+exact whenever the client happens to be stamping the tick it reads, so one lead
+proves nothing. `maxError` is the largest reconcile error in your own units and
+should sit at your wire's quantisation and no higher; `pinned` is the ticks
+where the server's pose moved and the client's raw pose did not, which is what a
+step refusing to move looks like from inside. `report.trace` is the whole run,
+tick by tick, when a number is not enough. Pass `onSnapshot` and update the same
+client-side context your page updates, or the harness tests a world your page
+never gives the step.
+
+It imports no Node builtin and no `ioredis`, so it loads in the browser test
+runner your client code already runs in. `src/testing/lockstep.test.ts` runs the
+pong example through it both ways: exact at every lead and delay, and a
+deliberately broken step reported as pinned and wrong.
 
 ---
 
@@ -1388,10 +1435,6 @@ weaker.
   quiet machine on a residential link rather than a loaded container, and a
   whole-process stall detector in the page, since a blocked event loop stops the
   message handler too and cannot be told apart from inside it.
-- **0.2.0 is not tagged.** The `RedisLike` question that used to sit beside it
-  is closed: `createMemoryRedis()` is the second shipped implementation of the
-  interface and `tickroom/server/memoryRedis` is the import that reaches it
-  without loading `ioredis`.
 - **No lint script**, so CI runs no linter.
 
 ---

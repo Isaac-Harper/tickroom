@@ -14,8 +14,11 @@ generalised so it works for 2D games, collaborative apps, multiplayer cursors,
 or anything realtime where several clients need to agree on state changing many
 times a second.
 
-PUBLIC repo, MIT licensed, and PUBLISHED TO NPM as `tickroom` (0.1.1 at the time
-of writing; `npm install tickroom ioredis`). It also still installs as a git
+PUBLIC repo, MIT licensed, and PUBLISHED TO NPM as `tickroom` (0.2.0 is the
+newest on the registry; `npm install tickroom ioredis`). `package.json` says
+0.3.0 and this tree IS 0.3.0 UNRELEASED: `CHANGELOG.md` is the record of what
+that release carries, and its 0.2.0 entry is the migration guide from 0.1.x
+that never existed. It also still installs as a git
 dependency, which is what `prepare` exists for (npm builds a git dep by running
 it, and `dist/` is gitignored), so the hook stays whether or not anyone uses that
 route. Releases go out from a version tag via `.github/workflows/release.yml`
@@ -84,7 +87,18 @@ src/codec/     the wire. byte reader/writer, quantisation, a default codec.
 src/adapters/  thin wiring per platform. takes the platform handle by
                INJECTION so the library never hard-depends on one host, and
                SPREADS the server option bags rather than re-listing them.
+src/testing/   the lockstep harness a host runs against its OWN step. drives
+               a `RoomRuntime` the way the ticker does, so it reads as server
+               code, but it is under the CLIENT's rule: no node builtin, no
+               ioredis, because the runner that already holds the host's step
+               is the browser one. `bundling.test.ts` bundles it to prove it.
 ```
+
+`package.json` `exports` carries one subpath per public entry point: `.`,
+`./core`, `./server`, `./server/memoryRedis`, `./client`, `./codec`,
+`./adapters/vercel`, `./adapters/node` and `./testing`. `dist/` is gitignored
+and every one of them points into it, which is what `"prepare": "npm run build"`
+exists for.
 
 THE CONTRACT IS `src/core/types.ts`. `RoomRuntime<TState, TEvent>` is the interface
 a user's simulation implements, and the single most important property of the
@@ -1011,6 +1025,35 @@ whole timing guarantee rests on nothing in it ever awaiting.
   `./adapters/vercel` and `./adapters/node` as the entry points, so nothing
   could reach a combined barrel, and a barrel over two platform adapters would
   put both platforms in one import graph anyway.
+- `src/testing/lockstep.ts` - NEW in 0.3.0, and the whole of `tickroom/testing`
+  (`src/testing/index.ts` is the barrel `package.json` points `./testing` at).
+  `runLockstep` runs a host's own `RoomRuntime` and its own `PredictedEntity`
+  step against each other for `ticks` ticks with a modelled `lead` and `delay`,
+  through the host's own `encode`/`decode` so the client reads WIRE-QUANTISED
+  poses; `sweepLockstep` does it once per lead/delay combination. It reports
+  `maxError`, the `reconciles` above a threshold, `snaps`, `stamped`, the
+  per-tick `trace`, and `pinned`, the ticks where the server's pose moved and
+  the client's raw `entity.pose` did not. IT EXISTS FOR THE ONE DIVERGENCE NO
+  CHECK INSIDE THIS LIBRARY CAN SEE: a host's step reading context the server
+  does not read at the same tick (the case that produced it read a collision
+  latch off the client's raw pose, so every replay from the server's pose
+  refused to move and the game rubberbanded after every bomb drop, with the
+  arithmetic pure, the reconcile running and nothing anywhere reporting a
+  fault). THREE THINGS ABOUT IT ARE LOAD-BEARING. The server half MIRRORS
+  `ticker.ts` (the arrival pass, then the consume-exact pass for `tickNow + 1`,
+  then the step, with the real `PlayoutBuffer` and `StarveTracker` and the
+  `applyBufferedInput ?? applyInput`, `ackTick` and `onBufferHealth` hooks);
+  the snapshot's tick LABEL is read back out of `runtime.currentTick` AFTER the
+  step rather than carried forward from the consume, because a label derived
+  from the consume moves with a consume order that is off by one and the two
+  errors CANCEL, reporting a perfect run for a timeline nobody could reproduce
+  (measured: mutating the consume to `tickNow` reddens five cases with the
+  label read back and zero with it derived); and nothing here imports a node
+  builtin or `ioredis`, which `bundling.test.ts` bundles to prove, because the
+  runner that already has the host's client step in it is the browser one.
+  `pinned` has one honest false positive, a client sitting against a wall the
+  server has not reached yet, so scenarios stop at their wall rather than past
+  it.
 - `examples/pong/` - THE SHIPPED STAMPED REFERENCE, and the claim
   "no shipped example stamps inputs end to end" is retired. `sim.ts` exports
   `readDir` and `stepPaddleY`, ONE definition of the paddle rule run by both
@@ -2661,6 +2704,26 @@ browser already paces the loop at the display rate, `conn.frame(now)` measures
 its own delta, and every smoother in the client runs on real elapsed time, so
 an early frame costs a small `dt` and nothing else. Render every callback.
 
+A FRAGMENTED FRAME IS THE RELAY'S PROBLEM, AND IT USED TO BE EVERY HOST'S. `ws`
+delivers a fragmented message as an ARRAY of buffers rather than as one, a peer
+or a proxy chooses its own fragmentation, and nothing about a frame's size
+prevents it. `relay.ts` already had to know that for the PING SNIFF (it joins
+the array there before testing the prefix) and then handed `decodeInput` the RAW
+ARRAY anyway, so every host wrote the same
+`Array.isArray(data) ? Buffer.concat(data) : data` arm in its own decoder,
+including the README's step 2 example. A host that did not write it saw one
+player's inputs stop, on one peer's socket, with the room and every other player
+perfectly healthy and nothing anywhere logged, because a decoder throw is
+counted on `onBadInput` and dropped in silence by design. So `joinFragments`
+normalises ONCE, before `decodeInput`: an all-`Uint8Array` array is joined, a
+`string` (a text frame from a browser style transport) goes through untouched,
+and anything else goes through as it is, because guessing at a shape this relay
+does not recognise is how a host's decoder gets handed a frame nobody sent. THE
+`decodeInput(data: unknown)` SIGNATURE IS UNCHANGED on purpose, so a host's
+existing array arm keeps compiling and simply becomes dead. The all-or-none rule
+is a test rather than a comment: an array holding anything that is not bytes is
+passed through whole.
+
 ## Gates
 
 From the repo root:
@@ -2745,18 +2808,19 @@ nothing here saw it.
 
 ## Status
 
-MEASURED ON THIS TREE, not estimated: `npx vitest run` collects 1149 tests
-across 43 files (with a local Redis up on 6399, so the TWELVE integration files
+MEASURED ON THIS TREE, not estimated: `npx vitest run` collects 1161 tests
+across 44 files (with a local Redis up on 6399, so the TWELVE integration files
 run rather than skip; pointed at an unreachable one with
-`TICKROOM_TEST_REDIS_URL=redis://127.0.0.1:6499` it is 1086 passed and 63
-skipped across 31 files run and 12 skipped, still exit 0, because
+`TICKROOM_TEST_REDIS_URL=redis://127.0.0.1:6499` it is 1098 passed and 63
+skipped across 32 files run and 12 skipped, still exit 0, because
 `tests/memory.test.ts` needs nothing and runs either way); the last fw13 run of
-the same suite, at the 1130 it collected before the 0.3.0 client work, was
-exit 0 with a real Redis too; `npx tsc --noEmit`
-is clean repo-wide including `examples/`; `npm run build` emits `dist/`
-cleanly. Roughly 18,200 lines of source and 28,400 of tests. Per layer, and
-these SUM to the total rather than approximating it: core 208, server 361,
-client 292, codec 109, adapters 69, examples 46, `tests/` 64.
+the same suite, at the 1130 it collected at 0.2.0 before the 0.3.0 client work,
+`src/testing/lockstep.test.ts` and the relay's fragment cases, was exit 0 with
+a real Redis too; `npx tsc --noEmit` is clean repo-wide including `examples/`;
+`npm run build` emits `dist/` cleanly. Roughly 18,600 lines of source and
+28,800 of tests. Per layer, and these SUM to the total rather than
+approximating it: core 208, server 364, client 293, codec 109, adapters 69,
+testing 8, examples 46, `tests/` 64.
 
 THE LONG RUNS HAPPEN ON A SECOND MACHINE NOW, AND THAT IS WHY THE WALL-CLOCK
 CASES MOVED. Anything that takes minutes (the whole suite, the split-brain long
@@ -2788,7 +2852,7 @@ decides whether the host can measure at all and the files say why when it
 cannot.
 
 PER FILE, which is what a mutation row is measured against: `ticker.test.ts`
-146, `relay.test.ts` 124, `connection.test.ts` 122, `interpolation.test.ts` 64,
+146, `relay.test.ts` 127, `connection.test.ts` 122, `interpolation.test.ts` 64,
 `ids.test.ts` 64, `bytes.test.ts` 52, `netPolicy.test.ts` 18, `lease.test.ts`
 34, `snapshot.test.ts` 34, `playout.test.ts` 30, `quantize.test.ts` 23,
 `core/checkpoint.test.ts` 23, `server/checkpoint.test.ts` 22,
@@ -2797,7 +2861,7 @@ PER FILE, which is what a mutation row is measured against: `ticker.test.ts`
 `balancer.test.ts` 20, `redis.test.ts` 14, `adapters/node.test.ts` 15,
 `errorOffset.test.ts` 10, `clientTick.test.ts` 13, `predictedEntity.test.ts`
 60, `rateLimit.test.ts` 8,
-`bundling.test.ts` 5, and in the examples `pong/sim.test.ts` 23,
+`bundling.test.ts` 6, `testing/lockstep.test.ts` 8, and in the examples `pong/sim.test.ts` 23,
 `cursors/sim.test.ts` 19, `pong/codec.test.ts` 4.
 
 WHAT THE 2026-09-02 WORK COST IN TESTS, per file, measured against commit
@@ -2823,12 +2887,12 @@ for why those counts are lower bounds rather than stale.
 
 - Extracted and implemented: core, server, client, codec, adapters, plus three
   examples (a 2D game, a presence layer, a plain Node host).
-- PUBLISHED to npm (`tickroom`, 0.1.0 and 0.1.1). `package.json` NOW SAYS 0.2.0
-  AND 0.2.0 IS NOT PUBLISHED: everything documented in this file, in the README
-  and in `docs/ARCHITECTURE.md` is the 0.2.0 tree, and the registry's 0.1.1 has
-  a materially different API at what a reader would assume is the same version.
-  Until the release tag goes out, the supported install is `npm pack` from a
-  checkout, which the README's Install section says. The audit and the rounds
+- PUBLISHED to npm (`tickroom`, 0.1.0, 0.1.1 and 0.2.0). `package.json` NOW SAYS
+  0.3.0 AND 0.3.0 IS NOT PUBLISHED: everything documented in this file, in the
+  README and in `docs/ARCHITECTURE.md` is the 0.3.0 tree, and `npm install
+  tickroom` gets 0.2.0, which has neither `SnapshotInterpolator.teleport`, nor
+  the `tick` argument on a predicted step, nor `tickroom/testing`. The README's
+  Install section says so and `CHANGELOG.md` lists the difference. The audit and the rounds
   after it changed public API in several places (`TerminalReason` gained and
   renamed members, `ConnectionStats` replaced the old `stats()` shape and then
   gained `serverTickHz`, `hostErrors`, `swapsAttempted` and `swapsFailed`,

@@ -438,6 +438,37 @@ const defaultLog: Logger = (ev) => {
 };
 
 /**
+ * Joins a FRAGMENTED message before anything downstream sees it, and leaves
+ * everything else exactly as the transport handed it over.
+ *
+ * A peer (or a proxy) chooses its own fragmentation, and `ws` delivers a
+ * fragmented message as an ARRAY of buffers rather than as one. This relay
+ * already had to know that for the ping sniff below, and every host then had
+ * to know it AGAIN in its own `decodeInput`: the README's step 2 example
+ * opened with `Array.isArray(data) ? Buffer.concat(data) : data`, which is a
+ * transport detail this file owns and a host has no business rediscovering
+ * from a decoder that throws on one peer's socket and not another's. So the
+ * normalisation happens once, here.
+ *
+ * `decodeInput(data: unknown)` keeps its signature, deliberately: nothing a
+ * host already wrote stops compiling, its own array arm simply becomes
+ * unreachable. A `string` (a text frame from a browser style transport) goes
+ * through untouched, and so does anything else, because guessing at a shape
+ * this relay does not recognise is how a host's decoder gets handed something
+ * it never agreed to.
+ */
+function joinFragments(data: unknown): unknown {
+  if (!Array.isArray(data)) return data;
+  // ALL of it, or none of it. An array holding anything that is not a chunk
+  // of bytes is not a fragmented binary message, whatever else it may be, and
+  // concatenating it would invent a frame nobody sent.
+  for (const part of data) {
+    if (!Buffer.isBuffer(part) && !(part instanceof Uint8Array)) return data;
+  }
+  return Buffer.concat(data as Uint8Array[]);
+}
+
+/**
  * Reads a client `ping` out of whatever the transport handed us, or `null`
  * for anything else, WITHOUT decoding the frame.
  *
@@ -1514,7 +1545,11 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
     }
     let inputs: ClientInput[];
     try {
-      inputs = decodeInput(data);
+      // JOINED HERE AND NOT INSIDE THE DECODER. See `joinFragments`: the
+      // fragmentation is this transport's business, and a host that had to
+      // undo it in its own decoder was reimplementing a line this file
+      // already had.
+      inputs = decodeInput(joinFragments(data));
     } catch {
       // A decoder throw is the signature of a malformed or hostile frame
       // (a truncated packet, a wrong protocol version, a crafted length),
