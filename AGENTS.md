@@ -3015,13 +3015,13 @@ nothing here saw it.
 
 ## Status
 
-MEASURED ON THIS TREE, not estimated, PER TIER: `npm run test:unit` is 1098
-passed across 32 files with `TICKROOM_TEST_REDIS_URL` pointed at an unused port
+MEASURED ON THIS TREE, not estimated, PER TIER: `npm run test:unit` is 1135
+passed across 34 files with `TICKROOM_TEST_REDIS_URL` pointed at an unused port
 (6499), which is the no-services promise proved rather than assumed;
-`npm run test:integration` is 1145 across 40 with a local Redis on 6399;
+`npm run test:integration` is 1183 across 43 with a local Redis on 6399;
 `npm run test:measure` is 16 across 4 on the same Redis and a quiet laptop;
-`npm test` is the sum, 1161 across 44. Forced jittery (JITTER_LIMIT dropped to
-1.0 for the check, then restored) the integration tier is 1139 passed and 6
+`npm test` is the sum, 1199 across 47. Forced jittery (JITTER_LIMIT dropped to
+1.0 for the check, then restored) the integration tier is 1177 passed and 6
 skipped and still exit 0, and the measurement tier is 16 skipped and still exit
 0, which is the loud-skip path exercised rather than argued. The last fw13 run of
 the same suite, at the 1130 it collected at 0.2.0 before the 0.3.0 client work,
@@ -3168,6 +3168,7 @@ gates nothing and runs nightly and on fw13.
 | `src/core/checkpoint.test.ts` | unit | no services |
 | `src/core/ids.test.ts` | unit | no services |
 | `src/core/lease.test.ts` | unit | no services; the pure clock functions and a fake Redis |
+| `src/core/log.test.ts` | unit | no services; source-text, every log kind emitted is in the union and every kind in the union is emitted |
 | `src/core/metrics.test.ts` | unit | no services |
 | `src/core/playout.test.ts` | unit | no services |
 | `src/core/rateLimit.test.ts` | unit | no services |
@@ -3184,7 +3185,9 @@ gates nothing and runs nightly and on fw13.
 | `examples/pong/codec.test.ts` | unit | no services, pure codec |
 | `examples/pong/sim.test.ts` | unit | no services, pure simulation |
 | `tests/memory.test.ts` | unit | THE ONE FILE UNDER `tests/` THAT NEEDS NOTHING, which is the claim it exists to check: `createMemoryRedis` is the bus. It drives a real `ws` socket over four seconds, but its bounds are presence claims (a frame drew the paddle, a step was exactly one tick of `PADDLE_SPEED`) and 0.5x-generous counts, not a rate band |
+| `tests/tiers.test.ts` | unit | no services; the guard that every file under `tests/` is in exactly one tier, added when a parallel branch left `depth.redis.test.ts` in none |
 | `tests/checkpoint.redis.test.ts` | integration | real Redis; gzip round trips or it does not. Its TTL bounds are the server's own, with seconds of slack |
+| `tests/depth.redis.test.ts` | integration | real Redis; the depth frame reaches a client through a real ticker and relay and closes the stamping-lead loop, a deterministic outcome |
 | `tests/e2e.redis.test.ts` | integration | real Redis and a real socket; admission decisions and "a snapshot arrived", all polled to a condition |
 | `tests/faults.redis.test.ts` | integration, 3 of 5 cases gated | real Redis behind a proxy. Lease theft and the crash loop assert on tick numbers and a counter Redis holds: same answer anywhere. The two black-hole cases and the restart case TIME the exit against a probe deadline, a lease TTL and a run cap, so they are `itSteady` (`it.skipIf(TOO_JITTERY)`) |
 | `tests/lease.redis.test.ts` | integration | real Redis; N concurrent SET NX, the Lua owner checks, a TTL expiring on the server clock. The one timing bound is a 5000 to 8000ms window on a TTL |

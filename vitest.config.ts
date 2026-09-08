@@ -27,7 +27,7 @@ import { defineConfig } from 'vitest/config';
 // developer runs.
 
 /** No services at all. Must pass with nothing listening anywhere, which is the claim `tests/memory.test.ts` exists to check. */
-const UNIT = ['src/**/*.test.ts', 'examples/**/*.test.ts', 'tests/memory.test.ts'];
+export const UNIT = ['src/**/*.test.ts', 'examples/**/*.test.ts', 'tests/memory.test.ts', 'tests/tiers.test.ts'];
 
 /**
  * Real Redis, deterministic outcomes. The unit tier is included rather than
@@ -41,9 +41,10 @@ const UNIT = ['src/**/*.test.ts', 'examples/**/*.test.ts', 'tests/memory.test.ts
  * skips those cases loudly with the measured number in the reason rather than
  * reddening the release on a bound it cannot honestly measure.
  */
-const INTEGRATION = [
+export const INTEGRATION = [
   ...UNIT,
   'tests/checkpoint.redis.test.ts',
+  'tests/depth.redis.test.ts',
   'tests/e2e.redis.test.ts',
   'tests/faults.redis.test.ts',
   'tests/lease.redis.test.ts',
@@ -60,7 +61,7 @@ const INTEGRATION = [
  * on the fw13 machine, never as a required check, and they skip loudly rather
  * than loosening a bound: see `tests/helpers/jitter.ts`.
  */
-const MEASUREMENT = [
+export const MEASUREMENT = [
   'tests/example-cursors.redis.test.ts',
   'tests/example.redis.test.ts',
   'tests/smoothness.redis.test.ts',
@@ -73,7 +74,10 @@ const MEASUREMENT = [
  * concatenation of the three tiers on purpose, so a thirteenth file under
  * `tests/` runs somewhere from the moment it is written. It still has to be
  * added to `INTEGRATION` or `MEASUREMENT` above to reach a gate, and to the
- * classification table in AGENTS.md to be findable.
+ * classification table in AGENTS.md to be findable. `tests/tiers.test.ts`
+ * fails the unit tier when a file under `tests/` is in no tier or in two,
+ * because a branch written in parallel with the tiering left exactly one
+ * file (`depth.redis.test.ts`) running under `npm test` and under no gate.
  */
 const ALL = ['src/**/*.test.ts', 'tests/**/*.test.ts', 'examples/**/*.test.ts'];
 
