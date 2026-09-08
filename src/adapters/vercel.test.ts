@@ -1178,6 +1178,38 @@ describe('createRoom', () => {
     expect(new URL(String(fetchMock.mock.calls[0]?.[0])).pathname).toBe('/api/ticker');
   });
 
+  it('states the namespace ONCE, and all three routes get that one string', async () => {
+    // A Redis DB index does not isolate two deployments (keys are per
+    // database, pub/sub is instance-wide), so this is the seam that actually
+    // separates staging from production, and it was three options on three
+    // factories: a namespace on the ticker and not the relay splits one room
+    // in half, each side reading and writing keys the other never sees, with a
+    // lease acquired on each and no error anywhere.
+    const room = roomWith(new MockSocket(), { namespace: 'staging' });
+
+    await callTicker(room.ticker);
+    await room.ws(wsRequestFor(await mint(room)));
+    await room.balancer(new Request('https://example.test/api/room?base=lobby'));
+
+    expect(tickerOptionsPassed().namespace).toBe('staging');
+    expect(admitOptionsPassed().namespace).toBe('staging');
+    expect(mocks.assignRoom.mock.calls[0]?.[0]).toMatchObject({ namespace: 'staging' });
+  });
+
+  it('lets an escape hatch override the namespace on one route, because the hatches are applied last', async () => {
+    // Not a recommendation: a namespace on one route and not another is the
+    // split above. It is here because the hatch has to keep winning uniformly,
+    // and a shared field that silently could not be overridden would be the
+    // one exception a host has no way to discover.
+    const room = roomWith(new MockSocket(), { namespace: 'staging', relay: { namespace: 'canary' } });
+
+    await callTicker(room.ticker);
+    await room.ws(wsRequestFor(await mint(room)));
+
+    expect(tickerOptionsPassed().namespace).toBe('staging');
+    expect(admitOptionsPassed().namespace).toBe('canary');
+  });
+
   it('wires the default decoder in, so a host that writes none still reads its client', async () => {
     const room = roomWith(new MockSocket());
     await room.ws(wsRequestFor(await mint(room)));

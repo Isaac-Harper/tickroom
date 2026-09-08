@@ -914,6 +914,19 @@ export type VercelRoomOptions<TState, TEvent> = {
    * name in the message.
    */
   maxDurationS?: number | undefined;
+  /**
+   * Prefixes every Redis key AND every pub/sub channel this room uses.
+   * Unset, that is `DEFAULT_NAMESPACE`.
+   *
+   * STATED ONCE HERE BECAUSE A HALF-APPLIED NAMESPACE IS THE WORST OF THE
+   * MISMATCHES. A Redis DB index does not isolate two deployments (keys are
+   * per database, pub/sub is instance-wide), so this is the seam that actually
+   * separates staging from production, and it was three separate options on
+   * three route factories: a namespace on the ticker and not the relay splits
+   * one room in half, each side reading and writing keys the other never sees,
+   * with a lease acquired on each and no error anywhere.
+   */
+  namespace?: string | undefined;
   /** Injected, never imported: see `createRelayRoute`. `experimental_upgradeWebSocket` from `@vercel/functions`. */
   upgradeWebSocket: VercelRelayRouteOptions['upgradeWebSocket'];
   /** Where the relay sends its ticker spawn. Relative, so it resolves against the request's own origin. Defaults to `/api/ticker`. */
@@ -940,8 +953,9 @@ export type VercelRoomOptions<TState, TEvent> = {
    *
    * A shared fact set in one of these is set in ONE route only, which is the
    * failure this whole function exists to remove: state `maxPlayers`,
-   * `maxRooms`, `maxDurationS`, `secret`, `isValidBase` and `fallbackRoom`
-   * above, and use these for what genuinely differs between the routes.
+   * `maxRooms`, `maxDurationS`, `secret`, `namespace`, `isValidBase` and
+   * `fallbackRoom` above, and use these for what genuinely differs between
+   * the routes.
    */
   ticker?: Partial<VercelTickerRouteOptions<TState, TEvent>> | undefined;
   relay?: Partial<VercelRelayRouteOptions> | undefined;
@@ -1168,7 +1182,7 @@ function createSessionRoute(opts: {
  * the message) a `maxDurationS` whose derived lifetimes do not fit.
  */
 export function createRoom<TState, TEvent>(opts: VercelRoomOptions<TState, TEvent>): VercelRoom {
-  const { runtime, secret, rooms, upgradeWebSocket } = opts;
+  const { runtime, secret, rooms, namespace, upgradeWebSocket } = opts;
   const { isValidBase, fallbackRoom, maxPlayers, maxRooms } = rooms;
 
   // CHECKED AT CREATION, WHICH IS MODULE EVALUATION, for the same reason the
@@ -1199,6 +1213,7 @@ export function createRoom<TState, TEvent>(opts: VercelRoomOptions<TState, TEven
     isValidBase,
     fallbackRoom,
     maxRooms,
+    namespace,
     maxDurationS,
     ...opts.ticker,
   });
@@ -1209,6 +1224,7 @@ export function createRoom<TState, TEvent>(opts: VercelRoomOptions<TState, TEven
     fallbackRoom,
     maxRooms,
     maxPlayers,
+    namespace,
     maxDurationS,
     maxAgeS: opts.session?.maxAgeS,
     tickerUrl: opts.tickerUrl ?? DEFAULT_TICKER_URL,
@@ -1228,6 +1244,7 @@ export function createRoom<TState, TEvent>(opts: VercelRoomOptions<TState, TEven
     fallbackBase: baseOf(fallbackRoom),
     maxPlayers,
     maxRooms,
+    namespace,
     ...opts.balancer,
   });
 

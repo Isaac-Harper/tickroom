@@ -104,14 +104,15 @@ Which makes it right for exactly two shapes: **a single VM** (or container, or P
 **A Redis DB INDEX DOES NOT ISOLATE TWO DEPLOYMENTS, and `namespace` does.** Pointing staging at `/1` and production at `/0` looks like separation and is not: keys are per database, but **pub/sub is instance-wide**, so the two deployments publish into the identical `room:pong:in` and `room:pong:out` channels. Measured: each acquires its own lease against its own `room:pong:lease` key, so both believe they are the exactly-one writer, and each one's relays forward the other's snapshots to their players. Two authorities, no error anywhere, and the lease mechanism cannot see it because it is doing its job correctly on each database separately. `namespace` is the seam that actually works, because it prefixes keys **and** channels together:
 
 ```ts
-createRoom({ ...opts, ticker: { namespace: 'staging' }, relay: { namespace: 'staging' }, balancer: { namespace: 'staging' } });
+createRoom({ ...opts, namespace: 'staging' });
 
-// or, on the low-level form:
+// or, on the low-level form, once per route:
 createTickerRoute({ ...tickerOpts, namespace: 'staging' });
 createRelayRoute({ ...relayOpts, namespace: 'staging' });
+createBalancerRoute({ ...balancerOpts, namespace: 'staging' });
 ```
 
-Every route, the same string: a namespace on one and not the other splits the room in half. It is the one shared fact `createRoom` does not state once, because it rides the per-route escape hatches rather than the shared bag. (There is a second reason to leave the DB index alone, in `AGENTS.md`: ioredis re-issues `select(db)` on every reconnect with nothing catching the promise, so the shared client belongs on db 0.)
+Every route, the same string: a namespace on one and not the other splits the room in half, each side reading and writing keys the other never sees, with a lease acquired on each and no error anywhere. `createRoom` states it once for exactly that reason. (There is a second reason to leave the DB index alone, in `AGENTS.md`: ioredis re-issues `select(db)` on every reconnect with nothing catching the promise, so the shared client belongs on db 0.)
 
 ---
 
@@ -223,7 +224,7 @@ export const pong: RoomRuntime<State> = {
 
 ### 2. Mount the room
 
-Four routes, one call. **Every fact below is stated once and used everywhere it applies**, which is the whole reason this exists: mounting the four routes by hand meant writing the secret, the room validator, the fallback room, the capacity and the duration cap into four separate files, and a disagreement between any two of them is silent. A relay admitting 20 against a balancer assigning for 8 fills a room the balancer calls full while seats sit empty. A ticker on 300 beside a relay on 800 holds sockets for eight minutes after its own tick loop is gone. A `maxRooms` that differs hands a client `pong~7` that the relay quietly replaces with the fallback, and the player sits alone in a room nobody else can see them in. None of the three reports anything, because from each route's own point of view nothing went wrong.
+Four routes, one call. **Every fact below is stated once and used everywhere it applies**, which is the whole reason this exists: mounting the four routes by hand meant writing the secret, the room validator, the fallback room, the capacity, the namespace and the duration cap into four separate files, and a disagreement between any two of them is silent. A relay admitting 20 against a balancer assigning for 8 fills a room the balancer calls full while seats sit empty. A ticker on 300 beside a relay on 800 holds sockets for eight minutes after its own tick loop is gone. A `maxRooms` that differs hands a client `pong~7` that the relay quietly replaces with the fallback, and the player sits alone in a room nobody else can see them in. None of the three reports anything, because from each route's own point of view nothing went wrong.
 
 ```ts
 // lib/room.ts
@@ -247,6 +248,11 @@ export const room = createRoom({
   // lower plan limit and both lifetimes follow; raising it does NOT extend the
   // loop past 700s.
   maxDurationS: 800,
+  // `namespace` belongs here too, unset on one deployment and 'staging' on
+  // another: it prefixes every key AND every channel, for all four routes at
+  // once. See "A Redis DB index does not isolate two deployments" above for
+  // what setting it on one route and not another costs.
+  //
   // Injected, not imported. See below.
   upgradeWebSocket: experimental_upgradeWebSocket,
 });
@@ -342,7 +348,7 @@ onBadInput: () => void (badInputs += 1),
 onRateDrop: () => void (rateDrops += 1),
 ```
 
-**Everything a route accepts is still reachable, through three escape hatches applied last.** `ticker`, `relay` and `balancer` take a partial of the matching factory's options and win over the composed values, so `init`, `geomKey`, `onGeomMismatch`, `metaPayload`, `metaSeedPayload`, `statsLabels`, `presenceTimeoutMs`, `namespace`, `log`, every observability hook and every bound are just extra keys:
+**Everything a route accepts is still reachable, through three escape hatches applied last.** `ticker`, `relay` and `balancer` take a partial of the matching factory's options and win over the composed values, so `init`, `geomKey`, `onGeomMismatch`, `metaPayload`, `metaSeedPayload`, `statsLabels`, `presenceTimeoutMs`, `log`, every observability hook and every bound are just extra keys:
 
 ```ts
 createRoom({
@@ -352,7 +358,7 @@ createRoom({
 });
 ```
 
-A shared fact set in one of those bags is set in one route only, which is the mismatch this call exists to remove: state `secret`, `rooms` and `maxDurationS` at the top level and keep these for what genuinely differs.
+A shared fact set in one of those bags is set in one route only, which is the mismatch this call exists to remove: state `secret`, `rooms`, `namespace` and `maxDurationS` at the top level and keep these for what genuinely differs.
 
 **`createRoom` throws at creation, which is module evaluation**, for a `rooms.maxPlayers` that is not a positive integer, for a missing secret, and (from the factory that owns the number, with its name in the message) for a `maxDurationS` whose derived lifetimes do not fit. A deployment whose numbers do not fit fails on its first request rather than on every handoff for the rest of its life.
 

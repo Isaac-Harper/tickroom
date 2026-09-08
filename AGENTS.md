@@ -1026,7 +1026,7 @@ whole timing guarantee rests on nothing in it ever awaiting.
   AND `createRoom` IS THE PRIMARY ENTRY POINT NOW, with the three factories
   kept exported and documented as the low-level form. It takes one bag
   (`runtime`, `secret`, `rooms: { isValidBase, fallbackRoom, maxPlayers,
-  maxRooms? }`, `maxDurationS`, `upgradeWebSocket`, `tickerUrl?`,
+  maxRooms? }`, `maxDurationS`, `namespace?`, `upgradeWebSocket`, `tickerUrl?`,
   `decodeInput?`, `joinMeta?`, `onBadInput?`, `onRateDrop?`, `session?`, plus
   `ticker`/`relay`/`balancer` partial bags applied LAST as escape hatches) and
   returns `{ ticker, ws, session, balancer, config }`, each a
@@ -1056,10 +1056,13 @@ whole timing guarantee rests on nothing in it ever awaiting.
   the 12 hour default, so an expiry the mint states is one the socket path
   enforces rather than one on paper. `adapters/node.ts` takes the same field
   through the type it derives, and honours it the same way.
-  THE ONE SHARED FACT `createRoom` DOES NOT STATE ONCE IS `namespace`: it
-  rides the three escape hatches, so a staging namespace is still written
-  three times, and a namespace on one route and not another still splits the
-  room in half. The README says so where it documents the namespace seam.
+  `namespace` IS SHARED TOO, at the top level, applied to all three factories
+  before the escape hatches: it prefixes keys AND channels, it is the seam
+  that actually separates two deployments (a Redis DB index does not, because
+  pub/sub is instance-wide), and a namespace on the ticker and not the relay
+  splits one room in half with a lease acquired on each side and no error
+  anywhere. A hatch still overrides it per route, and `vercel.test.ts` pins
+  both halves.
 - `src/adapters/node.ts` - the same server core behind a plain `ws` server, no
   serverless at all. Proves the design is not platform-specific. Derives its
   own option type from the Vercel one minus the three genuinely Vercel-route
