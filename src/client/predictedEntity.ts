@@ -44,14 +44,22 @@
 // once per snapshot, and `snapTo` for the events a glide is the wrong answer
 // to at all (a respawn, a teleport, a round reset); the re-anchor handling the
 // example used to do in `onTickReanchor` is inside `advance`, read off the
-// counter itself, so there is no hook left for a host to forget. And there is
-// ONE per connection: the entity IS the player's input stream (the ticker
-// keeps one playout buffer per pid, so two entities on one connection
-// overwrite each other's records tick by tick), and a second construction on
-// the same `conn` throws.
+// counter itself, so there is no hook left for a host to forget.
+//
+// THE DOCUMENTED WAY TO GET ONE IS `RoomConnection`'S `predict` OPTION, which
+// owns an instance of this class and makes the three calls itself: `frame()`
+// advances it after the counter and the interpolator, every decoded snapshot
+// reconciles it before `onSnapshot`, and a snapshot the host declares as a
+// teleport snaps it first. Two of the four things a consumer got wrong in one
+// week were the order of those calls, so the order is no longer the host's.
+// The class stays exported for a host that wants more than one predicted
+// entity (each on its own `conn` fake whose `send` merges the windows, since
+// the ticker keeps one playout buffer per pid and two windows sent as two
+// packets overwrite each other tick by tick), or a render layer of its own.
 
 import type { ClientTickView } from './clientTick.js';
 import { ErrorOffset } from './errorOffset.js';
+import { encodeInputWindow, type DefaultInput, type DefaultInputRecord } from '../codec/snapshot.js';
 
 /**
  * A 2D pose with an optional heading in radians: the same fields
@@ -81,7 +89,7 @@ export interface PredictedEntityOptions<TInput> {
    * counter was built with: there is no `tickHz` option here, because it was
    * the one number a consumer could get wrong against the connection.
    */
-  conn: { readonly tick: ClientTickView; send(payload: string): void };
+  conn: { readonly tick: ClientTickView; send(payload: ArrayBuffer | Uint8Array | string): void };
   /**
    * THE SAME PURE STEP THE SERVER RUNS FOR THIS ENTITY: the pose after one
    * tick of `dt` seconds under `input`. Share the function with the runtime
@@ -109,12 +117,27 @@ export interface PredictedEntityOptions<TInput> {
    * travel, past which the two ends are desynced rather than a tick apart.
    */
   maxSpeed: number;
-  /** Where the entity starts before the first authoritative pose arrives. The first reconcile replaces it outright. */
-  initial: Pose;
+  /** Where the entity starts before the first authoritative pose arrives. The first reconcile replaces it outright, so it only has to be plausible. Defaults to the origin. */
+  initial?: Pose | undefined;
+  /**
+   * Which of the library's two input wires the re-send window goes out on.
+   * Default `'binary'`: `tickroom/codec`'s `encodeInputWindow`, 69 bytes for
+   * six records against about 300 as JSON, which REQUIRES `TInput` to be
+   * `DefaultInput` (`{ axes: [x, y], buttons }`); the first input `advance`
+   * is given is checked at runtime, before anything is stamped, and a
+   * `TypeError` names the two ways out. `'json'` is
+   * one text frame per send, an array of `{ targetTick, data }`, for any
+   * `TInput` that is JSON data. Both decode on the relay through
+   * `decodeInputAuto`, which is the default `decodeInput` there. Ignored when
+   * `encodeInput` is given.
+   */
+  wire?: 'binary' | 'json' | undefined;
+  /** A host's own wire: the last `INPUT_WINDOW` records, oldest first, to one frame `conn.send` takes. Overrides `wire`; the relay's `decodeInput` has to be the inverse. */
+  encodeInput?: ((records: StampedRecord<TInput>[]) => ArrayBuffer | Uint8Array | string) | undefined;
 }
 
-/** One stamped record as it goes on the wire: `{ targetTick, data }`, which is the `ClientInput` shape less the `seq` the library documents it never reads. */
-interface StampedRecord<TInput> {
+/** One stamped record as it goes on the wire: `{ targetTick, data }`, which is the `ClientInput` shape less the `seq` the library documents it never reads. What `encodeInput` is handed, and what the JSON wire sends verbatim. */
+export interface StampedRecord<TInput> {
   targetTick: number;
   data: TInput;
 }
@@ -213,35 +236,82 @@ function shifted(a: Pose, dx: number, dy: number, dh: number): Pose {
   };
 }
 
+/** The origin, for an entity constructed without `initial`. The first confirmation replaces it whatever it is. */
+const ORIGIN: Pose = { x: 0, y: 0 };
+
+/** Is `v` a `DefaultInput`: a two-axis stick of finite numbers and a `u8` button mask, which is everything the binary window can carry. */
+function isDefaultInput(v: unknown): v is DefaultInput {
+  if (typeof v !== 'object' || v === null) return false;
+  const { axes, buttons } = v as { axes?: unknown; buttons?: unknown };
+  return (
+    Array.isArray(axes) &&
+    axes.length === 2 &&
+    Number.isFinite(axes[0]) &&
+    Number.isFinite(axes[1]) &&
+    Number.isInteger(buttons) &&
+    (buttons as number) >= 0 &&
+    (buttons as number) <= 255
+  );
+}
+
 /**
- * The one entity each connection may own, keyed by the `conn` object itself.
- * Weak, so a connection that is dropped takes its entry with it; module
- * level, so the rule holds across every construction site in a page.
+ * The check the default wire makes on the input, ONCE, before the first
+ * record is stamped: a `TypeError` that names the two alternatives, because
+ * the alternative is `ByteWriter` refusing `undefined` several calls down
+ * with a message about a `u8`. A checked input is trusted from then on:
+ * `TInput` is one type for the life of the entity, and a check per stamp
+ * would be paying for a compile-time fact on every frame.
  */
-const owners = new WeakMap<object, PredictedEntity<unknown>>();
+function assertDefaultInput(input: unknown): void {
+  if (isDefaultInput(input)) return;
+  throw new TypeError(
+    "PredictedEntity: the default binary input wire carries `{ axes: [number, number]; buttons: 0..255 }` (`DefaultInput` from tickroom/codec) and this input is not that shape. Pass `wire: 'json'` to send the input as JSON, or `encodeInput` to write your own frame.",
+  );
+}
+
+/** The default wire: the window as one `encodeInputWindow` frame, with each record's `targetTick` written into the `seq` field the library never reads. */
+function binaryInputEncoder<TInput>(): (records: StampedRecord<TInput>[]) => Uint8Array {
+  return (records) =>
+    encodeInputWindow(
+      records.map((rec): DefaultInputRecord => {
+        const data = rec.data as unknown as DefaultInput;
+        return { seq: rec.targetTick, targetTick: rec.targetTick, axes: data.axes, buttons: data.buttons };
+      }),
+    );
+}
+
+/** The JSON wire: the window as one text frame, an array of `{ targetTick, data }`, which is what a relay's `decodeInput` parses in one line. */
+function jsonInputEncoder<TInput>(): (records: StampedRecord<TInput>[]) => string {
+  return (records) => JSON.stringify(records);
+}
 
 /**
  * One locally predicted entity: stamps its inputs, predicts them, sends them,
  * reconciles against every snapshot, and hands back the pose to draw.
  *
- * ONE PER CONNECTION, BY RULE. This object IS the player's input stream: the
- * server keeps ONE playout buffer per pid, and every record this sends is
- * keyed by its tick in that one buffer, so a second entity on the same
- * connection overwrites the first's record for every tick it stamps and the
- * server consumes whichever landed last. A player steering several things
- * carries them all in one input record and one `step`. Constructing a second
- * entity for a `conn` that already owns one throws a `RangeError` naming this
- * rule, at construction, rather than corrupting both streams in silence.
+ * THE ENTITY IS THE PLAYER'S INPUT STREAM. The server keeps ONE playout buffer
+ * per pid, and every record this sends is keyed by its tick in that one
+ * buffer, so a player steering several things carries them all in one input
+ * record and one `step`: two entities on one socket, each sending its own
+ * window, overwrite each other's record for every tick and the server
+ * consumes whichever landed last. `RoomConnection`'s `predict` option builds
+ * exactly one, which is why the rule no longer needs enforcing here; a host
+ * building several by hand owns the merge.
  *
- * `TInput` is the per-tick input as it goes on the wire, so it has to be JSON
- * data (an object of numbers, typically). Each stamped record keeps a JSON
- * copy of it rather than a reference, and predicts through that copy, so the
- * record replayed here is byte for byte the record the server applied even if
- * the caller mutates the object it passed in on the next frame.
+ * `TInput` is the per-tick input as it goes on the wire. On the default
+ * binary wire it is `DefaultInput`; on the JSON wire it has to be JSON data
+ * (an object of numbers, typically). Each stamped record keeps a JSON copy of
+ * it rather than a reference, and predicts through that copy, so the record
+ * replayed here is byte for byte the record the server applied even if the
+ * caller mutates the object it passed in on the next frame.
  */
 export class PredictedEntity<TInput> {
   private readonly conn: PredictedEntityOptions<TInput>['conn'];
   private readonly step: PredictedEntityOptions<TInput>['step'];
+  /** The window to one frame for `conn.send`: the host's `encodeInput`, or the encoder `wire` names. */
+  private readonly encode: (records: StampedRecord<TInput>[]) => ArrayBuffer | Uint8Array | string;
+  /** The shape check the default binary wire owes the first input, `null` once it has passed and on every other wire. Run in `advance` before anything moves, so a wrong shape throws on every frame until it is fixed rather than once. */
+  private shapeCheck: ((input: unknown) => void) | null;
   /** One tick, seconds: `conn.tick.tickMs / 1000`, read once at construction. */
   private readonly dt: number;
   private readonly maxSpeed: number;
@@ -312,23 +382,24 @@ export class PredictedEntity<TInput> {
     if (!Number.isFinite(opts.maxSpeed) || opts.maxSpeed <= 0) {
       throw new RangeError(`PredictedEntity: maxSpeed must be a positive number, got ${opts.maxSpeed}`);
     }
-    if (!isFinitePose(opts.initial)) {
+    const initial = opts.initial ?? ORIGIN;
+    if (!isFinitePose(initial)) {
       throw new RangeError('PredictedEntity: initial must be a finite pose');
     }
-    // AFTER the option checks, so a construction refused above claims nothing.
-    if (owners.has(opts.conn)) {
-      throw new RangeError(
-        'PredictedEntity: one PredictedEntity per connection. The entity is the player input stream (the server keeps one playout buffer per pid), so a player steering several things carries them in one input record; this conn already owns one.',
-      );
+    const wire = opts.wire ?? 'binary';
+    if (wire !== 'binary' && wire !== 'json') {
+      throw new RangeError(`PredictedEntity: wire must be 'binary' or 'json', got ${String(wire)}`);
     }
-    owners.set(opts.conn, this as PredictedEntity<unknown>);
     this.conn = opts.conn;
     this.step = opts.step;
+    const binary = opts.encodeInput === undefined && wire === 'binary';
+    this.encode = opts.encodeInput ?? (binary ? binaryInputEncoder<TInput>() : jsonInputEncoder<TInput>());
+    this.shapeCheck = binary ? assertDefaultInput : null;
     this.dt = tickMs / 1000;
     this.maxSpeed = opts.maxSpeed;
     this.snapDistance = opts.maxSpeed * SNAP_SECONDS;
-    this.initial = { ...opts.initial };
-    this.curr = { ...opts.initial };
+    this.initial = { ...initial };
+    this.curr = { ...initial };
     this.err = new ErrorOffset({
       posTau: GLIDE_TAU,
       headingTau: GLIDE_TAU,
@@ -375,8 +446,8 @@ export class PredictedEntity<TInput> {
    *
    * Stamps one record per tick the counter crossed since the last call, each
    * carrying `input` and each predicted through `step`; sends the last
-   * `INPUT_WINDOW` records as one JSON array of `{ targetTick, data }` when
-   * anything was stamped and nothing otherwise; and returns the pose to draw
+   * `INPUT_WINDOW` records as one frame on the configured wire when anything
+   * was stamped and nothing otherwise; and returns the pose to draw
    * this frame: the pose history read at the render playhead, which has
    * moved `dt` of real time (within `RENDER_SLEW`) toward one tick behind
    * the newest stamp, with what is left of the last correction added. Before
@@ -388,7 +459,8 @@ export class PredictedEntity<TInput> {
    * must be byte for byte the record the server applies. It has to be JSON
    * data; `undefined`, a function or a symbol has no JSON form and is refused
    * with a `TypeError` here, before anything is stamped, rather than stamped
-   * as a record whose input the server cannot read.
+   * as a record whose input the server cannot read. On the default binary
+   * wire it also has to be a `DefaultInput`, checked here once, the same way.
    *
    * `dt` is this frame's wall time in seconds. A value that is not a finite
    * non-negative number is NO TIME AT ALL: the playhead and the glide stand
@@ -406,6 +478,10 @@ export class PredictedEntity<TInput> {
       throw new TypeError(
         `PredictedEntity.advance: input must be JSON data, got ${input === undefined ? 'undefined' : typeof input}`,
       );
+    }
+    if (this.shapeCheck !== null) {
+      this.shapeCheck(input);
+      this.shapeCheck = null;
     }
 
     // A DURATION THAT IS NOT ONE IS ZERO. `Math.max(0, NaN)` is NaN, and a
@@ -527,10 +603,9 @@ export class PredictedEntity<TInput> {
       if (this.records.length > INPUT_HISTORY) this.records.splice(0, this.records.length - INPUT_HISTORY);
       if (this.poses.length > INPUT_HISTORY + 1) this.poses.splice(0, this.poses.length - (INPUT_HISTORY + 1));
       this.lastStamped = value;
-      // THE WHOLE WINDOW ON EVERY PACKET, oldest first, as one JSON array
-      // of `{ targetTick, data }`: what a relay's `decodeInput` parses in
-      // one line.
-      this.conn.send(JSON.stringify(this.records.slice(-INPUT_WINDOW)));
+      // THE WHOLE WINDOW ON EVERY PACKET, oldest first, as one frame on the
+      // configured wire: what the relay's `decodeInputAuto` reads back.
+      this.conn.send(this.encode(this.records.slice(-INPUT_WINDOW)));
     }
 
     // THE PLAYHEAD. Its target is one tick behind the newest stamp, by how

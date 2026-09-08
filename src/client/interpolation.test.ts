@@ -2088,10 +2088,12 @@ describe('SnapshotInterpolator.teleport', () => {
 
 /**
  * THE PATH A CONSUMER ACTUALLY TAKES, end to end: a `RoomConnection` with the
- * `interpolate` option, a socket, and the host calling `teleport` from
- * `onSnapshot`. The ordering `teleport` documents is the connection's own (it
- * pushes the decoded frame and THEN calls the host back), and nothing but this
- * test proves the two agree.
+ * `interpolate` option, a socket, and the host either DECLARING the jump in
+ * `interpolate.teleported` (the documented way) or calling `teleport` itself
+ * from `onSnapshot` (still supported, since the method is public). The
+ * ordering `teleport` documents is the connection's own (it pushes the decoded
+ * frame and THEN makes the calls), and nothing but this test proves the two
+ * agree.
  */
 class TeleportSocket implements WebSocketLike {
   static last: TeleportSocket | null = null;
@@ -2132,7 +2134,7 @@ describe('teleport through a RoomConnection', () => {
    * because this class runs its clock, its arrival stamps and the
    * interpolator's playhead on `performance.now()`.
    */
-  async function drivenByConnection(announce: boolean): Promise<number[]> {
+  async function drivenByConnection(announce: 'declared' | 'onSnapshot' | 'none'): Promise<number[]> {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'performance'] });
     const interp = new SnapshotInterpolator<string>();
     let x = 0;
@@ -2143,11 +2145,17 @@ describe('teleport through a RoomConnection', () => {
       WebSocketImpl: TeleportSocket as unknown as WebSocketConstructor,
       socketUrl: () => 'ws://x',
       decodeSnapshot: () => ({ tick: 100, serverTime: performance.now(), x, jump }),
-      interpolate: { into: interp, entities: (snap) => new Map([['p2', { x: snap.x, y: 0 }]]) },
-      // THE WHOLE POINT: the frame carrying the destination is already in the
-      // buffer by the time this runs, so one call here is the whole answer.
+      interpolate: {
+        into: interp,
+        entities: (snap) => new Map([['p2', { x: snap.x, y: 0 }]]),
+        // THE DOCUMENTED WAY: name the keys this snapshot put somewhere and
+        // the connection makes the call, after its own push.
+        teleported: announce === 'declared' ? (snap) => (snap.jump ? ['p2'] : []) : undefined,
+      },
+      // THE HAND-DRIVEN WAY: the frame carrying the destination is already in
+      // the buffer by the time this runs, so one call here is the whole answer.
       onSnapshot: (snap) => {
-        if (snap.jump && announce) interp.teleport('p2');
+        if (snap.jump && announce === 'onSnapshot') interp.teleport('p2');
       },
     });
 
@@ -2180,13 +2188,19 @@ describe('teleport through a RoomConnection', () => {
     return steps.filter((step) => Math.abs(step) > WALK_PER_SNAP + 1e-9);
   }
 
-  it('one teleport() from onSnapshot is the whole answer on a real connection', async () => {
-    const big = await drivenByConnection(true);
+  it('a key declared in interpolate.teleported is one jump and no streak: the connection makes the call after its push', async () => {
+    const big = await drivenByConnection('declared');
     expect(big).toHaveLength(1);
     expect(big[0]).toBeGreaterThan(JUMP - WALK_SPEED); // the jump itself, not a fragment of it
   });
 
-  it('and without it the same connection streaks, which is the control', async () => {
-    expect((await drivenByConnection(false)).length).toBeGreaterThan(1);
+  it('one teleport() from onSnapshot is the same answer, for a host driving the interpolator by hand', async () => {
+    const big = await drivenByConnection('onSnapshot');
+    expect(big).toHaveLength(1);
+    expect(big[0]).toBeGreaterThan(JUMP - WALK_SPEED);
+  });
+
+  it('and without either the same connection streaks, which is the control', async () => {
+    expect((await drivenByConnection('none')).length).toBeGreaterThan(1);
   });
 });

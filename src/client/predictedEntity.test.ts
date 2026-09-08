@@ -46,7 +46,7 @@ function fakeConn(tickMs = TICK_MS) {
 
 function make(step: PredictedEntityOptions<Dir>['step'] = stepY, initial: Pose = INITIAL, tickMs = TICK_MS) {
   const { conn, tick, sent } = fakeConn(tickMs);
-  const entity = new PredictedEntity<Dir>({ conn, step, maxSpeed: SPEED, initial });
+  const entity = new PredictedEntity<Dir>({ conn, step, maxSpeed: SPEED, initial, wire: 'json' });
   return { entity, tick, sent };
 }
 
@@ -577,19 +577,6 @@ describe('PredictedEntity', () => {
     expect(next.y - drawn.y).toBeCloseTo(SPEED * FRAME, 9);
   });
 
-  it('ONE PER CONNECTION: a second entity on the same conn throws a RangeError naming the rule; a different conn is fine', () => {
-    const { conn } = fakeConn();
-    const opts = { conn, step: stepY, maxSpeed: SPEED, initial: INITIAL };
-    expect(() => new PredictedEntity<Dir>(opts)).not.toThrow();
-    // The entity IS the player's input stream: the ticker keeps one playout
-    // buffer per pid, so a second would overwrite the first's record for
-    // every tick it stamps and the server would consume whichever landed
-    // last.
-    expect(() => new PredictedEntity<Dir>(opts)).toThrow(RangeError);
-    expect(() => new PredictedEntity<Dir>(opts)).toThrow(/one PredictedEntity per connection/);
-    expect(() => new PredictedEntity<Dir>({ ...opts, conn: fakeConn().conn })).not.toThrow();
-  });
-
   describe('a new connection epoch (anchored false, then true) starts the entity over', () => {
     /** Seat, stamp `ticks` records with the key held, then drop the anchor and observe it dropped, the way a frame between the reconnect attempt and its first snapshot does. */
     function stampedThenUnanchored(ticks: number, from = 100) {
@@ -697,6 +684,7 @@ describe('PredictedEntity', () => {
       step: stepHeading,
       maxSpeed: SPEED,
       initial: { x: 0, y: 0, heading: Math.PI - 0.05 },
+      wire: 'json',
     });
     tick.anchorTo(100);
     entity.reconcile({ x: 0, y: 0, heading: Math.PI - 0.05 }, 99);
@@ -716,14 +704,15 @@ describe('PredictedEntity', () => {
 
     // The between-tick interpolation crosses the wrap the short way too: a
     // tick that turns from pi - 0.1 to -pi + 0.1 draws pi at half a tick,
-    // where a linear lerp would draw 0. On its own connection: one entity
-    // per connection is the rule.
+    // where a linear lerp would draw 0. On its own connection, so the two
+    // entities' windows do not land in one send log.
     const second = fakeConn();
     const arc = new PredictedEntity<Turn>({
       conn: second.conn,
       step: stepHeading,
       maxSpeed: SPEED,
       initial: { x: 0, y: 0, heading: Math.PI - 0.1 },
+      wire: 'json',
     });
     arc.reconcile({ x: 0, y: 0, heading: Math.PI - 0.1 }, 99);
     second.tick.anchorTo(101);
@@ -1065,7 +1054,7 @@ describe('PredictedEntity', () => {
           }
         },
       };
-      const entity = new PredictedEntity<Dir>({ conn, step: stepY, maxSpeed: SPEED, initial: INITIAL });
+      const entity = new PredictedEntity<Dir>({ conn, step: stepY, maxSpeed: SPEED, initial: INITIAL, wire: 'json' });
 
       let serverTick = 100;
       let serverPose: Pose = INITIAL;

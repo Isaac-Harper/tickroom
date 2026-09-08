@@ -15,6 +15,7 @@ export type {
   CodecEntity,
   DefaultSnapshot,
   DefaultSnapshotCodecOptions,
+  DefaultInput,
   DefaultInputRecord,
   DefaultInputWindowOptions,
 } from './snapshot.js';
@@ -27,4 +28,5 @@ export {
   encodeInputWindow,
   decodeInputWindow,
   inputWindowToClientInputs,
+  decodeInputAuto,
 } from './snapshot.js';

@@ -143,7 +143,7 @@ the stamped path's central claim is not something a comment can assert:
 
 - **A stamped input runs identically on both ends.** One branch is the
   client: `stepPaddleY` on a bare number, exactly as `pong/client.ts` runs
-  it on its own paddle through `PredictedEntity`'s `step`. The other is the
+  it on its own paddle through the connection's `predict.step`. The other is the
   server: the runtime, applying the record stamped for tick T on tick T. The
   two traces are compared per tick and asserted EXACTLY equal, not close,
   because a tolerance would hide the one failure this test exists to catch, a

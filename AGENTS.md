@@ -621,38 +621,53 @@ whole timing guarantee rests on nothing in it ever awaiting.
   4, a wrap that subtracts one tick regardless of steps 1, an `anchorTo` that
   keeps the accumulator 1.
 - `src/client/predictedEntity.ts` - `PredictedEntity<TInput>`, THE STAMPED
-  PATH'S CLIENT HALF IN ONE OBJECT, and the way the pong example, the README
-  quickstart and the bench page do prediction now. A consumer used to
-  hand-write four coupled rules (stamp one record per tick and re-send a
-  window; predict each through the shared pure step; replay the records with
+  PATH'S CLIENT HALF IN ONE OBJECT, AND SINCE 1.0.0 THE OBJECT
+  `RoomConnection`'S `predict` OPTION OWNS. A consumer used to hand-write
+  four coupled rules (stamp one record per tick and re-send a window;
+  predict each through the shared pure step; replay the records with
   `targetTick > snap.tick` from every snapshot into an `ErrorOffset`, snapping
   on the first confirmation and past a distance; draw the owned entity
   between its tick states) plus an `onTickReanchor` handler to move the send
   mark and drop the window, and the reference example had two of the four
-  wrong the day before this landed. OPINIONATED BY DECISION: the options are
-  `conn` (structural, `{ tick: ClientTickView; send(payload: string) }`, so a
-  test passes a fake and `RoomConnection` passes as is), `step`, `maxSpeed`
-  and `initial`, and nothing else; THE TIMESTEP IS `conn.tick.tickMs`, read
-  off the view, because a `tickHz` option was the one number a consumer could
-  get wrong against the connection (it is gone). The API is
-  `advance(input, dt)` once per frame after `conn.frame()` (stamps, sends,
-  returns the pose to draw), `reconcile(pose, snapTick)` once per snapshot,
-  `snapTo(pose)` for the jumps the GAME knows a glide is wrong for,
-  `pose` (the raw prediction) and `stats` (`lastError`, `snaps`, `stamped`,
-  `invalid`). `Pose` is `{ x, y, heading? }`, the fields `EntitySample`
-  interpolates. The fixed decisions, as module constants: `INPUT_WINDOW` 6
-  records re-sent per packet, `INPUT_HISTORY` 32 kept for the replay (the
-  lead exceeds the re-send window on a slow link and a replay bounded by the
-  window came up short on every snapshot there), a pose history one deeper
-  (the pose after every held record plus the one they were predicted from);
-  `RENDER_SLEW` 0.1 and `PLAYHEAD_SNAP_TICKS` 4 for the draw (below); glide
-  taus 0.1, the per-frame position cap `maxSpeed * dt` PASSED THROUGH
-  `sample` from each frame's own delta rather than baked at 60fps, heading
-  cap 0.35 rad per frame, snap distance = offset cap = `maxSpeed * 0.5`; the
-  wire is one JSON array of `{ targetTick, data }` sent as a STRING (the e2e
-  harness already drives the relay with string frames, so the path is
-  covered); heading by shortest arc and wrapped difference; the `ErrorOffset`
-  `z` axis is `pose.y`. THE DRAW IS A PLAYHEAD, NOT THE COUNTER. `renderTick`
+  wrong the day before this landed. Then a consumer held this object beside
+  the connection and got three of its four call orders wrong in one week, so
+  the connection makes the calls now (see `connection.ts`); the class stays
+  exported for a host with several predicted entities or a render layer of
+  its own. OPINIONATED BY DECISION: the options are `conn` (structural,
+  `{ tick: ClientTickView; send(payload: ArrayBuffer | Uint8Array | string) }`,
+  so a test passes a fake and `RoomConnection` passes as is), `step`,
+  `maxSpeed`, an optional `initial` (the origin by default), and the wire
+  pair `wire` (`'binary'` by default, `'json'`) and `encodeInput`, and
+  nothing else; THE TIMESTEP IS `conn.tick.tickMs`, read off the view,
+  because a `tickHz` option was the one number a consumer could get wrong
+  against the connection (it is gone). The API is `advance(input, dt)` once
+  per frame after `conn.frame()` (stamps, sends, returns the pose to draw),
+  `reconcile(pose, snapTick)` once per snapshot, `snapTo(pose)` for the jumps
+  the GAME knows a glide is wrong for, `pose` (the raw prediction) and
+  `stats` (`lastError`, `snaps`, `stamped`, `invalid`). `Pose` is
+  `{ x, y, heading? }`, the fields `EntitySample` interpolates. The fixed
+  decisions, as module constants: `INPUT_WINDOW` 6 records re-sent per
+  packet, `INPUT_HISTORY` 32 kept for the replay (the lead exceeds the
+  re-send window on a slow link and a replay bounded by the window came up
+  short on every snapshot there), a pose history one deeper (the pose after
+  every held record plus the one they were predicted from); `RENDER_SLEW` 0.1
+  and `PLAYHEAD_SNAP_TICKS` 4 for the draw (below); glide taus 0.1, the
+  per-frame position cap `maxSpeed * dt` PASSED THROUGH `sample` from each
+  frame's own delta rather than baked at 60fps, heading cap 0.35 rad per
+  frame, snap distance = offset cap = `maxSpeed * 0.5`; heading by shortest
+  arc and wrapped difference; the `ErrorOffset` `z` axis is `pose.y`. THE
+  WIRE IS BINARY BY DEFAULT: the window goes out as `tickroom/codec`'s
+  `encodeInputWindow` frame (69 bytes for six records, each record's
+  `targetTick` written into the `seq` field the library never reads), which
+  REQUIRES `TInput` to be `DefaultInput` (`{ axes: [x, y], buttons }`); the
+  first input `advance` is given is checked BEFORE ANYTHING MOVES and a
+  `TypeError` names `wire: 'json'` and `encodeInput` as the ways out, on
+  every frame until it is fixed (a check inside the encoder, after the stamp,
+  threw once and then went quiet because the next frame crossed no tick).
+  `'json'` is the 0.3.x frame, one text array of `{ targetTick, data }`
+  (about 300 bytes for six), for any JSON-shaped input, which is what pong's
+  `{ dir }` uses; `encodeInput` is a host's own. Both decode on the relay
+  through `decodeInputAuto`. THE DRAW IS A PLAYHEAD, NOT THE COUNTER. `renderTick`
   (a float in the counter's tick units) aims at `tick.value - 1 + fraction`,
   one tick behind the newest stamp so it always sits on two stamped poses,
   and moves by each frame's own `dt / tickMs` scaled into `1 +- RENDER_SLEW`:
@@ -720,11 +735,13 @@ whole timing guarantee rests on nothing in it ever awaiting.
   `INPUT_HISTORY` below the oldest record held INSIDE an epoch (a count
   that restarted while the connection's rate-limited re-anchor had not
   caught up; the first snapshots of a fresh seat sit below every record by
-  only the lead) is a counted snap too, not a replay. ONE PER CONNECTION: a
-  module-level `WeakMap` from the `conn` object to its entity makes a
-  second construction on the same connection a `RangeError` naming the
-  rule, because the ticker keeps ONE playout buffer per pid and two entities
-  overwrite each other's record for every tick. Each record keeps a JSON
+  only the lead) is a counted snap too, not a replay. THE ONE-PER-CONNECTION
+  `WeakMap` IS GONE (1.0.0): the ticker keeps ONE playout buffer per pid and
+  two entities sending two windows overwrite each other's record for every
+  tick, which the rule protected against, but the connection builds exactly
+  one for `predict` now and a host building several by hand (the reason the
+  class is still exported) owns the merge into one window, which the rule
+  made impossible. Each record keeps a JSON
   COPY of the input and predicts through the copy, so the replay is byte
   for byte what the server applied whatever the caller does to its input
   object afterwards. AND SINCE 0.3.0 THE STEP IS TOLD WHICH TICK IT IS
@@ -791,7 +808,7 @@ whole timing guarantee rests on nothing in it ever awaiting.
   and no more, and released it draws the newest pose with the change carried
   by the offset), the double-step repro itself, a -20 (one counted snap,
   exact reconcile), a
-  NaN/Infinity/negative `dt`, the one-per-connection guard, four epoch cases
+  NaN/Infinity/negative `dt`, four epoch cases
   (same room, another room, the old records never replayed against a new
   count, a restarted count inside an epoch), a 70ms frame
   (ordinary motion), a late burst across a stop, a 450ms starve across a
@@ -812,7 +829,8 @@ whole timing guarantee rests on nothing in it ever awaiting.
   fires first, which is why the bound has its own case), the `before`
   measured against the stored history clamped at its end rather than the
   speculation the previous frame drew 5 (the input change case among them),
-  the `dt` guard removed 1, the one-per-connection guard removed 1,
+  the `dt` guard removed 1, the one-per-connection guard removed 1 (the
+  guard and its case are both gone in 1.0.0, the row is history),
   the epoch transition watch removed 1, the restarted-count rule removed 1,
   `lastError` left stale on a refusal 1; the slew
   removed (the draw follows the target) 8 (was 4), the slew allowed backward 1, the
@@ -889,14 +907,47 @@ whole timing guarantee rests on nothing in it ever awaiting.
   and 30 rendered frames at 60Hz for the default delay and pinned delays of 80,
   100, 200, 300 and 500ms. THE CALL ORDER IS THE CONTRACT, because it reads the
   destination out of the buffer: call it AFTER the frame carrying the
-  destination was pushed, which on `RoomConnection`'s `interpolate` option
-  means from `onSnapshot`. A late arrival from before the destination is voided
-  as it lands, for the same reason.
+  destination was pushed. SINCE 1.0.0 THE CONNECTION MAKES THE CALL: a host
+  names the keys in `interpolate.teleported(snap)` and `processSnapshot` calls
+  `teleport(key)` for each after its own push, so the order is a fact about
+  one function rather than a rule a host remembers (a consumer had it wrong).
+  The method stays public for a host driving an interpolator by hand, where
+  `onSnapshot` is still the right place. A late arrival from before the
+  destination is voided as it lands, for the same reason.
 - `src/client/connection.ts` - `RoomConnection`. Reconnect, re-mint, clock sync,
-  protocol-skew recovery, stall observation, AND the two epoch-scoped components
-  it owns: the tick counter and (optionally) a `SnapshotInterpolator`. Generic in
-  the host's snapshot type and the interpolator's key type, both inferred.
-  `frame()` is the ONE per-frame call. Also exports `RosterFrame`/`isRosterFrame`,
+  protocol-skew recovery, stall observation, AND the three epoch-scoped
+  components it owns: the tick counter, (optionally) a `SnapshotInterpolator`,
+  and (optionally, since 1.0.0) the `PredictedEntity` for the player's own
+  entity. Generic in the host's snapshot type, the interpolator's key type and
+  the input type (`TInput`, defaulting to `DefaultInput`, inferred from
+  `predict.step`). `frame(now, input?)` is the ONE per-frame call.
+  THE 1.0.0 FOLD, and why: a consumer holding a `PredictedEntity` beside the
+  connection got three of the four hand-wiring orders wrong in one week (the
+  entity advanced before `frame()` moved the counter, `reconcile` after
+  `onSnapshot` had already read the state, `snapTo` after the reconcile
+  instead of before it), and every one was an ORDER between two objects the
+  host held at once. So `predict: { step, maxSpeed, ownPose, teleported?,
+  initial?, wire?, encodeInput? }` builds the entity in the constructor with
+  `conn: this`, `frame(now, input)` REQUIRES `input` once it is set (a
+  `TypeError` naming the option, before anything moves) and advances the
+  entity LAST, after the counter and the interpolator sample, returning the
+  drawn pose as `FrameView.own` (`null` until `ownConfirmed`, a flag set by the
+  first reconcile and dropped by `dropHeldPoses`, so it is scoped exactly as
+  the held remote poses are: a reconnect into the same room keeps drawing,
+  a terminal or a room change stops); `processSnapshot` pushes the frame, then
+  calls `interp.teleport(key)` for every key of `interpolate.teleported(snap)`,
+  then takes `predict.ownPose(snap)` and, when it is not null, calls `snapTo`
+  first if `predict.teleported(snap)` and then `reconcile(pose, snap.tick)`,
+  and THEN `onSnapshot`, so a host reads a fully reconciled state from its
+  callback. `conn.own` is the raw prediction (what `entity.pose` was) and
+  `conn.ownStats` what `entity.stats` was, both `null` without `predict`.
+  `interpolate.into` is OPTIONAL: the connection constructs a default
+  `SnapshotInterpolator` when it is omitted, held on `this.interp`, which is
+  the only field the class reads the interpolator from. All four new host
+  callbacks (`interpolate.teleported`, `predict.ownPose`, `predict.teleported`,
+  and a `snapTo` that refuses the host's own non-finite pose) are guarded and
+  counted on `hostErrors` like `interpolate.entities`, because each has a
+  RETURN VALUE and a throw has to skip one specific step. Also exports `RosterFrame`/`isRosterFrame`,
   the typed shape of the `onText` roster control frame. The audit added: session
   validation on `mint()`'s output; an attempt GENERATION counter so a stale
   attempt cannot tear down the live one; deadlines on `mint()` and the handshake
@@ -937,8 +988,9 @@ whole timing guarantee rests on nothing in it ever awaiting.
   `onText`, `onSnapshot`), and the close path schedules the reconnect BEFORE it
   announces the status. THE PUSH-BEFORE-`onSnapshot` ORDERING IS NOW A PUBLIC
   CONTRACT rather than only a defence: `SnapshotInterpolator.teleport(key)`
-  reads the destination out of the buffer, so `onSnapshot` is the callback a
-  host calls it from, and both option docs say so. `rttMs` is a SLIDING-WINDOW MINIMUM over `RTT_WINDOW`
+  reads the destination out of the buffer, and since 1.0.0 the connection
+  makes that call itself for the keys `interpolate.teleported` names, after
+  the push and before `onSnapshot`. `rttMs` is a SLIDING-WINDOW MINIMUM over `RTT_WINDOW`
   (8) accepted samples, discarding anything above `RTT_MAX_SAMPLE_MS` (5000) or
   taken while the render loop was frozen. Once the server clock is seeded a
   snapshot more than `SNAPSHOT_TIME_PLAUSIBLE_MS` (60000) from `serverNow()`, or
@@ -949,8 +1001,8 @@ whole timing guarantee rests on nothing in it ever awaiting.
   (`anchorRttMs`): a pong that moves `rttMs` a whole tick away from it drops the
   rate limit so the next snapshot corrects it. `relay-expiring` is rate limited
   to one swap per `RELAY_EXPIRY_LEAD_MS` with the deadline floored at
-  `SWAP_MIN_DEADLINE_MS` (1000). `beginEpoch()` calls
-  `interpolate.into.resumeFrom(held)` immediately after `clear()`, with the
+  `SWAP_MIN_DEADLINE_MS` (1000). `beginEpoch()` calls the interpolator's
+  `resumeFrom(held)` immediately after `clear()`, with the
   poses `frame()` was drawing. And `lastReanchorAt`/`lastSwapStartedAt` are
   `Number.NEGATIVE_INFINITY` sentinels, never 0: see the sentinel invariant.
   SIX MORE FROM THE COMPLETENESS ROUND, and two of them are new public surface.
@@ -1013,7 +1065,20 @@ whole timing guarantee rests on nothing in it ever awaiting.
   passes 1 (+-32767 px at 1px); both ends must agree, and the bump that
   agreement implies belongs to the host. `encodeInputWindow`/`decodeInputWindow`
   take an optional `DefaultInputWindowOptions` carrying `axisScale`, defaulting
-  to `AXIS_SCALE` (127) so the existing wire is byte-identical.
+  to `AXIS_SCALE` (127) so the existing wire is byte-identical. SINCE 1.0.0
+  the record's payload half has a name, `DefaultInput`
+  (`{ axes: [number, number]; buttons: number }`, `DefaultInputRecord` extends
+  it with `seq` and `targetTick`), because it is the shape `RoomConnection`'s
+  default binary input wire requires; and `decodeInputAuto(data: unknown)` is
+  THE ONE DECODER FOR BOTH INPUT WIRES and the default `decodeInput` of
+  `createRoom` and `runLockstep`: a `string`, or bytes whose first byte is
+  `[` or `{` (the cursors example encodes JSON into a binary frame), is JSON
+  (an array of records or one record, non-object entries dropped); other
+  bytes go through `decodeInputWindow`; anything malformed on either path is
+  `[]`, NEVER A THROW, including malformed JSON, which the Vercel adapter's
+  old default deliberately let throw so `onBadInput` could count it. A host
+  that wants that count writes a decoder that throws. The sniff is
+  unambiguous because `INPUT_WINDOW_VERSION` is 1 and neither JSON opener is.
   `encodeDefaultSnapshot` THROWS `CodecError` on an entity id outside
   `0..65535`. `decodeDefaultSnapshot` checks the version FIRST, before a single
   field, and throws `ProtocolVersionError`; `decodeInputWindow` returns `[]` for
@@ -1115,10 +1180,12 @@ whole timing guarantee rests on nothing in it ever awaiting.
   `<connNamespace>:conns:<sub>`, so it is filtered on the same terms a room id
   is), and copying a `claims` hook's extra claims through by VALUE TYPE
   because `verifyToken` fails closed on a claim that is not a string or a
-  number. `defaultDecodeInput` is exported beside it: a `string` is JSON (what
-  `PredictedEntity` sends), bytes go through `tickroom/codec`'s
-  `decodeInputWindow`, anything else is `[]`, and malformed JSON is left to
-  throw because that is the only thing `onBadInput` can count. ONE OPTION WAS
+  number. `defaultDecodeInput` is exported beside it and SINCE 1.0.0 IS AN
+  ALIAS OF `decodeInputAuto` from `tickroom/codec` (the binary window
+  `predict` sends by default, the JSON frame it sends on `wire: 'json'`, `[]`
+  for anything malformed); it used to let malformed JSON throw so
+  `onBadInput` could count it, and a host that wants the count back writes a
+  decoder that throws. ONE OPTION WAS
   ADDED TO `createRelayRoute` TO MAKE `session.maxAgeS` HONEST: the route
   passes `maxAgeS` into its own `verifyToken`, where it previously always took
   the 12 hour default, so an expiry the mint states is one the socket path
@@ -1157,13 +1224,19 @@ whole timing guarantee rests on nothing in it ever awaiting.
   put both platforms in one import graph anyway.
 - `src/testing/lockstep.ts` - NEW in 0.3.0, and the whole of `tickroom/testing`
   (`src/testing/index.ts` is the barrel `package.json` points `./testing` at).
-  `runLockstep` runs a host's own `RoomRuntime` and its own `PredictedEntity`
-  step against each other for `ticks` ticks with a modelled `lead` and `delay`,
+  `runLockstep` runs a host's own `RoomRuntime` and its own `predict.step`
+  against each other for `ticks` ticks with a modelled `lead` and `delay`,
   through the host's own `encode`/`decode` so the client reads WIRE-QUANTISED
-  poses; `sweepLockstep` does it once per lead/delay combination. It reports
-  `maxError`, the `reconciles` above a threshold, `snaps`, `stamped`, the
-  per-tick `trace`, and `pinned`, the ticks where the server's pose moved and
-  the client's raw `entity.pose` did not. IT EXISTS FOR THE ONE DIVERGENCE NO
+  poses, on the same input wire the page uses (its options MIRROR `predict`
+  since 1.0.0: `step`, `maxSpeed`, `ownPose`, `wire`, `encodeInput`,
+  `initial`, and `decodeInput(unknown)` defaults to `decodeInputAuto`, so a
+  pong-shaped scenario says `wire: 'json'` exactly as the page does); it
+  builds its own `PredictedEntity` on a fake conn rather than a
+  `RoomConnection`, since there is no socket. `sweepLockstep` does it once
+  per lead/delay combination. It reports `maxError`, the `reconciles` above a
+  threshold, `snaps`, `stamped`, the per-tick `trace`, and `pinned`, the ticks
+  where the server's pose moved and the client's raw `conn.own` did not. IT
+  EXISTS FOR THE ONE DIVERGENCE NO
   CHECK INSIDE THIS LIBRARY CAN SEE: a host's step reading context the server
   does not read at the same tick (the case that produced it read a collision
   latch off the client's raw pose, so every replay from the server's pose
@@ -1192,21 +1265,23 @@ whole timing guarantee rests on nothing in it ever awaiting.
   the library's own `depth`/`input-lead` frames, and the example is the proof
   that a host has nothing to route. `client.ts` IS IN TWO
   HALVES, AND THE SPLIT IS THE DOM. `createPongClient` is all of the netcode
-  and none of the browser (the connection, the decode, the interpolator, the
-  `PredictedEntity` and the `frame()`-then-`advance()` ordering the three
-  depend on), and `startPong` is the canvas, the keys and the animation frame
-  on top of it, about thirty lines of drawing. The split changes no behaviour;
-  what it buys is that `tests/example.redis.test.ts` can drive THIS wiring
-  through a real socket rather than a retyped copy of it, which is the only
-  way the shipped example can be the thing CI checks. The prediction inside it
-  is `PredictedEntity` and nothing else: one object built from `conn`, the
-  shared `stepPaddleY`, `PADDLE_SPEED` and the spawn pose, one `advance` per
-  frame, one `reconcile` per snapshot, and NO `onTickReanchor` handler at all,
-  because the entity reads a counter jump off `tick.value` itself. The
-  stamping, the six-record re-send window, the replay through an `ErrorOffset`
-  and the draw between tick states that this file used to hand-write are the
-  library's now, and two of those four rules were wrong here until the day
-  before that landed. `codec.ts` is
+  and none of the browser (one `RoomConnection` with `interpolate` and
+  `predict`, and one `conn.frame(now, { dir })` per frame), and `startPong` is
+  the canvas, the keys and the animation frame on top of it, about thirty
+  lines of drawing. The split changes no behaviour; what it buys is that
+  `tests/example.redis.test.ts` can drive THIS wiring through a real socket
+  rather than a retyped copy of it, which is the only way the shipped example
+  can be the thing CI checks. The prediction inside it is the connection's
+  `predict` option and nothing else: the shared `stepPaddleY`, `PADDLE_SPEED`,
+  the spawn pose, an `ownPose` that finds our paddle by pid (`null` until the
+  roster names us), `wire: 'json'` because `{ dir }` is not a stick, and NO
+  `onTickReanchor` handler at all, because the entity reads a counter jump off
+  `tick.value` itself. `PongFrame.own` is `null` until the server confirms the
+  paddle and `PongClient.paddle` is gone (`conn.ownStats` is what the
+  harnesses read). The stamping, the six-record re-send window, the replay
+  through an `ErrorOffset`, the draw between tick states and the three call
+  orders that this file used to hand-write are the library's now, and two of
+  the four rules were wrong here until the day before that landed. `codec.ts` is
   `PONG_PROTOCOL_VERSION` 3: 2 added `inputLead` per paddle and 3 took it back
   out, and each changed what the wire MEANS. `sim.test.ts` (23 cases) is the differential test: the
   client's `stepPaddleY` against the server's `applyInput` plus `tick` on the
@@ -1958,11 +2033,13 @@ whole timing guarantee rests on nothing in it ever awaiting.
   frozen threshold is not drift, and reading it as drift re-anchored twice
   (+N inside the hitch, -N two seconds later). Every other use of
   `tick.value` is the raw counter. See "A STALL IS NOT DRIFT".
-- ONE `PredictedEntity` PER CONNECTION, enforced at construction with a
-  `RangeError`. The entity is the player's input stream: the ticker keeps one
-  playout buffer per pid, so two entities on one connection overwrite each
-  other's record for every tick and the server consumes whichever landed
-  last. A player steering several things carries them in one input record.
+- ONE INPUT STREAM PER CONNECTION. The ticker keeps one playout buffer per
+  pid, so two windows sent from one socket overwrite each other's record for
+  every tick and the server consumes whichever landed last. `predict` builds
+  exactly one `PredictedEntity`, which is why the construction-time `WeakMap`
+  guard the class used to carry is gone; a player steering several things
+  carries them in one input record, and a host building several entities by
+  hand merges their windows into one send.
 - A BACKWARD COUNTER JUMP REWINDS THE PREDICTION AND RELABELS NOTHING. The
   ticks beyond `value - 1` have not happened on the server's timeline: the
   records beyond the mark are dropped and re-sent as the counter climbs (a
@@ -1995,11 +2072,13 @@ whole timing guarantee rests on nothing in it ever awaiting.
   ever hide this module's own guess, so a real teleport, a respawn or an
   authoritative correction still snaps.
 - A JUMP THE HOST KNOWS ABOUT IS THE HOST'S TO DECLARE, on both paths and from
-  the snapshot that carries it: `SnapshotInterpolator.teleport(key)` for a
-  remote entity (after the push, which `onSnapshot` guarantees) and
-  `PredictedEntity.snapTo(pose)` for the owned one. Neither smoother can tell a
-  respawn from a disagreement on its own, and both are built to render the path
-  between two poses, which is precisely what a jump has none of.
+  the snapshot that carries it: `interpolate.teleported(snap)` names the remote
+  keys and `predict.teleported(snap)` says the owned entity was put somewhere,
+  and the connection makes the calls (`teleport(key)` after its push, `snapTo`
+  before the reconcile). Neither smoother can tell a respawn from a
+  disagreement on its own, and both are built to render the path between two
+  poses, which is precisely what a jump has none of. The ORDER of those calls
+  is the connection's, not the host's: see the gotcha.
 - BOTH TERMS OF THE PLAYHEAD ARE SLEW-CAPPED: the offset at 5%, the delay at 8%
   of wall time. Both are subtracted from the playhead, so moving either quickly
   IS rendering every remote entity fast or slow for as long as the move lasts.
@@ -2592,8 +2671,8 @@ connection with zero reconnects and no terminal. A host that logs or alerts on
 `onTickReanchor` will page itself every time a player switches tabs, and a host
 that adjusts its own `lastSentTick` by the delta (which is what the callback's
 docstring asks for) is doing exactly the right thing at ~0.5 Hz. A host on
-`PredictedEntity` has nothing to adjust: the entity reads the jump off
-`tick.value` inside `advance`, and the callback is telemetry for it.
+`predict` has nothing to adjust: the entity reads the jump off `tick.value`
+inside its own advance, and the callback is telemetry for it.
 
 STEADY MOTION HIDES AN OFF-BY-ONE IN THE INPUT TIMELINE, AND ONLY AN INPUT
 CHANGE REVEALS IT. The ticker consumed the stamp `currentTick` (the COMPLETED
@@ -2630,9 +2709,10 @@ which the player reported as stutter the moment the timeline fix removed the
 rubber banding that had been hiding it. Measured on the deployment by
 `bench/paddle.mjs`: 67% of held frames with no motion and a largest
 single-frame step of 4.50 before, 0% and 1.60 after (per-frame travel at 60fps
-is 1.5). `PredictedEntity` owns the draw, and `examples/pong/client.ts` draws
-through it. One tick of visual delay on an entity whose prediction has no
-round trip in it, which is not felt, for motion at the frame rate.
+is 1.5). `PredictedEntity` owns the draw, the connection's `predict` owns the
+entity, and `examples/pong/client.ts` draws `frame().own`. One tick of visual
+delay on an entity whose prediction has no round trip in it, which is not
+felt, for motion at the frame rate.
 
 A COUNTER JUMP IS NOT TIME PASSING: THE RENDER OF A PREDICTED ENTITY MUST
 SLEW, NOT FOLLOW THE COUNTER. The first draw was `prev + (curr - prev) *
@@ -2819,12 +2899,38 @@ is the buffer depth measured rather than counted.
 AND ITS CALL ORDER IS A CONTRACT, NOT A PREFERENCE, because it reads the
 destination out of the buffer: called before the frame carrying the destination
 is pushed it finds the pose the entity had BEFORE the jump and voids the
-history behind THAT, which is the streak again with an extra step in it. On
-`RoomConnection`'s `interpolate` option the ordering is satisfied by
-construction from `onSnapshot`, since the connection pushes and then calls the
-host back, which is why that ordering is now stated in three places (the method
-doc, `SnapshotInterpolationOptions`, and `onSnapshot`'s own doc) instead of
-being a comment inside `processSnapshot`.
+history behind THAT, which is the streak again with an extra step in it. A
+consumer made the call from the wrong place anyway, so since 1.0.0 the host
+DECLARES the keys in `interpolate.teleported(snap)` and `processSnapshot` makes
+the call after its own push; `onSnapshot` is only the right place for a host
+driving an interpolator by hand.
+
+THE THREE ORDERS A CONSUMER GOT WRONG WITH A HAND-HELD `PredictedEntity`, AND
+WHY THE CONNECTION OWNS IT NOW (1.0.0). In one week one host advanced the
+entity BEFORE `conn.frame()` (every record stamped one frame into the past),
+reconciled AFTER reading `entity.pose` in `onSnapshot` (a camera and a
+collision latch a snapshot behind), and called `snapTo` AFTER `reconcile` on a
+respawn (the server's answer glided in from the pre-respawn pose and then
+snapped to the host's guess: 20 units absorbed into the offset and one snap
+where the right order absorbs nothing and counts two). Each is an order
+between two objects the host held at once, and the fix for an ordering rule
+is to remove the second object: `predict` makes all three calls inside
+`frame()` and `processSnapshot`, and `connection.test.ts` pins each order (the
+own entity advanced last, `conn.own` already reconciled inside `onSnapshot`,
+and a declared teleport reconciling with `lastError` 0 and two counted snaps
+against the control's 20 and none). WHAT THE FOLD DID NOT CHANGE: the entity
+still watches `tick.anchored` for its epoch from both calls, because the
+connection anchors and then reconciles in the same `processSnapshot`, so the
+epoch's first reconcile still lands before its first advance.
+
+THE BINARY INPUT WIRE CHECKS ITS SHAPE BEFORE THE FIRST STAMP, NOT INSIDE THE
+ENCODER. The first cut checked `DefaultInput` inside the binary encoder on the
+first send, which is after the records are pushed and the mark has moved: the
+`TypeError` fired once, the next frame crossed no tick and sent nothing, and
+the entity sat there stamped and silent with the error a frame in the past.
+The check runs in `advance` beside the JSON check, before any state moves, and
+clears itself only when it passes, so a wrong shape is every frame's error
+until the host adds `wire: 'json'` or `encodeInput`.
 
 A PREDICTION STEP HAS TO BE PURE OF CLIENT-FRAME STATE, NOT MERELY OF ITS OWN,
 AND THIS IS WHAT RUBBERBANDING ON A HEALTHY LINK LOOKS LIKE. `reconcile`
@@ -3015,12 +3121,14 @@ nothing here saw it.
 
 ## Status
 
-MEASURED ON THIS TREE, not estimated, PER TIER: `npm run test:unit` is 1135
+MEASURED ON THIS TREE, not estimated, PER TIER: `npm run test:unit` is 1148
 passed across 34 files with `TICKROOM_TEST_REDIS_URL` pointed at an unused port
 (6499), which is the no-services promise proved rather than assumed;
-`npm run test:integration` is 1183 across 43 with a local Redis on 6399;
-`npm run test:measure` is 16 across 4 on the same Redis and a quiet laptop;
-`npm test` is the sum, 1199 across 47. Forced jittery (JITTER_LIMIT dropped to
+`npm run test:integration` is 1196 across 43 with a local Redis on 6399 (both
+re-measured on the 1.0.0 fold commit); `npm run test:measure` is 16 across 4
+on the same Redis and a quiet laptop (last measured before the fold; its four
+files compile against the folded API and were not re-run for it);
+`npm test` is the sum, 1212 across 47. Forced jittery (JITTER_LIMIT dropped to
 1.0 for the check, then restored) the integration tier is 1177 passed and 6
 skipped and still exit 0, and the measurement tier is 16 skipped and still exit
 0, which is the loud-skip path exercised rather than argued. The last fw13 run of
@@ -3066,18 +3174,27 @@ rest of each file is worth gating a release on. In every one of those places
 `tests/helpers/jitter.ts` decides whether the host can measure at all and the
 file says why when it cannot, with the measured factor in the reason.
 
-PER FILE, which is what a mutation row is measured against: `ticker.test.ts`
-146, `relay.test.ts` 127, `connection.test.ts` 122, `interpolation.test.ts` 64,
-`ids.test.ts` 64, `bytes.test.ts` 52, `netPolicy.test.ts` 18, `lease.test.ts`
-34, `snapshot.test.ts` 34, `playout.test.ts` 30, `quantize.test.ts` 23,
+PER FILE, which is what a mutation row is measured against (re-read off the
+1.0.0 fold's integration run): `ticker.test.ts` 148, `relay.test.ts` 131,
+`connection.test.ts` 131, `interpolation.test.ts` 65, `ids.test.ts` 64,
+`bytes.test.ts` 52, `netPolicy.test.ts` 18, `lease.test.ts` 34,
+`snapshot.test.ts` 38, `playout.test.ts` 30, `quantize.test.ts` 23,
 `core/checkpoint.test.ts` 23, `server/checkpoint.test.ts` 22,
-`vercel.test.ts` 54, `session.test.ts` 19, `metrics.test.ts` 17,
+`vercel.test.ts` 81, `session.test.ts` 19, `metrics.test.ts` 17,
 `admission.test.ts` 16, `backpressure.test.ts` 16, `starvation.test.ts` 16,
-`balancer.test.ts` 20, `redis.test.ts` 14, `adapters/node.test.ts` 15,
+`balancer.test.ts` 20, `redis.test.ts` 14, `adapters/node.test.ts` 16,
 `errorOffset.test.ts` 10, `clientTick.test.ts` 13, `predictedEntity.test.ts`
-60, `rateLimit.test.ts` 8,
-`bundling.test.ts` 6, `testing/lockstep.test.ts` 8, and in the examples `pong/sim.test.ts` 23,
-`cursors/sim.test.ts` 19, `pong/codec.test.ts` 4.
+59 (the one-per-connection case is gone with the guard), `rateLimit.test.ts` 8,
+`log.test.ts` 5, `bundling.test.ts` 6, `testing/lockstep.test.ts` 8, and in
+the examples `pong/sim.test.ts` 20, `cursors/sim.test.ts` 19,
+`pong/codec.test.ts` 4. The fold added 8 to `connection.test.ts` (six for the
+`predict` orders and `own`, the default interpolator, and three for the input
+wire: JSON/binary parity through `decodeInputAuto` with the 69-byte frame
+pinned, the shape check, a verbatim `encodeInput`), 1 to
+`interpolation.test.ts` (the declared teleport through a connection), 4 to
+`snapshot.test.ts` (`decodeInputAuto`), and 1 to `vercel.test.ts` (JSON as
+bytes), and replaced the adapter's malformed-JSON-throws case with its
+inverse.
 
 WHAT THE 2026-09-02 WORK COST IN TESTS, per file, measured against commit
 `b3ebcd7` (593 across 33 files, which is what the first version of this

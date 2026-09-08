@@ -13,8 +13,8 @@
 //   * the client is `createPongClient` from `examples/pong/client.ts`, the
 //     DOM-free half of the example, driven on a 16ms timer instead of
 //     `requestAnimationFrame`. Nothing about the netcode is retyped here: the
-//     decode, the interpolator wiring, the `PredictedEntity`, the
-//     `frame()`-then-`advance()` ordering and `readDir` are all the example's.
+//     decode, the interpolator wiring, the `predict` option, the one
+//     `frame(now, input)` call and `readDir` are all the example's.
 //
 // WHY THIS FILE EXISTS. AGENTS.md carried "the examples are still not run by
 // CI" as an open item for exactly this reason: the example's own tests are
@@ -96,7 +96,7 @@ interface SnapRec {
 interface FrameRec {
   at: number;
   ids: string[];
-  /** `PredictedEntity.stats.lastError`: how far the prediction sat from the replayed authoritative pose at the last reconcile. */
+  /** `conn.ownStats.lastError`: how far the prediction sat from the replayed authoritative pose at the last reconcile. */
   lastError: number;
 }
 
@@ -212,7 +212,7 @@ d('examples/pong through a real socket', () => {
         joinMeta: (claims) => ({ name: claims.pid }),
         // The node example's own line, normalising `ws`'s Buffer (or an array
         // of them for a fragmented message) before parsing the JSON array
-        // `PredictedEntity` sends.
+        // pong's `predict` sends on `wire: 'json'`.
         decodeInput: (buf): ClientInput[] => {
           const bytes = Array.isArray(buf) ? Buffer.concat(buf as Buffer[]) : (buf as Buffer);
           const parsed = JSON.parse(new TextDecoder().decode(bytes)) as ClientInput | ClientInput[];
@@ -275,7 +275,7 @@ d('examples/pong through a real socket', () => {
       const frameTimer = setInterval(() => {
         const at = performance.now();
         const view = client.frame(at);
-        frames.push({ at, ids: [...view.entities.keys()], lastError: client.paddle.stats.lastError });
+        frames.push({ at, ids: [...view.entities.keys()], lastError: client.conn.ownStats!.lastError });
       }, FRAME_MS);
 
       await client.start();
@@ -283,7 +283,7 @@ d('examples/pong through a real socket', () => {
       await new Promise((resolve) => setTimeout(resolve, RUN_MS));
 
       const endStats = client.conn.stats();
-      log(`[client] final ${JSON.stringify(endStats)} predicted=${JSON.stringify(client.paddle.stats)}`);
+      log(`[client] final ${JSON.stringify(endStats)} predicted=${JSON.stringify(client.conn.ownStats!)}`);
 
       // ---- teardown -------------------------------------------------------
       clearInterval(sweep);
@@ -366,7 +366,7 @@ d('examples/pong through a real socket', () => {
           hiY,
         },
         reconcile: { maxError: +maxError.toFixed(4), medianError: +medianError.toFixed(4) },
-        predicted: client.paddle.stats,
+        predicted: client.conn.ownStats!,
         goals: goals.length,
         ownGoals: ownGoals.length,
         bestScore,
@@ -418,9 +418,9 @@ d('examples/pong through a real socket', () => {
         // counter re-anchor, which is a healthy event that invalidates the
         // stored history and must not be ROUTINE, since a prediction snapping
         // repeatedly is what a broken timeline looks like from this side.
-        expect(client.paddle.stats.stamped, 'stamped records').toBeGreaterThan((RUN_MS / 1000) * TICK_HZ * 0.8);
-        expect(client.paddle.stats.snaps, 'hard snaps').toBeLessThanOrEqual(2);
-        expect(client.paddle.stats.invalid, 'invalid replays').toBeLessThanOrEqual(1);
+        expect(client.conn.ownStats!.stamped, 'stamped records').toBeGreaterThan((RUN_MS / 1000) * TICK_HZ * 0.8);
+        expect(client.conn.ownStats!.snaps, 'hard snaps').toBeLessThanOrEqual(2);
+        expect(client.conn.ownStats!.invalid, 'invalid replays').toBeLessThanOrEqual(1);
 
         expect(ownGoals.length, 'goal events for our pid').toBeGreaterThanOrEqual(1);
         expect(bestScore, 'our score, as the client decoded it').toBeGreaterThanOrEqual(1);

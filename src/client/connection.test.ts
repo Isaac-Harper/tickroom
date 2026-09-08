@@ -11,14 +11,19 @@ import {
   type SessionInfo,
   type DecodedSnapshotLike,
   type RoomConnectionOptions,
+  type PredictionOptions,
 } from './connection.js';
 import { SnapshotInterpolator, RESUME_GLIDE_MAX_MS } from './interpolation.js';
+import type { Pose } from './predictedEntity.js';
 import { PING_INTERVAL_MS, PLAYOUT_MAX_AHEAD } from '../core/index.js';
 import { REANCHOR_MIN_INTERVAL_MS } from './netPolicy.js';
 import {
   DEFAULT_SNAPSHOT_VERSION,
+  INPUT_WINDOW_MAX,
   encodeDefaultSnapshot,
   decodeDefaultSnapshot,
+  decodeInputAuto,
+  type DefaultInput,
   type DefaultSnapshot,
 } from '../codec/index.js';
 
@@ -4021,5 +4026,277 @@ describe('RoomConnection a failed swap does not damage the live socket', () => {
     await conn.start({ remint: true });
     expect(mints()).toBe(2); // ...and a fresh one, also as asked
     conn.stop();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The own entity, owned by the connection: `predict`.
+// ---------------------------------------------------------------------------
+
+/** A snapshot that carries this client's own pose, or does not yet, and may say the entity was PUT somewhere. */
+interface OwnSnap extends DecodedSnapshotLike {
+  own: Pose | null;
+  jump?: boolean | undefined;
+}
+
+/** A stick that is not moving: the default input shape, so the binary wire takes it. */
+const STILL: DefaultInput = { axes: [0, 0], buttons: 0 };
+/** Full deflection both ways plus two buttons. `1` and `-1` are exact at `AXIS_SCALE`, which is what lets the two wires be compared for equality below. */
+const HELD: DefaultInput = { axes: [1, -1], buttons: 3 };
+const OWN_SPEED = 90;
+
+function stepStick(pose: Pose, input: DefaultInput, dt: number): Pose {
+  return { x: pose.x + input.axes[0] * OWN_SPEED * dt, y: pose.y + input.axes[1] * OWN_SPEED * dt };
+}
+
+/** A predicting connection whose snapshot payload the test sets frame by frame, exactly as `clockRoom` does for a plain one. */
+function predictRoom(
+  predict: Partial<PredictionOptions<OwnSnap, DefaultInput>> = {},
+  over: Partial<RoomConnectionOptions<OwnSnap, string, DefaultInput>> = {},
+) {
+  let next: OwnSnap = { tick: 100, serverTime: 0, own: null };
+  const conn = new RoomConnection<OwnSnap, string, DefaultInput>({
+    tickHz: 20,
+    mint: vi.fn().mockResolvedValue(makeSession()),
+    WebSocketImpl: IMPL,
+    socketUrl: () => 'ws://x',
+    decodeSnapshot: () => ({ ...next }),
+    predict: {
+      step: stepStick,
+      maxSpeed: OWN_SPEED,
+      initial: { x: 0, y: 0 },
+      ownPose: (snap) => snap.own,
+      ...predict,
+    },
+    ...over,
+  });
+  const deliver = (snap: OwnSnap): void => {
+    next = snap;
+    live().message(new ArrayBuffer(4));
+  };
+  return { conn, deliver };
+}
+
+/** Everything the socket was handed that is not the connection's own ping. */
+function inputFrames(sock: FakeSocket): (ArrayBuffer | Uint8Array | string)[] {
+  return sock.sent.filter(
+    (raw) => !(typeof raw === 'string' && raw.startsWith('{"t":"ping"')),
+  ) as (ArrayBuffer | Uint8Array | string)[];
+}
+
+describe('RoomConnection owns the prediction', () => {
+  it('frame() without input throws a TypeError naming `predict`, and a connection without predict ignores the argument', async () => {
+    // A record stamped with `undefined` is one the server cannot read, and
+    // the entity used to catch it one call down with a message about JSON.
+    // The connection is the one that knows `predict` is set, so it is the one
+    // that says which option made the argument required.
+    const { conn } = predictRoom();
+    await conn.start();
+    live().open();
+    expect(() => conn.frame(1000)).toThrow(TypeError);
+    expect(() => conn.frame(1000)).toThrow(/predict/);
+    expect(() => conn.frame(1000, STILL)).not.toThrow();
+    conn.stop();
+
+    const plain = new RoomConnection({
+      tickHz: 20,
+      mint: vi.fn().mockResolvedValue(makeSession()),
+      WebSocketImpl: IMPL,
+      socketUrl: () => 'ws://x',
+      decodeSnapshot: () => null,
+    });
+    await plain.start();
+    expect(() => plain.frame(1000)).not.toThrow();
+    expect(plain.frame(1000).own).toBeNull();
+    expect(plain.own).toBeNull();
+    expect(plain.ownStats).toBeNull();
+    plain.stop();
+  });
+
+  it('own is null until the first authoritative pose, and the raw prediction is readable throughout', async () => {
+    useMonotonicFakeTimers();
+    const { conn, deliver } = predictRoom();
+    await conn.start();
+    live().open();
+
+    // Nothing anchored: no stamp, no draw, but the prediction exists.
+    expect(conn.frame(performance.now(), STILL).own).toBeNull();
+    expect(conn.own).toEqual({ x: 0, y: 0 });
+
+    // Anchored, stamping, and still nothing of ours in the snapshot.
+    deliver({ tick: 100, serverTime: performance.now(), own: null });
+    for (let i = 0; i < 4; i++) {
+      await vi.advanceTimersByTimeAsync(50);
+      expect(conn.frame(performance.now(), STILL).own).toBeNull();
+    }
+    expect(conn.ownStats!.stamped).toBeGreaterThan(0);
+
+    // The first pose is the first confirmation: a counted snap, and drawn.
+    deliver({ tick: 104, serverTime: performance.now(), own: { x: 5, y: 5 } });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(conn.frame(performance.now(), STILL).own).toEqual({ x: 5, y: 5 });
+    expect(conn.ownStats!.snaps).toBe(1);
+    conn.stop();
+  });
+
+  it('reconciles the own entity BEFORE onSnapshot, so the callback reads the state this snapshot produced', async () => {
+    // A host that reads `conn.own` from `onSnapshot` (a camera, a collision
+    // latch) must see the pose this snapshot confirmed and not the one the
+    // previous snapshot left, which is what a hand-wired `reconcile` after the
+    // callback gave it.
+    useMonotonicFakeTimers();
+    const seen: { own: Pose | null; snaps: number }[] = [];
+    const { conn, deliver } = predictRoom(
+      {},
+      { onSnapshot: () => void seen.push({ own: conn.own, snaps: conn.ownStats!.snaps }) },
+    );
+    await conn.start();
+    live().open();
+    deliver({ tick: 100, serverTime: performance.now(), own: { x: 50, y: 50 } });
+    expect(seen).toEqual([{ own: { x: 50, y: 50 }, snaps: 1 }]);
+    conn.stop();
+  });
+
+  it('a declared own teleport snaps BEFORE the reconcile, so the server answer is a fresh confirmation and not a glide', async () => {
+    // 20 units is inside the snap distance (half a second at 90 u/s is 45),
+    // so an undeclared jump is glided like any other disagreement: that is
+    // the control. Declared, the entity is put on the destination first and
+    // the reconcile then runs FROM it, which is what makes the error zero
+    // and the second snap the first confirmation of a fresh seat. The other
+    // order (reconcile, then snap) draws the destination too, but absorbs 20
+    // units into the offset on the way and counts one snap rather than two.
+    async function jumpRun(declared: boolean) {
+      useMonotonicFakeTimers();
+      const { conn, deliver } = predictRoom(declared ? { teleported: (snap) => snap.jump === true } : {});
+      await conn.start();
+      live().open();
+      deliver({ tick: 100, serverTime: performance.now(), own: { x: 0, y: 0 } });
+      for (let i = 0; i < 10; i++) {
+        await vi.advanceTimersByTimeAsync(50);
+        conn.frame(performance.now(), STILL);
+      }
+      const snapsBefore = conn.ownStats!.snaps;
+      deliver({ tick: 110, serverTime: performance.now(), own: { x: 20, y: 0 }, jump: true });
+      const stats = conn.ownStats!;
+      await vi.advanceTimersByTimeAsync(50);
+      const drawn = conn.frame(performance.now(), STILL).own!;
+      conn.stop();
+      vi.useRealTimers();
+      return { snaps: stats.snaps - snapsBefore, lastError: stats.lastError, drawn };
+    }
+
+    const declared = await jumpRun(true);
+    expect(declared.snaps).toBe(2);
+    expect(declared.lastError).toBe(0);
+    expect(declared.drawn).toEqual({ x: 20, y: 0 });
+
+    const control = await jumpRun(false);
+    expect(control.snaps).toBe(0);
+    expect(control.lastError).toBe(20);
+    expect(control.drawn.x).toBeLessThan(10); // still gliding across
+  });
+
+  it('constructs the interpolator itself when `into` is omitted', async () => {
+    // Every host that wrote `new SnapshotInterpolator<string>()` on the line
+    // above the connection and nothing else now writes nothing: the key type
+    // comes off `entities`.
+    const conn = new RoomConnection({
+      tickHz: 20,
+      mint: vi.fn().mockResolvedValue(makeSession()),
+      WebSocketImpl: IMPL,
+      socketUrl: () => 'ws://x',
+      decodeSnapshot: () => ({ tick: 100, serverTime: Date.now(), players: [{ id: 'p2', x: 7, y: 9 }] }),
+      interpolate: {
+        entities: (snap) => new Map(snap.players.map((p) => [p.id, { x: p.x, y: p.y }])),
+      },
+    });
+    await conn.start();
+    live().open();
+    live().message(new ArrayBuffer(8));
+    expect(conn.frame(1000).entities.get('p2')).toMatchObject({ x: 7, y: 9 });
+    conn.stop();
+  });
+});
+
+describe('RoomConnection input wire', () => {
+  /** Anchor, then hold `input` across enough frames to fill the re-send window, and return every input frame the socket saw. */
+  async function stampWindow(
+    predict: Partial<PredictionOptions<OwnSnap, DefaultInput>>,
+    input: DefaultInput = HELD,
+  ): Promise<(ArrayBuffer | Uint8Array | string)[]> {
+    useMonotonicFakeTimers();
+    const { conn, deliver } = predictRoom(predict);
+    await conn.start();
+    const sock = live();
+    sock.open();
+    deliver({ tick: 100, serverTime: performance.now(), own: { x: 0, y: 0 } });
+    conn.frame(performance.now(), input);
+    for (let i = 0; i < INPUT_WINDOW_MAX + 2; i++) {
+      await vi.advanceTimersByTimeAsync(50);
+      conn.frame(performance.now(), input);
+    }
+    conn.stop();
+    vi.useRealTimers();
+    return inputFrames(sock);
+  }
+
+  it('the binary frame decodes on the relay to the same records the JSON frame does, at a pinned fraction of the bytes', async () => {
+    // The default wire is `encodeInputWindow` and the relay's default decoder
+    // is `decodeInputAuto`, so this is the round trip a stock deployment
+    // makes: what the ticker consumes has to be what the JSON wire would have
+    // handed it, record for record, `seq` aside (the library never reads it,
+    // and the binary wire writes the record's own tick there).
+    const binaryFrames = await stampWindow({});
+    const jsonFrames = await stampWindow({ wire: 'json' });
+    const binary = binaryFrames[binaryFrames.length - 1] as Uint8Array;
+    const json = jsonFrames[jsonFrames.length - 1] as string;
+    expect(binary).toBeInstanceOf(Uint8Array);
+    expect(typeof json).toBe('string');
+
+    const fromBinary = decodeInputAuto(binary);
+    const fromJson = decodeInputAuto(json);
+    expect(fromBinary).toHaveLength(INPUT_WINDOW_MAX);
+    const strip = (r: { targetTick?: number | undefined; data: unknown }) => ({ targetTick: r.targetTick, data: r.data });
+    expect(fromBinary.map(strip)).toEqual(fromJson.map(strip));
+    expect(fromBinary.map((r) => r.data)).toEqual(Array.from({ length: INPUT_WINDOW_MAX }, () => HELD));
+    for (const r of fromBinary) expect(r.seq).toBe(r.targetTick);
+
+    // THE SIZE IS PINNED: a 3 byte header and 11 bytes a record. The JSON
+    // frame carrying the same six records is several times that.
+    expect(binary.byteLength).toBe(3 + INPUT_WINDOW_MAX * 11);
+    expect(binary.byteLength).toBe(69);
+    expect(json.length).toBeGreaterThan(binary.byteLength * 3);
+  });
+
+  it('an input that is not the default shape throws a TypeError naming the two ways out, before the first record is stamped', async () => {
+    useMonotonicFakeTimers();
+    const { conn, deliver } = predictRoom({
+      // A pong-shaped step, on the default wire by mistake.
+      step: ((pose: Pose) => pose) as unknown as PredictionOptions<OwnSnap, DefaultInput>['step'],
+    });
+    await conn.start();
+    live().open();
+    deliver({ tick: 100, serverTime: performance.now(), own: { x: 0, y: 0 } });
+    const stamp = () => conn.frame(performance.now(), { dir: 1 } as unknown as DefaultInput);
+    expect(stamp).toThrow(TypeError);
+    expect(stamp).toThrow(/wire: 'json'/);
+    expect(stamp).toThrow(/encodeInput/);
+    // Nothing was stamped and nothing was sent: the check runs before the
+    // entity moves, so a wrong shape is every frame's error until it is fixed
+    // rather than one frame's.
+    expect(conn.ownStats!.stamped).toBe(0);
+    expect(inputFrames(live())).toEqual([]);
+    conn.stop();
+  });
+
+  it('a custom encodeInput is what goes on the socket, verbatim', async () => {
+    const frames = await stampWindow({
+      encodeInput: (records) => `custom:${records.map((r) => r.targetTick).join(',')}`,
+    });
+    expect(frames.length).toBeGreaterThan(0);
+    for (const frame of frames) expect(typeof frame).toBe('string');
+    const last = frames[frames.length - 1] as string;
+    expect(last.startsWith('custom:')).toBe(true);
+    expect(last.slice('custom:'.length).split(',')).toHaveLength(INPUT_WINDOW_MAX);
   });
 });

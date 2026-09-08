@@ -1249,7 +1249,7 @@ describe('createRoom', () => {
 });
 
 describe('defaultDecodeInput', () => {
-  it('reads the JSON text frame PredictedEntity actually sends', () => {
+  it('reads the JSON text frame the json wire actually sends', () => {
     const records = [
       { seq: 1, targetTick: 10, data: { x: 1 } },
       { seq: 2, targetTick: 11, data: { x: 2 } },
@@ -1272,11 +1272,18 @@ describe('defaultDecodeInput', () => {
     expect(defaultDecodeInput(Buffer.from(new Uint8Array(frame)))).toHaveLength(1);
   });
 
-  it('THROWS on malformed JSON, because that is the only thing onBadInput can count', () => {
-    // A decoder that swallowed this would report a broken client as an
-    // ordinary empty window, and the only symptom of a broken client is one
-    // player whose inputs stop while every other signal reads healthy.
-    expect(() => defaultDecodeInput('{not json')).toThrow();
+  it('answers malformed JSON with an empty window rather than a throw, the same as a malformed binary frame', () => {
+    // It used to throw so `onBadInput` could count it. The default is
+    // `decodeInputAuto` now, and a decoder handed arbitrary bytes on every
+    // frame is never allowed to throw; a host that wants the count writes a
+    // decoder that does.
+    expect(defaultDecodeInput('{not json')).toEqual([]);
+  });
+
+  it('reads JSON that arrived as BYTES, which is what the cursors example sends', () => {
+    const records = [{ seq: 1, targetTick: 0, data: { x: 3 } }];
+    expect(defaultDecodeInput(new TextEncoder().encode(JSON.stringify(records)))).toEqual(records);
+    expect(defaultDecodeInput(Buffer.from(JSON.stringify(records[0])))).toEqual(records);
   });
 
   it('answers a malformed binary frame and an unknown shape with an empty window, never a throw', () => {

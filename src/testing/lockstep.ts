@@ -23,8 +23,10 @@
 //     `src/server/ticker.ts` drives it;
 //   - the host's real codec both ways, so the client reads WIRE-QUANTISED
 //     poses rather than the server's own floats;
-//   - the real `PredictedEntity` on a fake conn, stamping against a real
-//     `ClientTick` that runs `lead` ticks ahead of the server;
+//   - the real `PredictedEntity` (the object `RoomConnection`'s `predict`
+//     option owns) on a fake conn, stamping against a real `ClientTick` that
+//     runs `lead` ticks ahead of the server, on the same wire the connection
+//     would use;
 //   - the real `PlayoutBuffer` and `StarveTracker` on the server side, so the
 //     consume order and the hooks are the ticker's and not a convenient
 //     approximation of them.
@@ -46,7 +48,8 @@
 // for the browser to keep that true.
 
 import { ClientTick } from '../client/clientTick.js';
-import { PredictedEntity, type Pose, type PredictedEntityOptions } from '../client/predictedEntity.js';
+import { PredictedEntity, type Pose, type PredictedEntityOptions, type StampedRecord } from '../client/predictedEntity.js';
+import { decodeInputAuto } from '../codec/snapshot.js';
 import { PlayoutBuffer } from '../core/playout.js';
 import { StarveTracker } from '../core/starvation.js';
 import type { ClientInput, RoomRuntime, SnapshotPayload } from '../core/types.js';
@@ -78,17 +81,21 @@ export interface LockstepOptions<TState, TSnap, TInput> {
   encode: (state: TState) => SnapshotPayload;
   /** The host's own snapshot decoder, the inverse of `encode`. */
   decode: (bytes: SnapshotPayload) => TSnap;
-  /** The predicted player's pose out of a decoded snapshot, or `null` while the snapshot does not carry one (before a seat is assigned, after a death). A `null` reconciles nothing and leaves the trace holding the last pose that was there. */
-  ownPose: (snap: TSnap) => Pose | null;
   /**
-   * THE FUNCTION UNDER TEST: the step the host hands `PredictedEntity`, which
+   * THE FUNCTION UNDER TEST: the step the host hands `predict.step`, which
    * must be the same rule the runtime applies. It is passed straight through,
    * so whatever it closes over is what the replay reads, which is the entire
    * point of running it here rather than beside a copy of the runtime.
    */
   step: (pose: Pose, input: TInput, dt: number, tick: number) => Pose;
-  /** The entity's `maxSpeed`, units per second. Bounds the glide and sets the snap distance; see `PredictedEntityOptions`. */
+  /** `predict.maxSpeed`, units per second. Bounds the glide and sets the snap distance; see `PredictedEntityOptions`. */
   maxSpeed: number;
+  /** `predict.ownPose`: the predicted player's pose out of a decoded snapshot, or `null` while the snapshot does not carry one (before a seat is assigned, after a death). A `null` reconciles nothing and leaves the trace holding the last pose that was there. */
+  ownPose: (snap: TSnap) => Pose | null;
+  /** `predict.wire`, and the same default: `'binary'` requires `TInput` to be `DefaultInput`. Pong's `{ dir }` needs `'json'` here exactly as it does on the page. */
+  wire?: 'binary' | 'json' | undefined;
+  /** `predict.encodeInput`, for a host with a wire of its own. Pair it with the `decodeInput` that reads it. */
+  encodeInput?: ((records: StampedRecord<TInput>[]) => ArrayBuffer | Uint8Array | string) | undefined;
   /** The scripted input for one client tick. Called once per iteration with the tick being stamped. */
   input: (tick: number) => TInput;
   /**
@@ -101,20 +108,19 @@ export interface LockstepOptions<TState, TSnap, TInput> {
   onSnapshot?: ((snap: TSnap, tick: number) => void) | undefined;
   /**
    * The host's own relay-side `decodeInput`, so the records reaching the
-   * runtime are the ones its real decoder produces. Defaults to a JSON parse
-   * of what `PredictedEntity` sends, which is one array of
-   * `{ targetTick, data }` per message and what the README's step 2 example
-   * parses. Those records carry no `seq`, exactly as they do on a real wire;
-   * the library documents that it never reads one.
+   * runtime are the ones its real decoder produces. Defaults to
+   * `decodeInputAuto`, the relay's own default, which reads both of the
+   * library's wires. The JSON wire's records carry no `seq`, exactly as they
+   * do on a real socket; the library documents that it never reads one.
    */
-  decodeInput?: ((payload: string) => ClientInput[]) | undefined;
+  decodeInput?: ((payload: unknown) => ClientInput[]) | undefined;
   /** How many ticks ahead of the server the client's counter stamps. */
   lead: number;
   /** How many ticks a snapshot takes to reach the client. */
   delay: number;
   /** How many ticks to run. Give the scenario `lead` ticks to reach steady state plus however long the interesting part takes. */
   ticks: number;
-  /** Where the prediction starts before the first authoritative pose. The first confirmation replaces it outright, so this only has to be plausible. Defaults to the origin. */
+  /** `predict.initial`: where the prediction starts before the first authoritative pose. The first confirmation replaces it outright, so this only has to be plausible. Defaults to the origin. */
   initial?: Pose | undefined;
   /** Reconciles at or below this error are left out of `reconciles`. Defaults to 0, which lists every reconcile that was not exact. */
   reconcileThreshold?: number | undefined;
@@ -137,8 +143,8 @@ export interface LockstepReport {
   /**
    * The largest reconcile error the run produced, in the simulation's own
    * units. THE FIRST CONFIRMATION IS NOT IN IT: the prediction before it was
-   * a guess at `initial`, so `PredictedEntity` snaps rather than glides there
-   * by design and the number says nothing about the step. Judge this against
+   * a guess at `initial`, so the entity snaps rather than glides there by
+   * design and the number says nothing about the step. Judge this against
    * the resolution of your own wire.
    */
   maxError: number;
@@ -148,7 +154,7 @@ export interface LockstepReport {
   snaps: number;
   /**
    * THE PINNING SIGNATURE, and the one this harness exists for: the ticks
-   * where the server's own pose MOVED and the client's raw `entity.pose` did
+   * where the server's own pose MOVED and the client's raw `conn.own` did
    * not. A step reading its context off the wrong pose refuses to move at all,
    * and a pinned prediction still LOOKS alive from outside because it adopts
    * the server's pose on every snapshot. This is what that looks like from
@@ -160,7 +166,7 @@ export interface LockstepReport {
    * prediction genuinely does not. Run a scenario up to its wall, not past it.
    */
   pinned: { tick: number }[];
-  /** How many records the entity stamped, `PredictedEntity.stats.stamped`. One per tick of a healthy run. */
+  /** How many records the entity stamped, `conn.ownStats.stamped`. One per tick of a healthy run. */
   stamped: number;
   /** The whole run, tick by tick, for a host to inspect when a number above is not enough. */
   trace: LockstepFrame[];
@@ -179,10 +185,6 @@ function distance(a: Pose, b: Pose): number {
 
 function moved(a: Pose, b: Pose): boolean {
   return a.x !== b.x || a.y !== b.y;
-}
-
-function parseSentWindow(payload: string): ClientInput[] {
-  return JSON.parse(payload) as ClientInput[];
 }
 
 /**
@@ -216,7 +218,7 @@ export function runLockstep<TState, TSnap, TInput>(opts: LockstepOptions<TState,
   const tickMs = 1000 / runtime.tickHz;
   const initial: Pose = opts.initial ?? { x: 0, y: 0 };
   const threshold = opts.reconcileThreshold ?? 0;
-  const decodeInput = opts.decodeInput ?? parseSentWindow;
+  const decodeInput = opts.decodeInput ?? decodeInputAuto;
 
   // ---------------------------------------------------------------------
   // The server.
@@ -232,8 +234,11 @@ export function runLockstep<TState, TSnap, TInput>(opts: LockstepOptions<TState,
   // The client. Every field here has a counterpart in a page.
   // ---------------------------------------------------------------------
   const tick = new ClientTick({ tickMs });
-  const sent: string[] = [];
-  const conn = { tick, send: (payload: string) => void sent.push(payload) };
+  const sent: (ArrayBuffer | Uint8Array | string)[] = [];
+  const conn = { tick, send: (payload: ArrayBuffer | Uint8Array | string) => void sent.push(payload) };
+  // The object `predict` owns, built from the same five options a page gives
+  // that option, so the wire the records cross here is the wire they cross
+  // there.
   const entity = new PredictedEntity<TInput>({
     conn,
     // Passed straight through. The cast is arity and nothing else: the entity
@@ -243,6 +248,8 @@ export function runLockstep<TState, TSnap, TInput>(opts: LockstepOptions<TState,
     step: opts.step as PredictedEntityOptions<TInput>['step'],
     maxSpeed: opts.maxSpeed,
     initial,
+    wire: opts.wire,
+    encodeInput: opts.encodeInput,
   });
 
   const reconciles: LockstepReconcile[] = [];

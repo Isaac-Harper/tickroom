@@ -32,6 +32,7 @@ export {
   PLAYHEAD_SNAP_TICKS,
   type Pose,
   type PredictedEntityOptions,
+  type StampedRecord,
 } from './predictedEntity.js';
 
 export {
@@ -76,6 +77,7 @@ export {
   type WebSocketConstructor,
   type RoomConnectionOptions,
   type SnapshotInterpolationOptions,
+  type PredictionOptions,
   type FrameView,
   type ConnectionStats,
 } from './connection.js';

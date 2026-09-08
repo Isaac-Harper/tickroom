@@ -31,7 +31,7 @@ interface PongInput {
 }
 
 /**
- * The step `examples/pong/client.ts` hands `PredictedEntity`, character for
+ * The step `examples/pong/client.ts` hands `predict`, character for
  * character: `stepPaddleY` is shared with the runtime rather than retyped, so
  * this is the whole of the client's half of the rule.
  */
@@ -88,6 +88,9 @@ function base(
     },
     step,
     maxSpeed: PADDLE_SPEED,
+    // `{ dir }` is not the default binary shape, so pong is on the JSON wire
+    // here exactly as it is on the page.
+    wire: 'json',
     input: () => ({ dir: 1 }),
     initial: { x: 0, y: TOP },
     // SHORT OF THE CLAMP ON PURPOSE. The paddle runs out of field after 21 and

@@ -21,7 +21,7 @@
 // (the duration caps below).
 import type { ClientInput, Logger, LogKind, RoomRuntime } from '../core/index.js';
 import { MAX_TICKER_MS, RELAY_EXPIRY_LEAD_MS, baseOf, normalizeBase, normalizeRoomId } from '../core/index.js';
-import { decodeInputWindow, inputWindowToClientInputs } from '../codec/index.js';
+import { decodeInputAuto } from '../codec/index.js';
 import type {
   AdmitSocketOptions,
   HostRelayOptions,
@@ -932,9 +932,10 @@ export type VercelRoomOptions<TState, TEvent> = {
   /** Where the relay sends its ticker spawn. Relative, so it resolves against the request's own origin. Defaults to `/api/ticker`. */
   tickerUrl?: string | undefined;
   /**
-   * Reads a client frame into inputs. Defaults to `defaultDecodeInput`: a JSON
-   * text frame (what `PredictedEntity` sends) or a binary frame through
-   * `tickroom/codec`'s input window, sniffed by type.
+   * Reads a client frame into inputs. Defaults to `tickroom/codec`'s
+   * `decodeInputAuto`: the binary input window `predict` sends by default, or
+   * the JSON frame it sends on `wire: 'json'`, sniffed on the first byte, and
+   * `[]` for anything malformed.
    */
   decodeInput?: ((data: unknown) => ClientInput[]) | undefined;
   /** Passed through to the relay. See `VercelRelayRouteOptions`. */
@@ -1002,39 +1003,16 @@ const MAX_SUBJECT_CHARS = 64;
 const SAFE_SUBJECT = /^[A-Za-z0-9._~@-]+$/;
 
 /**
- * The default `decodeInput`: the README's own hand-written decoder, plus the
- * binary path the shipped codec already implements.
- *
- * SNIFFED BY TYPE, because the two frames are genuinely different transports
- * and a host running both should not have to write the branch. A `string` is a
- * text frame, which is what `PredictedEntity` sends (one JSON array of
- * `{ targetTick, data }` records per message, the last few ticks re-sent whole
- * so a lost packet does not starve a tick); bytes are an `encodeInputWindow`
- * frame. Anything else decodes to `[]`.
- *
- * Fragmentation is NOT handled here and does not need to be: `attachRelay`
- * joins a fragmented message before any decoder sees it.
- *
- * A host whose client sends something else passes its own `decodeInput`. This
- * one is a default, not a protocol.
+ * The default `decodeInput`, kept under the name this module exported it as
+ * through 0.3.x. It IS `tickroom/codec`'s `decodeInputAuto` now: the binary
+ * input window `RoomConnection`'s `predict` sends by default, the JSON frame
+ * it sends on `wire: 'json'`, and `[]` for anything else, sniffed on the first
+ * byte, never a throw. The JSON half used to throw on malformed text so
+ * `onBadInput` could count it; a host that wants that count back writes a
+ * `decodeInput` that throws. See `decodeInputAuto` for why the default does
+ * not.
  */
-export function defaultDecodeInput(data: unknown): ClientInput[] {
-  if (typeof data === 'string') {
-    // Left to THROW on malformed JSON, deliberately: the relay catches it,
-    // drops the frame and fires `onBadInput`, which is the seam that exists to
-    // count it. Returning `[]` here would report a broken client as an
-    // ordinary empty window.
-    const parsed = JSON.parse(data) as ClientInput | ClientInput[];
-    return Array.isArray(parsed) ? parsed : [parsed];
-  }
-  if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
-    // `decodeInputWindow` answers ANY malformed frame with `[]` rather than
-    // throwing, including a crafted `count`, so this path needs no guard of
-    // its own. See its doc comment.
-    return inputWindowToClientInputs(decodeInputWindow(data as ArrayBuffer | Uint8Array));
-  }
-  return [];
-}
+export const defaultDecodeInput: (data: unknown) => ClientInput[] = decodeInputAuto;
 
 /** One field off a JSON body that may be anything at all, including not an object. */
 function bodyField(body: unknown, key: string): unknown {

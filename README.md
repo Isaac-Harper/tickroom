@@ -124,6 +124,7 @@ Nothing here knows about sockets, Redis, or a platform. That is the point.
 
 ```ts
 import type { RoomRuntime } from 'tickroom/core';
+import type { DefaultInput } from 'tickroom/codec';
 
 interface Player { x: number; y: number; vx: number; vy: number; }
 interface State {
@@ -141,10 +142,15 @@ export const PLAYER_SPEED = 40;
  * and land on the same place, so a snapshot confirms the prediction rather
  * than correcting it. Share it; never retype it. Pure, and it clamps what
  * came off the wire, so the client's copy cannot skip the clamp either.
+ *
+ * The input is `DefaultInput` from `tickroom/codec`, a stick and a button
+ * mask, because that is the shape the client's default binary wire carries
+ * (step 3) and the relay's default decoder hands back (step 2). Any other
+ * shape works too, on the JSON wire.
  */
-export function stepPlayer(p: { x: number; y: number }, input: { x: number; y: number }, dt: number) {
-  const vx = Math.max(-1, Math.min(1, input.x));
-  const vy = Math.max(-1, Math.min(1, input.y));
+export function stepPlayer(p: { x: number; y: number }, input: DefaultInput, dt: number) {
+  const vx = Math.max(-1, Math.min(1, input.axes[0]));
+  const vy = Math.max(-1, Math.min(1, input.axes[1]));
   return {
     x: Math.max(0, Math.min(100, p.x + vx * dt * PLAYER_SPEED)),
     y: Math.max(0, Math.min(100, p.y + vy * dt * PLAYER_SPEED)),
@@ -157,7 +163,7 @@ export const pong: RoomRuntime<State> = {
   create: () => ({ tick: 0, players: new Map() }),
 
   tick(s, dt) {
-    for (const p of s.players.values()) Object.assign(p, stepPlayer(p, { x: p.vx, y: p.vy }, dt));
+    for (const p of s.players.values()) Object.assign(p, stepPlayer(p, { axes: [p.vx, p.vy], buttons: 0 }, dt));
     s.tick += 1;
   },
 
@@ -184,9 +190,9 @@ export const pong: RoomRuntime<State> = {
   applyInput(s, pid, input) {
     const p = s.players.get(pid);
     if (!p) return;
-    const { x, y } = input.data as { x: number; y: number };
-    p.vx = Math.max(-1, Math.min(1, x));
-    p.vy = Math.max(-1, Math.min(1, y));
+    const { axes } = input.data as DefaultInput;
+    p.vx = Math.max(-1, Math.min(1, axes[0]));
+    p.vy = Math.max(-1, Math.min(1, axes[1]));
   },
 
   serialize: (s) => JSON.stringify({ tick: s.tick, players: [...s.players] }),
@@ -314,7 +320,7 @@ session: {
 
 Without a `claims` hook the subject is the request body's own `sub` when it is a short, key-safe string, and `d.<pid>` otherwise: `sub` is interpolated into a Redis key name (`room:conns:<sub>`, the set the per-subject socket cap counts), and Redis key names have no escaping, so a body-supplied one is filtered on the same terms a room id is. **A room the pool does not recognise is answered with 400, never reassigned.** `normalizeRoomId` answers an id it cannot validate with the fallback, which is right on the socket path and wrong here: a client that asked for one room and was quietly minted a session for another joins a game it did not ask for, and this response is the only place that could have told it.
 
-**`decodeInput` has a default now, and it is the two frames this library actually ships.** A `string` is parsed as JSON, which is what `PredictedEntity` sends in step 3 (one array of `{ targetTick, data }` records per message, the last six ticks re-sent whole, so a lost packet does not starve a tick); a binary frame goes through `tickroom/codec`'s `decodeInputWindow`, which answers any malformed frame with `[]` rather than throwing. Pass your own `decodeInput` for anything else. Fragmentation is not your problem either way: a peer or a proxy chooses its own, and the relay joins a fragmented message before any decoder sees it.
+**`decodeInput` has a default, and it is the two frames this library actually ships.** `decodeInputAuto` from `tickroom/codec` reads the binary input window the client's `predict` option sends by default (69 bytes for the six re-sent records, the last six ticks whole so a lost packet does not starve a tick) and the JSON frame it sends on `predict.wire: 'json'` (one array of `{ targetTick, data }` records per message, as a text frame or as bytes), sniffed on the first byte, and answers anything malformed on either path with `[]` rather than throwing. Pass your own `decodeInput` for anything else, and make it throw if you want `onBadInput` to count a broken client: the default never does. Fragmentation is not your problem either way: a peer or a proxy chooses its own, and the relay joins a fragmented message before any decoder sees it.
 
 **Wire `onBadInput` and `onRateDrop`, and COUNT rather than log.** Both run at a rate the client owns, so a log line per event hands an abuser an amplifier: the refused frame becomes more expensive than the accepted one. A decoder that throws is caught and dropped in silence by design, which means the only symptom of a broken decoder is one player whose inputs stop while the room, the roster, the snapshots and every other player stay perfectly healthy:
 
@@ -379,6 +385,7 @@ export const GET = createTickerRoute({
 // app/api/ws/route.ts
 import { experimental_upgradeWebSocket } from '@vercel/functions';
 import { createRelayRoute } from 'tickroom/adapters/vercel';
+import { decodeInputAuto } from 'tickroom/codec';
 
 export const runtime = 'nodejs';
 export const maxDuration = 800;
@@ -395,12 +402,10 @@ export const GET = createRelayRoute({
   // `decodeInput`'s parameter is `unknown`, not `ArrayBuffer`: the real
   // transport behind this route is the `ws` package, which hands over a
   // `Buffer` rather than a browser-style ArrayBuffer, and a text frame arrives
-  // as a `string`. `createRoom`'s default does both; this is that default,
-  // written out.
-  decodeInput: (data) => {
-    const parsed = JSON.parse(String(data));
-    return Array.isArray(parsed) ? parsed : [parsed];
-  },
+  // as a `string`. The default is `decodeInputAuto` from `tickroom/codec`,
+  // which reads both frames the client in step 3 can send; this is that
+  // default, written out. Pass your own for a wire of your own.
+  decodeInput: decodeInputAuto,
   onBadInput: () => void (badInputs += 1),
   onRateDrop: () => void (rateDrops += 1),
   upgradeWebSocket: experimental_upgradeWebSocket,
@@ -457,30 +462,25 @@ export const GET = createBalancerRoute({
 ### 3. Connect from the browser
 
 ```ts
-import { PredictedEntity, RoomConnection, SnapshotInterpolator, type SessionInfo } from 'tickroom/client';
+import { RoomConnection, type SessionInfo } from 'tickroom/client';
+import type { DefaultInput } from 'tickroom/codec';
 import { PLAYER_SPEED, stepPlayer } from '@/sim/pong';
 
 interface Snapshot {
   tick: number;
   serverTime: number;
   players: [string, { x: number; y: number }][];
-  /** Pids this tick PUT somewhere rather than moved: a respawn, an elimination. See `onSnapshot`. */
+  /** Pids this tick PUT somewhere rather than moved: a respawn, an elimination. See `interpolate.teleported` and `predict.teleported`. */
   respawned?: string[];
 }
 
-// The key type is REQUIRED and it is the one decision here. Pids are strings
-// everywhere in tickroom, so a JSON room like this one is keyed by `string`;
-// a room on the default binary codec is keyed by `number`, because
-// `CodecEntity.id` is one. There is no default, precisely because there is no
-// answer that is right for both.
-const interp = new SnapshotInterpolator<string>();
-
 // Yours, not tickroom's: a HUD, the input state your controls write into, and
 // a renderer. Stubbed here so this block compiles as written; replace all
-// three with the real thing. Nothing here predicts anything: that is
-// `PredictedEntity`'s job, below the connection.
+// three with the real thing. The input is the DEFAULT shape, a stick and a
+// button mask, because that is what the default binary wire carries; see
+// `predict.wire` below for anything else.
 const banner = { toggle: (stalled: boolean) => {}, terminal: (msg: string) => {} };
-const input = { x: 0, y: 0 };
+const input: DefaultInput = { axes: [0, 0], buttons: 0 };
 function draw(id: string, x: number, y: number) {}
 
 let myPid = '';
@@ -491,15 +491,19 @@ let myRoom = '';
 let refused: string[] = [];
 let tries = 0;
 
-// BOTH TYPE ARGUMENTS, WRITTEN OUT. They are inferable (`decodeSnapshot`'s
-// return type fixes the first, `interpolate.into` fixes the second), and
-// writing them anyway is what makes a mistake in either one an error HERE
-// rather than a widened `DecodedSnapshotLike` reaching `interpolate.entities`
-// and `onSnapshot` several lines later.
-const conn = new RoomConnection<Snapshot, string>({
+// ALL THREE TYPE ARGUMENTS, WRITTEN OUT. They are inferable (`decodeSnapshot`'s
+// return type fixes the first, `interpolate.entities` the second, and
+// `predict.step`'s input parameter the third), and writing them anyway is
+// what makes a mistake in any of them an error HERE rather than a widened
+// shape reaching `onSnapshot`, `predict.ownPose` or `frame()` several lines
+// later. The key type is the one decision: pids are strings everywhere in
+// tickroom, so a JSON room like this one is keyed by `string`; a room on the
+// default binary codec is keyed by `number`, because `CodecEntity.id` is one.
+const conn = new RoomConnection<Snapshot, string, DefaultInput>({
   // MUST EQUAL YOUR `RoomRuntime.tickHz`. It drives the tick counter's step,
-  // `estimateServerTick`'s slope and the underrun threshold at once, so a
-  // mismatch is a silent multiplier on all three rather than an error.
+  // `estimateServerTick`'s slope, the underrun threshold and the prediction's
+  // timestep at once, so a mismatch is a silent multiplier on all four rather
+  // than an error.
   //
   // The symptom, if you ever see it: `onTickReanchor` firing every couple of
   // seconds with a delta of the SAME SIGN every time (the counter running at
@@ -557,33 +561,74 @@ const conn = new RoomConnection<Snapshot, string>({
   // through anything your snapshot carries.
   decodeSnapshot: (buf) => JSON.parse(new TextDecoder().decode(buf)) as Snapshot,
 
-  // The connection pushes every snapshot into the interpolator with the right
-  // timestamps and clears it on every reconnect. You say which parts move.
+  // EVERYONE ELSE'S ENTITIES, interpolated. The connection constructs the
+  // interpolator (pass `into` to pin its delay bounds or keep a handle on it),
+  // pushes every snapshot in with the right timestamps and clears it on every
+  // reconnect. You say which parts of a snapshot MOVE, and which entities this
+  // snapshot PUT somewhere rather than walked: a respawn or an elimination is
+  // not motion, and interpolating across it walks the entity over the whole
+  // distance at playback speed. Name the keys and the connection calls
+  // `teleport(key)` for each AFTER its own push, which is the one order that
+  // call needs and the one a host used to have to remember. One declaration
+  // is the whole answer at any delay; `forget` is not that call and measures
+  // worse than doing nothing.
   interpolate: {
-    into: interp,
     entities: (snap) => new Map(snap.players),
+    teleported: (snap) => (snap.respawned ?? []).filter((pid) => pid !== myPid),
   },
 
-  // YOUR OWN ENTITY'S AUTHORITATIVE POSE, once per snapshot. The entity
-  // replays the records it stamped after `snap.tick` from it and glides any
-  // difference away; on a healthy link that difference is zero.
-  //
-  // AND ANY ENTITY THIS SNAPSHOT PUT SOMEWHERE, once, here. A respawn or an
-  // elimination is not motion: interpolating across it walks the entity over
-  // the whole distance at playback speed. `teleport(key)` voids what the
-  // buffer knows about how it got there and holds it at the destination until
-  // playback catches up, and it belongs in THIS callback because the
-  // connection pushes the frame before calling you, so the destination is
-  // already buffered. One call is the whole answer at any delay; `forget` is
-  // not that call and measures worse than doing nothing.
-  onSnapshot: (snap) => {
-    const mine = snap.players.find(([pid]) => pid === myPid);
-    if (mine) me.reconcile(mine[1], snap.tick);
-    for (const pid of snap.respawned ?? []) {
-      if (pid !== myPid) interp.teleport(pid);
-      else if (mine) me.snapTo(mine[1]); // yours is predicted, not interpolated
-    }
+  // YOUR OWN ENTITY, PREDICTED LOCALLY. The interpolation delay is right for
+  // everyone else's entities and wrong for the one you are steering, so this
+  // one runs the stamped path instead: one record per TICK (never per frame,
+  // never per keydown) carrying the tick it applies on, predicted here through
+  // the SAME pure step the runtime runs, the last six records re-sent on every
+  // packet so a lost packet is not a starved tick, replayed from every
+  // snapshot, corrected as a glide rather than a teleport (a snap on the first
+  // confirmation and whenever the offset would grow past half a second of
+  // travel), and drawn from a render playhead that moves at real time through
+  // its recent poses, one tick behind the newest, so it moves at the frame
+  // rate instead of stepping at the tick rate and a counter re-anchor is
+  // caught up over a second rather than drawn as a lurch. The connection owns
+  // all of it: it advances the prediction inside `frame()` AFTER the counter
+  // and the interpolator, reconciles it against every snapshot BEFORE
+  // `onSnapshot`, and snaps it before the reconcile that confirms a jump you
+  // declare. Those three orders are the ones a host got wrong by hand, and
+  // there is no call here left to put in the wrong place.
+  predict: {
+    // `(pose, input, dt, tick)`. The fourth argument is the tick this call is
+    // PRODUCING, which is the record's own `targetTick`: a replay runs several
+    // ticks inside one snapshot, so a step whose world changes over time (a
+    // closing arena, a grid that moved two ticks ago) indexes it with that
+    // number rather than with the newest one. A step that does not care
+    // ignores it and compiles unchanged, which is what `stepPlayer` does here.
+    step: stepPlayer,
+    maxSpeed: PLAYER_SPEED,
+    initial: { x: 50, y: 50 },
+    // Where YOU are in a snapshot, or `null` while you are not in it yet. The
+    // connection replays the records it stamped after `snap.tick` from this
+    // pose and glides any difference away; on a healthy link that difference
+    // is your wire's own rounding and nothing else.
+    ownPose: (snap) => snap.players.find(([pid]) => pid === myPid)?.[1] ?? null,
+    // This snapshot PUT you somewhere. Yours is predicted rather than
+    // interpolated, so it is declared here rather than above, and the
+    // connection snaps the prediction onto `ownPose` BEFORE reconciling, so
+    // the server's answer is a fresh confirmation rather than a half-second
+    // slide from where you were.
+    teleported: (snap) => (snap.respawned ?? []).includes(myPid),
+    // THE WIRE. Omitted, the input goes out as the binary window from
+    // `tickroom/codec` (69 bytes for six records), which requires the input
+    // to be `DefaultInput`, a stick and a button mask, as it is here; the
+    // first input is checked and a `TypeError` names both alternatives if it
+    // is not. `wire: 'json'` sends any JSON-shaped input as one text frame
+    // (about 300 bytes for the same six), and `encodeInput` is your own wire.
+    // The relay's default `decodeInput` in step 2 reads the first two.
   },
+
+  // Everything the interpolator cannot smooth and the prediction does not own:
+  // scores, a winner, a phase. By the time this runs the frame is pushed, every
+  // declared teleport is made and your own entity is reconciled, so `conn.own`
+  // read here is the state THIS snapshot produced.
+  onSnapshot: (snap) => {},
 
   onStallChange: (stalled) => banner.toggle(stalled),
 
@@ -594,7 +639,7 @@ const conn = new RoomConnection<Snapshot, string>({
   // here, or a `if (t <= lastSentTick) return;` guard went silent until the
   // counter climbed back past it, measured on a real socket at 5.6 seconds of
   // input silence and 100 self-inflicted starves from one backward re-anchor.
-  // `PredictedEntity` reads the jump off the counter itself and resets its own
+  // The prediction reads the jump off the counter itself and resets its own
   // mark and window, so nothing is required here any more. Count it if you
   // want to know how often it happens; a hidden tab fires it about every two
   // seconds, and that is not a fault.
@@ -632,52 +677,21 @@ const conn = new RoomConnection<Snapshot, string>({
 
 await conn.start();
 
-// YOUR OWN ENTITY, PREDICTED LOCALLY. The interpolation delay is right for
-// everyone else's entities and wrong for the one you are steering, so this one
-// runs the stamped path instead: one record per TICK (never per frame, never
-// per keydown) carrying the tick it applies on, predicted here through the
-// SAME pure step the runtime runs, the last six records re-sent on every
-// packet so a lost packet is not a starved tick, replayed from every snapshot,
-// corrected as a glide rather than a teleport (a snap on the first
-// confirmation and whenever the offset would grow past half a second of
-// travel), and drawn from a render playhead that moves at real time through
-// its recent poses, one tick behind the newest, so it moves at the frame rate
-// instead of stepping at the tick rate and a counter re-anchor is caught up
-// over a second rather than drawn as a lurch. Four coupled rules, and this
-// object owns all of them: one call per frame, one per snapshot, nothing to
-// keep in step. Its timestep is read off `conn.tick.tickMs`, so there is no
-// second `tickHz` here to disagree with the one above. AND THERE IS ONE PER
-// CONNECTION: this object IS your input stream (the server keeps one playout
-// buffer per player), so a player steering several things carries them all
-// in one input record and one step, and a second entity on the same
-// connection throws rather than overwriting the first's records tick by tick.
-const me = new PredictedEntity<{ x: number; y: number }>({
-  conn,
-  // `(pose, input, dt, tick)`. The fourth argument is the tick this call is
-  // PRODUCING, which is the record's own `targetTick`: a replay runs several
-  // ticks inside one snapshot, so a step whose world changes over time (a
-  // closing arena, a grid that moved two ticks ago) indexes it with that
-  // number rather than with the newest one. A step that does not care ignores
-  // it and compiles unchanged, which is what `stepPlayer` does here.
-  step: stepPlayer,
-  maxSpeed: PLAYER_SPEED,
-  initial: { x: 50, y: 50 },
-});
-
-// THE ONE PER-FRAME CALL, and then the entity's, in that order. `conn.frame()`
-// advances the tick counter inputs are stamped against, polls the stall
-// detector, and samples the interpolator, from one delta it measures itself.
-// `me.advance()` after it stamps whatever ticks the counter crossed with the
+// THE ONE PER-FRAME CALL. `conn.frame(now, input)` advances the tick counter
+// inputs are stamped against, polls the stall detector, samples the
+// interpolator, and THEN stamps whatever ticks the counter crossed with the
 // input as HELD STATE (a lost packet then costs nothing: the next tick
-// re-asserts the same intent), sends them, and returns the pose to draw.
+// re-asserts the same intent), sends them, and returns both the poses to draw
+// and your own. `input` is REQUIRED once `predict` is set, and the connection
+// throws if it is missing rather than stamping a record the server cannot
+// read. `own` is `null` until the server has confirmed you have an entity.
 //
 // AND IT RUNS ON EVERY CALLBACK. No `if (now - last < 1000 / 60) return;`
 // frame gate: see the note below.
 function frame(now: number) {
-  const { entities, dt } = conn.frame(now);
-  const own = me.advance({ x: input.x, y: input.y }, dt);
+  const { entities, own } = conn.frame(now, input);
   for (const [id, e] of entities) if (id !== myPid) draw(id, e.x, e.y);
-  draw(myPid, own.x, own.y);
+  if (own) draw(myPid, own.x, own.y);
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
@@ -707,12 +721,20 @@ own delta and every smoother in this library runs on real elapsed time, so a
 frame that arrives early costs a small `dt` and nothing else.
 
 **A `Pose` is `x`, `y` and an optional `heading`, and a replay keeps nothing
-else.** `PredictedEntity` stores, shifts and interpolates exactly those three
+else.** The prediction stores, shifts and interpolates exactly those three
 fields, so anything else you return from `step` (a velocity, a stun timer, a
 grounded flag, an ammo count) is dropped the moment a record is replayed or a
 correction shifts the history. That state belongs in your own object, derived
 from the pose, or on the wire from the server: a field the prediction carries
 but the replay does not is a divergence with no symptom until a snapshot lands.
+
+**`conn.own` is the raw prediction and `frame().own` is the drawn one, and
+they differ on purpose.** The drawn pose sits on a playhead one tick behind the
+newest stamp with the remains of the last correction added, which is right for
+the screen and wrong for a rule: a collision latch or a bomb placed at the
+player's feet wants where the entity IS, which is `conn.own`. `conn.ownStats`
+(`lastError`, `snaps`, `stamped`, `invalid`) is what a debug overlay reads to
+see how far the prediction and the server actually disagree.
 
 **Throw `ProtocolVersionError` out of `decodeSnapshot` on a wire mismatch.** The connection's skew recovery (reload once, then latch `'version-skew'`) fires on a returned `version` field *or* on a thrown error whose `name` is `'ProtocolVersionError'`, and the second is what a binary codec actually does: `decodeDefaultSnapshot` checks the version before reading a single field and throws exactly that. It is duck-typed on the name, so your own codec can participate without importing anything. A decoder that swallows the mismatch instead leaves every old client silently dropping every frame after a deploy, with nothing reloading and nothing latching.
 
@@ -723,8 +745,9 @@ extrapolation, and a stall detector that can tell a dead room from a slow one.
 
 **Every callback above is called inside a catch, and `conn.stats().hostErrors`
 is how you find out.** A throw out of `onStatus`, `onTerminal`,
-`onTickReanchor`, `onStallChange`, `onText`, `onSnapshot` or the
-`interpolate.entities` selector costs that one call and nothing else, because
+`onTickReanchor`, `onStallChange`, `onText`, `onSnapshot`, `interpolate.entities`,
+`interpolate.teleported`, `predict.ownPose` or `predict.teleported` costs that
+one call and nothing else, because
 the reconnect ladder is driven by a `void`ed promise and an escaping throw used
 to stop it dead: status stuck on `connecting`, no timer, no terminal, forever.
 Surviving it is the right behaviour and being silent about it is not, so the
@@ -771,11 +794,13 @@ in `connection.test.ts` fails if that ever stops being true.
 **What `conn.send` will not check for you.** It takes
 `ArrayBuffer | Uint8Array | string`, so the payload shape is yours: the relay's
 `decodeInput` in step 2 is the only thing that reads it, and the two have to
-agree. `PredictedEntity` sends one JSON array of `{ targetTick, data }` records
-per message as a text frame (the last six ticks, oldest first), and the
-`decodeInput` in step 2 parses exactly that; a host stamping by hand can send
-whatever its own decoder reads. Everything else about the client is typed end
-to end, so this is the seam to get right.
+agree. `predict` sends the last six stamped records, oldest first, as one
+frame per stamp: the binary input window by default (`seq` on that wire is the
+record's own `targetTick`, since the library never reads `seq`), one JSON array
+of `{ targetTick, data }` as a text frame on `wire: 'json'`, or whatever your
+`encodeInput` returns. Step 2's default `decodeInput` reads the first two; a
+host stamping by hand can send whatever its own decoder reads. Everything else
+about the client is typed end to end, so this is the seam to get right.
 
 **The roster arrives on `onText`, and it is typed.** The relay seeds a joining
 socket with a roster frame and the ticker broadcasts one on every change:
@@ -791,16 +816,18 @@ onText: (msg) => {
 
 ### Testing your step
 
-`PredictedEntity` replays your step from the server's pose. If that step reads
-any context the server does not read at the same tick, the replay is wrong and
+`predict` replays your step from the server's pose. If that step reads any
+context the server does not read at the same tick, the replay is wrong and
 **nothing anywhere reports it**: the arithmetic is pure, the reconcile runs, the
 error stays small, and what a player sees is rubberbanding. No check inside this
 library can see it, because the context lives in your closure.
 
 `tickroom/testing` runs both ends against each other so it can. It drives your
 real `RoomRuntime` the way the ticker does, through your real codec so the
-client sees wire-quantised poses, with the real `PredictedEntity` stamping
-`lead` ticks ahead of a server whose snapshots arrive `delay` ticks late.
+client sees wire-quantised poses, with the real prediction `predict` owns
+stamping `lead` ticks ahead of a server whose snapshots arrive `delay` ticks
+late, on the same wire (`wire` and `encodeInput` mean exactly what they mean
+on `predict`, and `decodeInput` defaults to the relay's own `decodeInputAuto`).
 
 ```ts
 import { runLockstep, sweepLockstep } from 'tickroom/testing';
@@ -817,6 +844,7 @@ const scenario = {
   },
   step: (pose, input, dt) => ({ x: pose.x, y: stepPaddleY(pose.y, input.dir, dt) }),
   maxSpeed: PADDLE_SPEED,
+  wire: 'json', // `{ dir }` is not the default binary shape, exactly as on the page
   input: () => ({ dir: 1 }),
   ticks: 20,
 };
@@ -858,12 +886,13 @@ deliberately broken step reported as pinned and wrong.
 | `PlayoutBuffer` | An input lands on the *same tick* at both ends despite jitter. |
 | `Inbox` | Backpressure with a per-sender quota, so one flooder degrades only themselves. |
 | `RoomConnection` | Reconnect, resume, re-mint, clock sync, protocol-skew recovery, a **real measured round trip**, and a **warm swap** at the relay's lifetime cap that the player never sees. |
-| `conn.frame(now)` | The one per-frame call: advances the tick, polls the stall, returns the poses to draw. |
-| `conn.tick` | The monotonic counter an input's `targetTick` is stamped from. Anchored per epoch to a **measured** lead (RTT + jitter headroom + optional server-depth feedback), advanced by `frame()`. Its `fraction` is how far it is into the next tick, 0 to 1, and its `tickMs` is the interval it was built with: `PredictedEntity` reads both, the one as its render target and the other as its timestep, so there is no tick rate to state twice. The tick a record names is also what `step` is told it is producing, so a time-dependent world can be indexed inside a replay. |
-| `PredictedEntity` | Your own entity, the one the interpolation delay is wrong for. One object owns the whole stamped path's client half: one record per tick predicted through the **same pure step** the runtime runs, the last six re-sent on every packet, a replay from every snapshot into a bounded **glide** (a snap on the first confirmation and whenever the offset would grow past half a second of travel, so nothing is ever trimmed in silence), a render **playhead** that moves at real time (within a tenth) through the recent poses one tick behind the newest, so a counter re-anchor is caught up over a second and a frozen tab is one counted snap rather than a lurch, and the re-anchor handling read off the counter itself. `advance` once per frame, `reconcile` once per snapshot, `conn`, `step`, `maxSpeed` and `initial` the only options, and none for the four rules a host used to get wrong. `step` is `(pose, input, dt, tick)`: the **tick it is producing**, passed on every stamp and every replayed record, so a step whose collision context changes over time indexes the right one instead of the newest. |
+| `conn.frame(now, input)` | The one per-frame call: advances the tick, polls the stall, samples the interpolator, then stamps and predicts with `input`, and returns the poses to draw and your own (`own`, `null` until the server has confirmed you). `input` is required once `predict` is set. |
+| `conn.tick` | The monotonic counter an input's `targetTick` is stamped from. Anchored per epoch to a **measured** lead (RTT + jitter headroom + optional server-depth feedback), advanced by `frame()`. Its `fraction` is how far it is into the next tick, 0 to 1, and its `tickMs` is the interval it was built with: the prediction reads both, the one as its render target and the other as its timestep, so there is no tick rate to state twice. The tick a record names is also what `step` is told it is producing, so a time-dependent world can be indexed inside a replay. |
+| `predict` | Your own entity, the one the interpolation delay is wrong for, owned by the connection. One option bag owns the whole stamped path's client half: one record per tick predicted through the **same pure step** the runtime runs, the last six re-sent on every packet, a replay from every snapshot into a bounded **glide** (a snap on the first confirmation and whenever the offset would grow past half a second of travel, so nothing is ever trimmed in silence), a render **playhead** that moves at real time (within a tenth) through the recent poses one tick behind the newest, so a counter re-anchor is caught up over a second and a frozen tab is one counted snap rather than a lurch, and the re-anchor handling read off the counter itself. `step`, `maxSpeed`, `ownPose` and the optional `teleported`, `initial`, `wire` and `encodeInput` are the options, and none for the four rules a host used to get wrong; the three calls a host used to make by hand (advance after the counter, reconcile before `onSnapshot`, snap before the reconcile that confirms a jump) are the connection's, in that order. `step` is `(pose, input, dt, tick)`: the **tick it is producing**, passed on every stamp and every replayed record, so a step whose collision context changes over time indexes the right one instead of the newest. `conn.own` is the raw prediction and `conn.ownStats` its diagnostics. `PredictedEntity`, the object underneath, stays exported for a host with several. |
+| `predict.wire` | The input wire. `'binary'` by default: `tickroom/codec`'s input window, **69 bytes** for the six re-sent records against about 300 as JSON, which requires the input to be `DefaultInput` (`{ axes: [x, y], buttons }`); the first input is checked and a `TypeError` names `wire: 'json'` and `encodeInput` as the ways out. `decodeInputAuto`, the relay's default `decodeInput`, reads both. |
 | `conn.stats()` | `rttMs`, `jitterMs`, `snapshotsReceived`, `rejectedSnapshots`, `underrunRate`, `reconnects`, `relaySwaps`, `swapsAttempted`, `swapsFailed`, `serverTickHz`, `hostErrors`. Gauges reset per epoch, counters are lifetime. `serverTickHz` and `hostErrors` exist because a wrong `tickHz` and a throwing host callback were both completely silent. |
 | `swapsAttempted` / `swapsFailed` | Warm swaps **started** at a relay's lifetime cap, and warm swaps that ended **without delivering**. Both lifetime counters, and `swapsAttempted - relaySwaps - swapsFailed` is 0, or 1 while one is in flight. `swapsFailed` tracking `swapsAttempted` means every relay lifetime cap is still costing a visible reconnect; the usual cause is a session `maxAgeS` shorter than the relay lifetime chain, so **size the token against the chain rather than against one relay**. |
-| `SnapshotInterpolator` | Other entities move smoothly. Adapts to measured jitter, never freezes, and unwinds its own extrapolation as a glide. **`teleport(key)`** for the jump an entity did not travel (a respawn, an elimination): one call, from `onSnapshot`, voids the history behind it and holds the entity at the destination until playback catches up, where `forget` re-seeds inside the bracket and streaks. |
+| `SnapshotInterpolator` | Other entities move smoothly. Adapts to measured jitter, never freezes, and unwinds its own extrapolation as a glide. Constructed by the connection when `interpolate.into` is omitted. **`teleport(key)`** for the jump an entity did not travel (a respawn, an elimination) voids the history behind it and holds the entity at the destination until playback catches up, where `forget` re-seeds inside the bracket and streaks; declare the keys in `interpolate.teleported` and the connection makes the call after its own push, the one order it needs. |
 | `ErrorOffset` | A correction becomes a glide instead of a teleport. |
 | `stallDecision` | Tell the player the world is gone, without crying wolf on a routine handoff. |
 | `ByteWriter` / `quantize` | The wire format, because fan-out bandwidth is the bill. Integer fields **refuse** rather than wrap; NaN is refused rather than encoded as the origin. |
@@ -985,7 +1014,7 @@ If bandwidth ever becomes the bill, the lever is not a bigger plan, it is ending
 
 | | |
 | --- | --- |
-| [`examples/pong`](examples/pong) | Two-player 2D game. Server-authoritative paddles and ball, and the reference for the STAMPED path: tick-stamped inputs and a paddle owned by a `PredictedEntity` running the simulation's own exported step function, with the stamping lead trimmed from the ticker's own depth frame. |
+| [`examples/pong`](examples/pong) | Two-player 2D game. Server-authoritative paddles and ball, and the reference for the STAMPED path: tick-stamped inputs and a paddle predicted by the connection's `predict` option running the simulation's own exported step function, with the stamping lead trimmed from the ticker's own depth frame. |
 | [`examples/cursors`](examples/cursors) | Multiplayer cursors, both halves. Not a game at all; realtime presence, at 10Hz with unstamped inputs. |
 | [`examples/node-server`](examples/node-server/README.md) | The same simulation on a plain Node `ws` server, no serverless. Its README has the run command, the env knobs, a headless Node client, and recipes for watching a planned handoff and the relay's warm swap. |
 
@@ -1176,8 +1205,8 @@ known one for weeks. `tests/example.redis.test.ts` runs the example's own
 adapter's own `attachNodeRelay` on a real `ws` server, and the example's own
 `createPongClient` as the client, on a 16ms timer in place of
 `requestAnimationFrame`. Nothing about the netcode is retyped in the test: the
-decode, the interpolator wiring, the `PredictedEntity`, the
-`frame()`-then-`advance()` ordering and the input rule are all the example's.
+decode, the interpolator wiring, the `predict` option, the one
+`frame(now, input)` call and the input rule are all the example's.
 
 | | measured |
 | --- | --- |

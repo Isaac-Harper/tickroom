@@ -9,6 +9,7 @@ import {
   encodeInputWindow,
   decodeInputWindow,
   inputWindowToClientInputs,
+  decodeInputAuto,
   type DefaultSnapshot,
   type DefaultInputRecord,
 } from './snapshot.js';
@@ -570,5 +571,50 @@ describe('the default input window carries a host-chosen axis scale', () => {
     const [out] = decodeInputWindow(encodeInputWindow(records));
     expect(out!.axes[0]).toBeCloseTo(0.5, 2);
     expect(out!.axes[1]).toBeCloseTo(-0.25, 2);
+  });
+});
+
+describe('decodeInputAuto reads both wires and throws for neither', () => {
+  const records = [
+    { targetTick: 10, data: { axes: [1, 0], buttons: 1 } },
+    { targetTick: 11, data: { axes: [0, -1], buttons: 0 } },
+  ];
+
+  it('a string is the JSON wire: an array of records, or one record', () => {
+    expect(decodeInputAuto(JSON.stringify(records))).toEqual(records);
+    expect(decodeInputAuto(JSON.stringify(records[0]))).toEqual([records[0]]);
+  });
+
+  it('bytes beginning with [ or { are the JSON wire too, which is what a host that encodes JSON into a binary frame sends', () => {
+    expect(decodeInputAuto(new TextEncoder().encode(JSON.stringify(records)))).toEqual(records);
+    const one = new TextEncoder().encode(JSON.stringify(records[1]));
+    expect(decodeInputAuto(one.buffer.slice(one.byteOffset, one.byteOffset + one.byteLength))).toEqual([records[1]]);
+  });
+
+  it('any other bytes are the binary input window, read through decodeInputWindow', () => {
+    const frame = encodeInputWindow([
+      { seq: 10, targetTick: 10, axes: [1, 0], buttons: 1 },
+      { seq: 11, targetTick: 11, axes: [0, -1], buttons: 0 },
+    ]);
+    expect(decodeInputAuto(frame)).toEqual(inputWindowToClientInputs(decodeInputWindow(frame)));
+    expect(decodeInputAuto(frame).map((r) => ({ targetTick: r.targetTick, data: r.data }))).toEqual(records);
+    // A view over a wider buffer is read at its own window, never the backing store.
+    const padded = new Uint8Array(frame.length + 8);
+    padded.set(frame, 4);
+    expect(decodeInputAuto(padded.subarray(4, 4 + frame.length))).toHaveLength(2);
+  });
+
+  it('answers everything malformed with an empty window and never throws', () => {
+    expect(decodeInputAuto('{not json')).toEqual([]);
+    expect(decodeInputAuto(new TextEncoder().encode('[1, 2'))).toEqual([]);
+    expect(decodeInputAuto('42')).toEqual([]);
+    expect(decodeInputAuto('null')).toEqual([]);
+    expect(decodeInputAuto(JSON.stringify([1, null, records[0], 'x']))).toEqual([records[0]]);
+    expect(decodeInputAuto(new Uint8Array([255, 255, 255, 255]))).toEqual([]);
+    expect(decodeInputAuto(new Uint8Array(0))).toEqual([]);
+    expect(decodeInputAuto(null)).toEqual([]);
+    expect(decodeInputAuto(undefined)).toEqual([]);
+    expect(decodeInputAuto(42)).toEqual([]);
+    expect(decodeInputAuto({ targetTick: 1 })).toEqual([]);
   });
 });

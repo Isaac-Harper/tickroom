@@ -20,7 +20,9 @@ import {
   isInputLeadFrame,
 } from '../core/index.js';
 import { ClientTick, TICK_STEP_CAP, type ClientTickView } from './clientTick.js';
-import type { SnapshotInterpolator, EntitySample, InterpolatedEntity } from './interpolation.js';
+import { SnapshotInterpolator, type EntitySample, type InterpolatedEntity } from './interpolation.js';
+import { PredictedEntity, type Pose, type StampedRecord } from './predictedEntity.js';
+import type { DefaultInput } from '../codec/snapshot.js';
 import {
   stallDecision,
   shouldReanchor,
@@ -176,19 +178,101 @@ export type WebSocketConstructor = new (url: string) => WebSocketLike;
  * estimate. The connection already does the identical thing for the one other
  * epoch-scoped component it holds, one line away, in `markUnanchored()`.
  *
- * AND IT FIXES THE CALL ORDER `teleport` NEEDS, which is the one thing a host
- * still has to get right by hand. `SnapshotInterpolator.teleport(key)` reads
- * the destination out of the buffer, so it has to run AFTER the frame carrying
- * the destination is pushed; with this option the push happens here and
- * `onSnapshot` runs after it (see the ordering comment in `processSnapshot`), so
- * `onSnapshot` is where a host calls it and the order is satisfied by
- * construction rather than by remembering.
+ * AND IT FIXES THE CALL ORDER `teleport` NEEDS, which used to be the one
+ * thing a host still had to get right by hand. `SnapshotInterpolator.teleport(key)`
+ * reads the destination out of the buffer, so it has to run AFTER the frame
+ * carrying the destination is pushed; a host used to make the call from
+ * `onSnapshot` for that reason, and a consumer made it from the wrong place
+ * anyway. So the host DECLARES the jump instead: `teleported(snap)` names the
+ * keys this snapshot put somewhere, and the connection makes the call, after
+ * its own push, where the order cannot be wrong. `teleport(key)` stays public
+ * on the interpolator for a host that drives one by hand.
  */
 export interface SnapshotInterpolationOptions<TSnap, K extends string | number> {
-  /** The interpolator to push into and to clear on every epoch change. Its key type decides `K`, and `SnapshotInterpolator` has no default key type, so the host states it once here. */
-  into: SnapshotInterpolator<K>;
-  /** Pull the entities that MOVE out of one decoded snapshot. Everything else in the snapshot (scores, a winner, a serve countdown) is discrete state that has no meaning half way between two values, so it belongs in `onSnapshot` rather than here. A jump the entity did NOT travel (a respawn, an elimination moving the player to the border) is neither: it belongs in `onSnapshot` too, as one `into.teleport(key)` call, because this frame is already buffered by then. */
+  /**
+   * The interpolator to push into and to clear on every epoch change. OMIT IT
+   * and the connection constructs one with the default options, which is the
+   * right answer for every host that was writing `new SnapshotInterpolator()`
+   * on the line above and nothing else. Supply it to pin the delay bounds, or
+   * to keep a handle for `delayMs`, `underrunRate` and `teleport(key)`. `K` is
+   * the key type of the map `entities` returns.
+   */
+  into?: SnapshotInterpolator<K> | undefined;
+  /** Pull the entities that MOVE out of one decoded snapshot. Everything else in the snapshot (scores, a winner, a serve countdown) is discrete state that has no meaning half way between two values, so it belongs in `onSnapshot` rather than here. A jump the entity did NOT travel (a respawn, an elimination moving the player to the border) is neither: it is `teleported`'s. */
   entities(snap: TSnap): Map<K, EntitySample>;
+  /**
+   * The keys this snapshot PUT somewhere rather than moved: a respawn, an
+   * elimination to the border, a round reset. Read off the snapshot itself
+   * (an event list, a `respawned` field), never inferred from a distance,
+   * because a smoother cannot tell a jump from a disagreement and that is the
+   * whole reason this exists. The connection calls `teleport(key)` for each,
+   * AFTER the frame is pushed, so the entity is held at the destination until
+   * playback reaches it instead of streaking there at playback speed. The
+   * owned entity is not a key here: it is `predict.teleported`'s.
+   */
+  teleported?: ((snap: TSnap) => Iterable<K>) | undefined;
+}
+
+/**
+ * The player's OWN entity, predicted locally, owned by the connection. This
+ * option is `PredictedEntity` with the three calls a host used to make by hand
+ * (`advance` after `frame()`, `reconcile` per snapshot, `snapTo` before the
+ * reconcile that confirms a jump) made by the connection in the order they
+ * have to happen in. A consumer got three of the four hand-wiring rules wrong
+ * in one week (the entity advanced before the counter, the reconcile with the
+ * wrong tick, the snap after the reconcile instead of before), and every one
+ * of them was an ORDER between two objects the host had to hold at once. One
+ * object, one `frame(now, input)`, and there is no order left to get wrong.
+ *
+ * `TInput` is the per-tick input as it goes on the wire, inferred from `step`.
+ * On the default binary wire it must be `DefaultInput` (`{ axes: [x, y],
+ * buttons }`) from `tickroom/codec`; see `wire`.
+ */
+export interface PredictionOptions<TSnap, TInput> {
+  /**
+   * THE SAME PURE STEP THE SERVER RUNS FOR THIS ENTITY: the pose after one
+   * tick of `dt` seconds under `input`, producing tick `tick`. Share the
+   * function with the runtime rather than retyping it, keep it free of state,
+   * and keep it free of anything that only exists on the client's own frame:
+   * a replay runs it from the SERVER's pose, several ticks inside one
+   * snapshot, so every hook it reads has to be evaluated from the pose and
+   * the tick it is handed. See `PredictedEntityOptions.step`.
+   */
+  step: (pose: Pose, input: TInput, dt: number, tick: number) => Pose;
+  /** The fastest this entity can move, units per second. Bounds the correction glide and sets the snap distance at half a second of travel. See `PredictedEntityOptions.maxSpeed`. */
+  maxSpeed: number;
+  /**
+   * THE AUTHORITATIVE POSE FOR THIS CLIENT out of a decoded snapshot, or
+   * `null` while the snapshot carries none (before a seat is assigned, after
+   * a death). A `null` reconciles nothing and `FrameView.own` stays `null`
+   * until the first pose that is not. Which entity is "this client" is the
+   * host's to know: the pid comes back from `mint()`.
+   */
+  ownPose(snap: TSnap): Pose | null;
+  /**
+   * This snapshot PUT the own entity somewhere: a respawn, a round reset. The
+   * connection snaps the prediction onto `ownPose(snap)` BEFORE reconciling
+   * against it, so the server's answer is adopted as a fresh confirmation
+   * rather than glided in from where the entity was. A glide is invisible for
+   * an ordinary disagreement and exactly wrong for a jump, and the smoother
+   * cannot tell the two apart: read this off the snapshot, never off a
+   * distance, and never return true per frame.
+   */
+  teleported?: ((snap: TSnap) => boolean) | undefined;
+  /** Where the prediction starts before the first authoritative pose. The first confirmation replaces it outright. Defaults to the origin. */
+  initial?: Pose | undefined;
+  /**
+   * The input wire. Default `'binary'`: `tickroom/codec`'s `encodeInputWindow`,
+   * 69 bytes for six records against about 300 as JSON, which REQUIRES
+   * `TInput` to be `DefaultInput`; the first input handed to `frame()` is
+   * checked at runtime, before anything is stamped, and a `TypeError` names
+   * `wire: 'json'` and `encodeInput` as the ways out. `'json'` sends one text frame per stamp, an array of
+   * `{ targetTick, data }`, for any JSON-shaped `TInput`. The relay's default
+   * `decodeInput` (`decodeInputAuto`) reads both.
+   */
+  wire?: 'binary' | 'json' | undefined;
+  /** A host's own wire: the last six stamped records, oldest first, to one frame `conn.send` takes. Overrides `wire`; the relay's `decodeInput` has to be its inverse. */
+  encodeInput?: ((records: StampedRecord<TInput>[]) => ArrayBuffer | Uint8Array | string) | undefined;
 }
 
 /**
@@ -203,7 +287,7 @@ export interface SnapshotInterpolationOptions<TSnap, K extends string | number> 
  * `upgradeWebSocket` signature fix: a type that only compiles under THIS
  * repo's tsconfig is a type that is wrong for the people using it.
  */
-export interface RoomConnectionOptions<TSnap extends DecodedSnapshotLike, K extends string | number> {
+export interface RoomConnectionOptions<TSnap extends DecodedSnapshotLike, K extends string | number, TInput = DefaultInput> {
   /** Mint or fetch a session. Called on the first connect attempt and again whenever a re-mint is triggered (see the pre-open-failure rule below); an ordinary reconnect reuses the session already on hand. Its result is VALIDATED before use: a `token`, `playerId` and `room` that are strings and a finite `handle`, because a 401 body is JSON too and used to become the session, after which every URL carried a literal `undefined` and the ladder looped forever with nothing latching.
    *
    * SIZE THE TOKEN'S LIFETIME AGAINST THE RELAY LIFETIME CHAIN, NOT AGAINST A
@@ -236,7 +320,9 @@ export interface RoomConnectionOptions<TSnap extends DecodedSnapshotLike, K exte
   protocolVersion?: number | undefined;
   /** Drive an interpolator from this connection's own snapshot stream and epoch. See `SnapshotInterpolationOptions`. Omit it to keep a `SnapshotInterpolator` by hand, which is still supported and is what a host with several buffers, or with a render layer that owns its own playback, will want. */
   interpolate?: SnapshotInterpolationOptions<TSnap, K> | undefined;
-  /** Every decoded snapshot, in the concrete type `decodeSnapshot` returned. For the discrete state interpolation cannot smooth; the moving entities are `interpolate`'s job. It runs AFTER the frame has been pushed into `interpolate.into`, which is what makes it the place to call `teleport(key)` for an entity this snapshot says was PUT somewhere rather than walked there. */
+  /** Predict this client's own entity. See `PredictionOptions`. With it, `frame(now, input)` REQUIRES its second argument and returns the pose to draw as `own`; without it, `own` is always `null` and `input` is ignored. */
+  predict?: PredictionOptions<TSnap, TInput> | undefined;
+  /** Every decoded snapshot, in the concrete type `decodeSnapshot` returned. For the discrete state interpolation cannot smooth; the moving entities are `interpolate`'s job and the own entity is `predict`'s. It runs LAST: after the frame is pushed into the interpolator, after every declared teleport, and after the own entity is reconciled, so what a host reads here (`conn.own`, `conn.ownStats`) is the state this snapshot produced and not the one before it. */
   onSnapshot?: ((snap: TSnap) => void) | undefined;
   /** JSON control frames the host relay sends: a roster update, a capacity notice, a quota warning. Parsed for you; handed back as the parsed value, or the raw string if it did not parse as JSON. The library's OWN control frames (`pong`, `relay-expiring`) are consumed here and never reach this callback, because they are transport bookkeeping rather than anything a host has an opinion about. */
   onText?: ((msg: unknown) => void) | undefined;
@@ -268,9 +354,10 @@ export interface RoomConnectionOptions<TSnap extends DecodedSnapshotLike, K exte
    * onTickReanchor: (d) => { lastSentTick += d; err.reset(); }
    * ```
    *
-   * A HOST ON `PredictedEntity` NEEDS NONE OF THAT: it reads a backward jump
-   * off `tick.value` inside `advance` and resets its own mark and window, so
-   * for it this callback is telemetry, a count of how often the counter moved.
+   * A HOST ON `predict` NEEDS NONE OF THAT: the entity reads a backward jump
+   * off `tick.value` inside its own advance and resets its own mark and
+   * window, so for it this callback is telemetry, a count of how often the
+   * counter moved.
    */
   onTickReanchor?: ((deltaTicks: number) => void) | undefined;
   /**
@@ -467,7 +554,7 @@ function invalidSessionReason(session: unknown): string | null {
   return null;
 }
 
-/** What one rendered frame produced: the poses to draw, the stall state, and the delta the connection measured for itself. */
+/** What one rendered frame produced: the poses to draw, the own entity's pose, the stall state, and the delta the connection measured for itself. */
 export interface FrameView<K extends string | number> {
   /**
    * The interpolated pose of every tracked entity, ready to draw. EMPTY when
@@ -481,6 +568,16 @@ export interface FrameView<K extends string | number> {
    * every relay's own lifetime cap. The hold ends on that first snapshot.
    */
   entities: Map<K, InterpolatedEntity>;
+  /**
+   * THE OWN ENTITY'S POSE TO DRAW, from `predict`: the prediction read at a
+   * render playhead one tick behind the newest stamp, plus what is left of the
+   * last correction. `null` before the first authoritative pose has been
+   * reconciled (there is nothing of this client's to draw yet, and a guess at
+   * the spawn drawn for a few frames and then snapped is worse than nothing)
+   * and always `null` without `predict`. The raw prediction, for game logic
+   * rather than drawing, is `conn.own`.
+   */
+  own: Pose | null;
   /** Same value `stallView().stalled` reports; `onStallChange` has already fired if this call changed it. */
   stalled: boolean;
   /** Seconds since the previous `frame()` call, clamped to `FRAME_DT_CAP_S`. Zero on the first call. Returned because a host's own per-frame work usually wants the same delta rather than a second, differently clamped one. */
@@ -506,20 +603,34 @@ export interface ConnectionStats {
   swapsFailed: number;
   /** The simulation rate MEASURED off the snapshot stream, Hz, as a median over the last few seconds. 0 until two snapshots have been accepted. Compare it with the `tickHz` you configured: they must agree, and `onTickRateMismatch` fires if they do not. */
   serverTickHz: number;
-  /** Throws out of the HOST's own callbacks that this class caught and carried on from (`onSnapshot`, `onText`, `onStatus`, `onStallChange`, `onTickReanchor`, `onTerminal`, and `interpolate.entities`). Lifetime. Nonzero means a bug in the host, invisible everywhere else because this class deliberately does not let one stop the connection. */
+  /** Throws out of the HOST's own callbacks that this class caught and carried on from (`onSnapshot`, `onText`, `onStatus`, `onStallChange`, `onTickReanchor`, `onTerminal`, `interpolate.entities`, `interpolate.teleported`, `predict.ownPose` and `predict.teleported`). Lifetime. Nonzero means a bug in the host, invisible everywhere else because this class deliberately does not let one stop the connection. */
   hostErrors: number;
 }
 
 export class RoomConnection<
   TSnap extends DecodedSnapshotLike = DecodedSnapshotLike,
   K extends string | number = string,
+  TInput = DefaultInput,
 > {
-  private readonly opts: RoomConnectionOptions<TSnap, K>;
+  private readonly opts: RoomConnectionOptions<TSnap, K, TInput>;
   private readonly tickMs: number;
   private readonly leadTicks: number;
   /** A frame gap past this is not a slow frame, it is a stopped render loop. Used both to unanchor the counter and to refuse a round-trip sample the freeze contaminated. */
   private readonly frozenFrameGapMs: number;
   private readonly clock: ClientTick;
+  /** The interpolator `interpolate` drives: the host's `into`, or one constructed here when it gave none. `null` without the option. */
+  private readonly interp: SnapshotInterpolator<K> | null;
+  /** The own entity `predict` drives. `null` without the option. */
+  private readonly entity: PredictedEntity<TInput> | null;
+  /**
+   * Has the own entity been reconciled against an authoritative pose since
+   * the held poses were last dropped? Until it has, `FrameView.own` is `null`:
+   * the prediction is a guess at the spawn. Scoped exactly as the held remote
+   * poses are (`dropHeldPoses`), so a reconnect into the same room keeps
+   * drawing the own entity across the gap and a terminal or a room change
+   * stops.
+   */
+  private ownConfirmed = false;
 
   /**
    * This client's own stamping tick counter, read-only. Stamp an input's
@@ -630,17 +741,49 @@ export class RoomConnection<
   private tickRateMismatchRun = 0;
   private tickRateReported = false;
 
-  constructor(opts: RoomConnectionOptions<TSnap, K>) {
+  constructor(opts: RoomConnectionOptions<TSnap, K, TInput>) {
     this.opts = opts;
     this.tickMs = 1000 / opts.tickHz;
     this.leadTicks = Math.ceil((opts.inputLeadMs ?? DEFAULT_INPUT_LEAD_MS) / this.tickMs);
     this.frozenFrameGapMs = FRAME_DT_CAP_S * 1000 + this.tickMs;
     this.clock = new ClientTick({ tickMs: this.tickMs });
     this.tick = this.clock;
+    this.interp = opts.interpolate ? (opts.interpolate.into ?? new SnapshotInterpolator<K>()) : null;
+    // The entity stamps against this connection's own counter and sends
+    // through its own socket: `this` satisfies its `conn` as is, and the
+    // timestep it runs on is the counter's `tickMs`, so there is no second
+    // rate anywhere to disagree with `tickHz`.
+    const predict = opts.predict;
+    this.entity = predict
+      ? new PredictedEntity<TInput>({
+          conn: this,
+          step: predict.step,
+          maxSpeed: predict.maxSpeed,
+          initial: predict.initial,
+          wire: predict.wire,
+          encodeInput: predict.encodeInput,
+        })
+      : null;
   }
 
   get status(): NetStatus {
     return this._status;
+  }
+
+  /**
+   * The RAW prediction of the own entity: the pose after the last stamped
+   * tick, with no playhead and no glide in it. For game logic that has to run
+   * on where the entity IS rather than where it is drawn (a collision latch,
+   * a bomb placed at the player's feet), and never for drawing, which is
+   * `FrameView.own`. `null` without `predict`. A copy.
+   */
+  get own(): Pose | null {
+    return this.entity?.pose ?? null;
+  }
+
+  /** The own entity's diagnostics (`lastError`, `snaps`, `stamped`, `invalid`; see `PredictedEntity.stats`), what a debug overlay reads to see how far the prediction and the server disagree. `null` without `predict`. */
+  get ownStats(): { lastError: number; snaps: number; stamped: number; invalid: number } | null {
+    return this.entity?.stats ?? null;
   }
 
   /**
@@ -803,8 +946,24 @@ export class RoomConnection<
    * same `performance.now()` domain. DO NOT pass a `Date.now()` reading, which
    * is a different domain by about 1.7e12, and differencing the two is what
    * puts the playhead somewhere no frame will ever bracket.
+   *
+   * WITH `predict`, `input` IS REQUIRED: the input the server will apply on
+   * every tick this frame stamps, as HELD STATE rather than an event (a lost
+   * packet then costs nothing, because the next tick re-asserts the same
+   * intent), already run through the simulation's own clamp so the record
+   * predicted with is byte for byte the record the server applies. It is
+   * consumed AFTER the counter has advanced and the interpolator has been
+   * sampled, which is the order a host used to have to keep by hand and the
+   * one it got wrong. An omitted `input` on a predicting connection is a
+   * `TypeError` naming the option, before anything moves, rather than a
+   * record stamped with `undefined` the server cannot read.
    */
-  frame(nowMs: number = now()): FrameView<K> {
+  frame(nowMs: number = now(), input?: TInput): FrameView<K> {
+    if (this.entity !== null && input === undefined) {
+      throw new TypeError(
+        'RoomConnection.frame: `input` is required when `predict` is set. Pass the input the server will apply this tick as the second argument: `conn.frame(now, input)`.',
+      );
+    }
     const rawGapMs = this.lastFrameAt === null ? 0 : nowMs - this.lastFrameAt;
     const dt = this.lastFrameAt === null ? 0 : Math.max(0, Math.min(FRAME_DT_CAP_S, rawGapMs / 1000));
     this.lastFrameAt = nowMs;
@@ -826,9 +985,7 @@ export class RoomConnection<
 
     this.clock.advance(dt);
     const stalled = this.pollStall(nowMs);
-    let entities = this.opts.interpolate
-      ? this.opts.interpolate.into.sample(dt, nowMs)
-      : new Map<K, InterpolatedEntity>();
+    let entities = this.interp !== null ? this.interp.sample(dt, nowMs) : new Map<K, InterpolatedEntity>();
 
     // HOLD THE LAST POSES ACROSS A COLD RECONNECT. From `connectOnce` until the
     // new epoch's first snapshot the buffer is deliberately empty, and an empty
@@ -850,7 +1007,17 @@ export class RoomConnection<
       entities = this.heldEntities;
     }
 
-    return { entities, stalled, dt };
+    // THE OWN ENTITY LAST, AFTER THE COUNTER HAS MOVED. The entity stamps
+    // against `tick.value`, and advancing it before the counter stamps every
+    // record one frame into the past; that ordering used to be two calls in
+    // the host's frame function with a comment saying which came first.
+    let own: Pose | null = null;
+    if (this.entity !== null) {
+      const drawn = this.entity.advance(input as TInput, dt);
+      if (this.ownConfirmed) own = drawn;
+    }
+
+    return { entities, own, stalled, dt };
   }
 
   /**
@@ -885,7 +1052,7 @@ export class RoomConnection<
     // room A's players over it until B's first snapshot.
     if (this.heldRoom !== (this.session?.room ?? null)) this.dropHeldPoses();
 
-    this.opts.interpolate?.into.clear();
+    this.interp?.clear();
     // ...and hand the poses the host is currently looking at to the fresh
     // buffer, IMMEDIATELY AFTER the clear, so the new epoch's first snapshot
     // glides out of them instead of snapping. The ordering is the whole thing:
@@ -900,7 +1067,7 @@ export class RoomConnection<
     // An interpolator cannot seed itself and a host would have to hand-write
     // the same two lines against a lifecycle it does not see.
     const held = this.lastEntities;
-    if (held !== null) this.opts.interpolate?.into.resumeFrom(held);
+    if (held !== null) this.interp?.resumeFrom(held);
 
     this.epochDelivered = false;
     this.resetArrivalGauges();
@@ -963,11 +1130,12 @@ export class RoomConnection<
     this.underrunEma = 0;
   }
 
-  /** Stop drawing the previous epoch's last frame. A terminal and a room change both mean the poses describe a world this connection is no longer looking at. */
+  /** Stop drawing the previous epoch's last frame, the own entity included. A terminal and a room change both mean the poses describe a world this connection is no longer looking at. */
   private dropHeldPoses(): void {
     this.lastEntities = null;
     this.heldEntities = null;
     this.heldRoom = null;
+    this.ownConfirmed = false;
   }
 
   /**
@@ -1926,7 +2094,8 @@ export class RoomConnection<
     // this one has a RETURN VALUE: a throw has to skip the push specifically,
     // and everything after it still has to happen.
     const interpolate = this.opts.interpolate;
-    if (interpolate) {
+    const interp = this.interp;
+    if (interpolate && interp !== null) {
       let entities: Map<K, EntitySample> | null = null;
       try {
         entities = interpolate.entities(decoded);
@@ -1934,7 +2103,61 @@ export class RoomConnection<
         this.hostErrors++;
       }
       if (entities !== null) {
-        interpolate.into.push({ receivedAt: t, serverTime: decoded.serverTime, entities });
+        interp.push({ receivedAt: t, serverTime: decoded.serverTime, entities });
+      }
+      // THE DECLARED TELEPORTS, AFTER THE PUSH, which is the whole of the
+      // order `teleport` documents: it reads the destination out of the
+      // buffer, so it has to see this frame there. The host names the keys
+      // and this class makes the call, so the order is a fact about this
+      // function rather than a rule a host remembers.
+      if (interpolate.teleported) {
+        let keys: Iterable<K> | null = null;
+        try {
+          keys = interpolate.teleported(decoded);
+        } catch {
+          this.hostErrors++;
+        }
+        if (keys !== null) for (const key of keys) interp.teleport(key);
+      }
+    }
+
+    // THE OWN ENTITY, BEFORE `onSnapshot`, so a host reads a reconciled
+    // state from its callback rather than the one the previous snapshot left.
+    // A declared teleport SNAPS FIRST and the reconcile is then a fresh
+    // confirmation onto the server's answer; the other way round glides the
+    // server's answer in from the pose before the jump and then snaps to the
+    // host's guess, which is the order a consumer wrote.
+    const predict = this.opts.predict;
+    if (predict && this.entity !== null) {
+      let pose: Pose | null = null;
+      try {
+        pose = predict.ownPose(decoded);
+      } catch {
+        this.hostErrors++;
+      }
+      if (pose !== null) {
+        let teleported = false;
+        if (predict.teleported) {
+          try {
+            teleported = predict.teleported(decoded);
+          } catch {
+            this.hostErrors++;
+          }
+        }
+        if (teleported) {
+          try {
+            this.entity.snapTo(pose);
+          } catch {
+            // `snapTo` refuses a non-finite pose with a `RangeError` because it
+            // is documented as the host's own call with the host's own number
+            // in it, and through this option that is still what it is: the
+            // pose came out of `ownPose`. Counted, and the reconcile below
+            // refuses the same pose on its own terms.
+            this.hostErrors++;
+          }
+        }
+        this.entity.reconcile(pose, decoded.tick);
+        this.ownConfirmed = true;
       }
     }
 

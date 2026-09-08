@@ -33,25 +33,26 @@
 // the previous tick's state kept beside the current one for the draw, and a
 // re-anchor handler to keep the send mark and the window honest. Forty lines,
 // four coupled rules, and two of them were wrong here until the day the
-// library took them over. They are `PredictedEntity` now: one object, one call
-// per frame, one call per snapshot, and nothing for this file to get wrong.
-// Remote paddles and the ball keep coming from `conn.frame()` on the
-// interpolation delay, which is correct for them: nobody is steering them here.
+// library took them over. Then it held a `PredictedEntity` beside the
+// connection and made its three calls by hand, and the ORDER of those calls
+// was the next thing a consumer got wrong. They are the connection's
+// `predict` option now: the step, the speed, and where our paddle is in a
+// snapshot, and `conn.frame(now, input)` returns the pose to draw. Remote
+// paddles and the ball keep coming from the same call on the interpolation
+// delay, which is correct for them: nobody is steering them here.
 //
 // THE FILE IS IN TWO HALVES, AND THE SPLIT IS THE DOM. `createPongClient`
 // below is all of the netcode and none of the browser: the connection, the
-// decode, the interpolator, the prediction and the per-frame ordering the two
-// depend on. `startPong` is the canvas, the keys and the animation frame on
-// top of it, and it is thirty lines of drawing. The half worth copying is the
-// first one, and keeping it free of `document` is also what lets
+// decode, the interpolator and the prediction, all in one option bag.
+// `startPong` is the canvas, the keys and the animation frame on top of it,
+// and it is thirty lines of drawing. The half worth copying is the first one,
+// and keeping it free of `document` is also what lets
 // `tests/example.redis.test.ts` drive THIS wiring through a real socket
 // instead of a retyped copy of it, which is the only way the shipped example
 // can be the thing CI checks.
 
 import {
-  PredictedEntity,
   RoomConnection,
-  SnapshotInterpolator,
   type EntitySample,
   type InterpolatedEntity,
   type Pose,
@@ -78,11 +79,16 @@ export interface PongSnapshot {
 }
 
 /** Must equal `pongRuntime.tickHz`. The connection is the only place it is
- *  stated: the prediction reads its timestep off `conn.tick.tickMs`, so there
- *  is no second literal here to disagree with this one. Only the paddle step
- *  is imported from the simulation: the client has no use for the ball, the
- *  scoring or the serve. */
+ *  stated: the prediction it owns reads its timestep off the same counter, so
+ *  there is no second literal here to disagree with this one. Only the paddle
+ *  step is imported from the simulation: the client has no use for the ball,
+ *  the scoring or the serve. */
 const TICK_HZ = 20;
+
+/** What one stamped record carries: the held direction, already clamped by `readDir`. JSON on the wire (see `predict.wire` below). */
+interface PongInput {
+  dir: number;
+}
 
 /** Where a paddle sits for each side. The server owns the assignment; this is
  *  only where to draw it. */
@@ -119,8 +125,8 @@ export interface PongClientOptions {
 export interface PongFrame {
   /** The interpolated room: the ball, and every paddle including our own. Ours is in here and drawn from `own` instead; see the frame loop. */
   entities: Map<string, InterpolatedEntity>;
-  /** OUR paddle, from the prediction rather than the interpolator: no playback delay and no round trip in it. */
-  own: Pose;
+  /** OUR paddle, from the prediction rather than the interpolator: no playback delay and no round trip in it. `null` until the server has confirmed we have one, which is also when `selfSide` is known. */
+  own: Pose | null;
   /** Discrete state the interpolator cannot smooth, from the newest snapshot. */
   scores: Map<string, number>;
   winner: string | null;
@@ -132,13 +138,11 @@ export interface PongFrame {
 }
 
 export interface PongClient {
-  /** The connection itself, for `stats()` and for a host that wants to send something of its own. */
-  readonly conn: RoomConnection<PongSnapshot, string>;
-  /** Exposed for the same reason `conn` is: `paddle.stats` is what a debug overlay reads to see how far the prediction and the server actually disagree. */
-  readonly paddle: PredictedEntity<{ dir: number }>;
+  /** The connection itself, for `stats()`, for `ownStats` (what a debug overlay reads to see how far the prediction and the server actually disagree), and for a host that wants to send something of its own. */
+  readonly conn: RoomConnection<PongSnapshot, string, PongInput>;
   /** Held input, -1 up through +1 down. Nothing is sent from here; a send is one record per TICK, from `frame()`. */
   setDir(dir: number): void;
-  /** THE ONE PER-FRAME CALL. Advances the counter, samples the interpolator, stamps and sends this frame's ticks, and returns the pose to draw. */
+  /** THE ONE PER-FRAME CALL. Advances the counter, samples the interpolator, stamps and sends this frame's ticks, and returns the poses to draw. */
   frame(now: number): PongFrame;
   start(): Promise<void>;
   stop(): void;
@@ -152,7 +156,6 @@ export interface PongClient {
 export function createPongClient(opts: PongClientOptions): PongClient {
   const decode =
     opts.decode ?? ((buf: ArrayBuffer): PongSnapshot => JSON.parse(new TextDecoder().decode(buf)) as PongSnapshot);
-  const interp = new SnapshotInterpolator<string>();
 
   // Everything the interpolator does not smooth: scores, the winner, the serve
   // countdown. These are discrete state, not motion, so interpolating them would
@@ -172,10 +175,11 @@ export function createPongClient(opts: PongClientOptions): PongClient {
    *  delivery for a keyup, and a lost keyup is a paddle that never stops. */
   let dir = 0;
 
-  // The type arguments are STATED rather than inferred from `decodeSnapshot`,
-  // so a decoder that drifts from `PongSnapshot` is an error here rather than
-  // a wider shape reaching `onSnapshot` and `PongClient.conn`.
-  const conn = new RoomConnection<PongSnapshot, string>({
+  // The type arguments are STATED rather than inferred from `decodeSnapshot`
+  // and `predict.step`, so a decoder or a step that drifts from its type is an
+  // error here rather than a wider shape reaching `onSnapshot` and
+  // `PongClient.conn`.
+  const conn = new RoomConnection<PongSnapshot, string, PongInput>({
     // Required rather than defaulted, because a client silently running on the
     // wrong basis skews the tick counter, the server-tick estimate and the
     // underrun threshold at once.
@@ -199,11 +203,12 @@ export function createPongClient(opts: PongClientOptions): PongClient {
     // anything this snapshot carries.
     decodeSnapshot: decode,
 
-    // The connection owns the interpolator: it pushes every decoded snapshot in
-    // with the right two timestamps and clears the buffer on every epoch
-    // change. All this side has to say is which parts of a snapshot MOVE.
+    // The connection owns the interpolator: it constructs one, pushes every
+    // decoded snapshot in with the right two timestamps and clears the buffer
+    // on every epoch change. All this side has to say is which parts of a
+    // snapshot MOVE. Nothing in pong is ever PUT somewhere, so there is no
+    // `teleported` here; a game with a respawn names the respawned keys in it.
     interpolate: {
-      into: interp,
       entities: (snap) => {
         // The ball and each paddle are entities; a score is not. Interpolating
         // discrete state is meaningless (there is no half a point), so it is
@@ -223,27 +228,67 @@ export function createPongClient(opts: PongClientOptions): PongClient {
       },
     },
 
-    // `snap` arrives as `PongSnapshot`, not as an erased shape needing a cast.
+    // ---- our own paddle, predicted locally ----------------------------------
+    //
+    // The whole of the stamped path's client half, owned by the connection.
+    // Once per frame it stamps a record for every tick the counter crossed
+    // (never per frame, never per keydown: the tick is the unit the server
+    // applies input on), predicts each through `step`, sends the last six as
+    // one frame, and returns the pose to draw: its pose history read at a
+    // render playhead that moves at real time (within a tenth) one tick
+    // behind the newest stamp, with what is left of the last correction
+    // added. Once per snapshot it replays from `ownPose` and re-seats, BEFORE
+    // `onSnapshot` runs. The paddle's x never changes under `step`; the first
+    // reconcile seats it on the side the server chose.
+    predict: {
+      // THE SAME FUNCTION THE SIMULATION RUNS, on the same input, on the tick
+      // the record names. That is the whole promise of stamping, and it is one
+      // line because `stepPaddleY` is shared rather than copied. The fourth
+      // argument is the tick this call is producing, ignored here because a
+      // paddle collides with nothing that changes over time; a game whose
+      // collision context does change (a closing arena, a grid that moved two
+      // ticks ago) indexes it with that number rather than with the newest one,
+      // since a replay runs several ticks inside one snapshot.
+      step: (pose, input, dt) => ({ x: pose.x, y: stepPaddleY(pose.y, input.dir, dt) }),
+      // Bounds the correction glide (a paddle sliding back onto the server's
+      // answer faster than a paddle can move on its own reads as a second,
+      // ghostly hand on the controls: the glide adds at most this on top of the
+      // paddle's motion) and sets the snap distance at half a second of travel.
+      maxSpeed: PADDLE_SPEED,
+      initial: { x: 0, y: FIELD_H / 2 },
+      // OUR AUTHORITATIVE POSE, out of each snapshot. The snapshot is
+      // authoritative for tick `snap.tick`, but we have already stamped and
+      // simulated inputs for ticks after that, so the server's y is not
+      // directly comparable to ours: it is where our paddle was several ticks
+      // ago. The connection replays its stored records from here, adopts the
+      // result, and glides the difference away; on a healthy link that
+      // difference is the snapshot's own rounding (a tenth of a unit) and
+      // nothing else. The very first confirmation snaps instead, which is also
+      // what seats the paddle's x on the side the server assigned. `null`
+      // until the roster names us, and nothing is reconciled until then.
+      ownPose: (snap) => {
+        const mine = snap.paddles.find((p) => p.pid === selfPid);
+        return mine === undefined ? null : { x: paddleX(mine.side), y: mine.y };
+      },
+      // JSON ON THE WIRE, because `{ dir }` is not the default binary shape
+      // (a two-axis stick and a button mask). The relay in
+      // examples/node-server parses exactly this array. A game whose input IS
+      // a stick leaves this out and gets the binary window, about an eighth of
+      // the bytes.
+      wire: 'json',
+    },
+
+    // `snap` arrives as `PongSnapshot`, not as an erased shape needing a cast,
+    // and by the time this runs the prediction has already been reconciled
+    // against it: only the discrete state is left to read.
     onSnapshot: (snap) => {
       winner = snap.winner;
       serveIn = snap.serveIn;
       const next = new Map<string, number>();
       for (const p of snap.paddles) next.set(p.pid, p.score);
       scores = next;
-
-      // RECONCILE THE PREDICTION. The snapshot is authoritative for tick
-      // `snap.tick`, but we have already stamped and simulated inputs for
-      // ticks after that, so the server's y is not directly comparable to
-      // ours: it is where our paddle was several ticks ago. The entity replays
-      // its own stored records from there, adopts the result, and glides the
-      // difference away; on a healthy link that difference is the snapshot's
-      // own rounding (a tenth of a unit) and nothing else. The very first
-      // confirmation snaps instead, which is also what seats the paddle's x
-      // on the side the server assigned.
       const mine = snap.paddles.find((p) => p.pid === selfPid);
-      if (!mine) return;
-      selfSide = mine.side;
-      paddle.reconcile({ x: paddleX(mine.side), y: mine.y }, snap.tick);
+      if (mine) selfSide = mine.side;
     },
 
     onStallChange: opts.onStallChange,
@@ -253,66 +298,29 @@ export function createPongClient(opts: PongClientOptions): PongClient {
     // in-flight window, because a backward re-anchor (a handoff, a backgrounded
     // tab, a clock step) otherwise silenced the send loop until the counter
     // climbed back past the old mark: measured at 5.6 seconds of input silence
-    // on a real socket. `PredictedEntity` reads the jump off the counter
-    // itself, so the callback is telemetry now, for a host that wants to count
+    // on a real socket. The prediction reads the jump off the counter itself,
+    // so the callback is telemetry now, for a host that wants to count
     // re-anchors, and nothing here needs it.
 
     onTerminal: opts.onTerminal,
   });
 
-  // ---- our own paddle, predicted locally ------------------------------------
-  //
-  // The whole of the stamped path's client half. Once per frame `advance`
-  // stamps a record for every tick the counter crossed (never per frame, never
-  // per keydown: the tick is the unit the server applies input on), predicts
-  // each through `step`, sends the last six as one JSON array (what the relay's
-  // `decodeInput` in examples/node-server parses), and returns the pose to
-  // draw: its pose history read at a render playhead that moves at real time
-  // (within a tenth) one tick behind the newest stamp, with what is left of
-  // the last correction added. Once per snapshot `reconcile` replays and
-  // re-seats. The paddle's x never changes under `step`; the first reconcile
-  // seats it on the side the server chose. The timestep is `conn.tick.tickMs`,
-  // read off the connection, so there is nothing here to keep equal to it.
-  const paddle = new PredictedEntity<{ dir: number }>({
-    conn,
-    // THE SAME FUNCTION THE SIMULATION RUNS, on the same input, on the tick
-    // the record names. That is the whole promise of stamping, and it is one
-    // line because `stepPaddleY` is shared rather than copied. The fourth
-    // argument is the tick this call is producing, ignored here because a
-    // paddle collides with nothing that changes over time; a game whose
-    // collision context does change (a closing arena, a grid that moved two
-    // ticks ago) indexes it with that number rather than with the newest one,
-    // since a replay runs several ticks inside one snapshot.
-    step: (pose, input, dt) => ({ x: pose.x, y: stepPaddleY(pose.y, input.dir, dt) }),
-    // Bounds the correction glide (a paddle sliding back onto the server's
-    // answer faster than a paddle can move on its own reads as a second,
-    // ghostly hand on the controls: the glide adds at most this on top of the
-    // paddle's motion) and sets the snap distance at half a second of travel.
-    maxSpeed: PADDLE_SPEED,
-    initial: { x: 0, y: FIELD_H / 2 },
-  });
-
   return {
     conn,
-    paddle,
     setDir: (d) => {
       dir = d;
     },
     frame: (now) => {
       // THE ONE PER-FRAME CALL. It advances the tick counter inputs are stamped
-      // against, polls the stall detector, and samples the interpolator, all from
-      // one delta the connection measures for itself. This used to be three
-      // separate calls and one of them was documented nowhere, so a client that
-      // looked completely healthy could be stamping every input a second and a
-      // half into the past.
-      const { entities, dt } = conn.frame(now);
-      // AFTER `frame()`, never before: the counter this stamps against is
-      // advanced by that call, so advancing first stamps every record one frame
-      // into the past. `readDir` is the simulation's own clamp, run here so the
-      // record we predict with is byte for byte the record the server will
-      // apply: a second, subtly different sanitiser on this side is a
+      // against, polls the stall detector, samples the interpolator, and THEN
+      // stamps and predicts this frame's ticks with the input, all from one
+      // delta the connection measures for itself. This used to be three
+      // separate calls plus the entity's own, and the order between them was
+      // the host's to keep. `readDir` is the simulation's own clamp, run here
+      // so the record we predict with is byte for byte the record the server
+      // will apply: a second, subtly different sanitiser on this side is a
       // divergence with no symptom until it fires.
-      const own = paddle.advance({ dir: readDir(dir) }, dt);
+      const { entities, own } = conn.frame(now, { dir: readDir(dir) });
       return { entities, own, scores, winner, serveIn, selfPid, selfSide };
     },
     start: () => conn.start(),
@@ -379,7 +387,7 @@ export function startPong(canvas: HTMLCanvasElement): () => void {
 
   let raf = 0;
   const frame = (now: number) => {
-    const { entities: view, own, scores, winner, serveIn, selfPid, selfSide } = client.frame(now);
+    const { entities: view, own, scores, winner, serveIn, selfPid } = client.frame(now);
     const sx = canvas.width / FIELD_W;
     const sy = canvas.height / FIELD_H;
 
@@ -415,7 +423,7 @@ export function startPong(canvas: HTMLCanvasElement): () => void {
     // second rather than drawn as a lurch. One tick of visual delay (50ms
     // here) on top of a prediction that has no round trip in it, which is not
     // felt where the step was seen.
-    if (selfSide !== null) {
+    if (own !== null) {
       ctx.fillStyle = '#fff';
       ctx.fillRect(own.x * sx - 2, own.y * sy - 12 * sy, 4, 24 * sy);
     }

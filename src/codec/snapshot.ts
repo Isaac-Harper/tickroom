@@ -203,9 +203,15 @@ export function decodeDefaultSnapshot(
   return { version, tick, serverTime, entities, extra };
 }
 
-export interface DefaultInputRecord {
-  seq: number;
-  targetTick: number;
+/**
+ * THE DEFAULT INPUT SHAPE, and the one `RoomConnection`'s `predict` option
+ * sends on its default binary wire: a stick and a button mask, which is what a
+ * 2D game's per-tick input usually is. A host whose input is anything else
+ * (pong's `{ dir }`, a cursor's absolute position) either sets `wire: 'json'`
+ * or supplies its own `encodeInput`; the connection checks the shape of the
+ * first stamped record at runtime and names both alternatives when it fails.
+ */
+export interface DefaultInput {
   /**
    * Two floats (a movement stick, a steer/throttle pair). Quantized to `i8` on
    * the wire, so at the default `axisScale` they span [-1, 1] and are recovered
@@ -221,8 +227,14 @@ export interface DefaultInputRecord {
    * position wants its own record shape on `ByteWriter`, at `i16` or wider.
    */
   axes: [number, number];
-  /** A held-buttons bitmask: run, interact, an emote key, whatever the caller's input shape needs. */
+  /** A held-buttons bitmask, `0..255` (a `u8` on the wire): run, interact, an emote key, whatever the caller's input shape needs. */
   buttons: number;
+}
+
+/** One record of the binary input window: the default input plus the two fields that place it on the timeline. `seq` is carried and never read by the library; the connection's default wire writes the record's own `targetTick` into it. */
+export interface DefaultInputRecord extends DefaultInput {
+  seq: number;
+  targetTick: number;
 }
 
 export interface DefaultInputWindowOptions {
@@ -397,11 +409,69 @@ export function decodeInputWindow(
   return records;
 }
 
-/** Maps a decoded input window onto the core `ClientInput` shape `RoomRuntime`/`PlayoutBuffer` consume. `data` carries the axes and buttons; adjust the shape here (or skip this helper) if your simulation wants something else. */
+/** Maps a decoded input window onto the core `ClientInput` shape `RoomRuntime`/`PlayoutBuffer` consume. `data` is the `DefaultInput` the record carried; adjust the shape here (or skip this helper) if your simulation wants something else. */
 export function inputWindowToClientInputs(records: DefaultInputRecord[]): ClientInput[] {
   return records.map((rec) => ({
     seq: rec.seq,
     targetTick: rec.targetTick,
-    data: { axes: rec.axes, buttons: rec.buttons },
+    data: { axes: rec.axes, buttons: rec.buttons } satisfies DefaultInput,
   }));
+}
+
+/** ASCII `[` and `{`: the two bytes a JSON input frame can begin with, and neither is `INPUT_WINDOW_VERSION` (1), so a byte frame is sniffed without ambiguity. */
+const JSON_ARRAY_OPEN = 0x5b;
+const JSON_OBJECT_OPEN = 0x7b;
+
+/**
+ * A JSON input frame, parsed into records, and `[]` for anything that is not
+ * one. A record is any non-null object: the library reads `targetTick` off it
+ * later (the ticker decides buffered against applied-on-arrival from it) and
+ * never `seq`, so the JSON wire carries `{ targetTick, data }` and nothing
+ * here insists on more.
+ */
+function decodeJsonInputs(text: string): ClientInput[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  const isRecord = (v: unknown): v is ClientInput => typeof v === 'object' && v !== null && !Array.isArray(v);
+  if (Array.isArray(parsed)) return parsed.filter(isRecord);
+  return isRecord(parsed) ? [parsed] : [];
+}
+
+/**
+ * THE ONE DECODER THAT READS BOTH INPUT WIRES THIS LIBRARY SHIPS, and the
+ * default `decodeInput` of `createRoom` and of `runLockstep`. A `string` is a
+ * JSON text frame (what `predict.wire: 'json'` sends: one array of
+ * `{ targetTick, data }` records per message); bytes are sniffed on their
+ * first byte, JSON when it is `[` or `{` (a host that encodes JSON into a
+ * binary frame, as the cursors example does) and an `encodeInputWindow` frame
+ * otherwise (what the default `predict.wire: 'binary'` sends). Anything else,
+ * and anything malformed on either path, is `[]`.
+ *
+ * NEVER A THROW, on either path, which is a deliberate change from the JSON
+ * decoder this replaces. That one let `JSON.parse` throw so the relay's
+ * `onBadInput` could count a broken client; this one answers the way
+ * `decodeInputWindow` always has, because a decoder handed arbitrary bytes off
+ * a socket must be safe to call on every frame without a guard, and a hot
+ * path that throws is a hot path a peer can make expensive. A host that wants
+ * the count writes a `decodeInput` that throws; `onBadInput` still fires for
+ * one that does.
+ *
+ * Fragmentation is not handled here and does not need to be: `attachRelay`
+ * joins a fragmented message before any decoder sees it.
+ */
+export function decodeInputAuto(data: unknown): ClientInput[] {
+  if (typeof data === 'string') return decodeJsonInputs(data);
+  if (!(data instanceof ArrayBuffer) && !ArrayBuffer.isView(data)) return [];
+  // The VIEW's own window, never its backing buffer: a Node `Buffer` may be a
+  // slice of a pooled 8KB allocation that is mostly somebody else's bytes.
+  const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  const first = bytes[0];
+  if (first === JSON_ARRAY_OPEN || first === JSON_OBJECT_OPEN) {
+    return decodeJsonInputs(new TextDecoder().decode(bytes));
+  }
+  return inputWindowToClientInputs(decodeInputWindow(bytes));
 }

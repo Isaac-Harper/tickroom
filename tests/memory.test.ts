@@ -208,7 +208,7 @@ describe('one process, no Redis: createMemoryRedis behind the node adapter', () 
       const frameTimer = setInterval(() => {
         const at = performance.now();
         const view = client.frame(at);
-        frames.push({ at, ids: [...view.entities.keys()], lastError: client.paddle.stats.lastError });
+        frames.push({ at, ids: [...view.entities.keys()], lastError: client.conn.ownStats!.lastError });
       }, FRAME_MS);
 
       await client.start();
@@ -277,7 +277,7 @@ describe('one process, no Redis: createMemoryRedis behind the node adapter', () 
         drawMisses,
         paddle: { movingSteps, offSpeedSteps, step },
         reconcile: { maxError: +maxError.toFixed(4) },
-        predicted: client.paddle.stats,
+        predicted: client.conn.ownStats!,
         roomEvents: roomEvents.length,
         server: { hostErrors, badEnvelopes },
         client: endStats,
@@ -302,9 +302,9 @@ describe('one process, no Redis: createMemoryRedis behind the node adapter', () 
         // it are what stop the bound passing vacuously: a prediction that
         // never ran also reports zero.
         expect(maxError, 'reconcile error').toBeLessThan(0.25);
-        expect(client.paddle.stats.stamped, 'stamped records').toBeGreaterThan((RUN_MS / 1000) * TICK_HZ * 0.5);
-        expect(client.paddle.stats.snaps, 'hard snaps').toBeLessThanOrEqual(2);
-        expect(client.paddle.stats.invalid, 'invalid replays').toBeLessThanOrEqual(1);
+        expect(client.conn.ownStats!.stamped, 'stamped records').toBeGreaterThan((RUN_MS / 1000) * TICK_HZ * 0.5);
+        expect(client.conn.ownStats!.snaps, 'hard snaps').toBeLessThanOrEqual(2);
+        expect(client.conn.ownStats!.invalid, 'invalid replays').toBeLessThanOrEqual(1);
 
         expect(hostErrors, 'RoomStats.hostErrors').toBe(0);
         expect(badEnvelopes, 'RoomStats.badEnvelopes').toBe(0);
