@@ -74,20 +74,7 @@ export interface PongSnapshot {
   ball: { x: number; y: number };
   serveIn: number;
   winner: string | null;
-  paddles: { pid: string; side: 'left' | 'right'; y: number; score: number; inputLead: number }[];
-  /** Step 3 of the loop `sim.ts`'s `onBufferHealth` opened: OUR OWN pid's
-   *  playout depth, lifted out of `paddles` in `decodeSnapshot` below. This is
-   *  the one field `RoomConnection` reads out of a host's snapshot beyond
-   *  `tick` and `serverTime`, and it is optional there: omit it and the
-   *  RTT-compensated lead applies on its own.
-   *
-   *  `| undefined` SPELLED OUT, because `exactOptionalPropertyTypes` is on:
-   *  `decodeSnapshot` below writes `mine?.inputLead`, which is genuinely
-   *  `undefined` for a snapshot that does not name us yet, and a bare
-   *  `inputLead?: number` refuses that write. It used to compile only because
-   *  nothing named this type: the connection inferred its own wider shape from
-   *  the decoder. `PongClient.conn` names it, so the two now have to agree. */
-  inputLead?: number | undefined;
+  paddles: { pid: string; side: 'left' | 'right'; y: number; score: number }[];
 }
 
 /** Must equal `pongRuntime.tickHz`. The connection is the only place it is
@@ -185,11 +172,9 @@ export function createPongClient(opts: PongClientOptions): PongClient {
    *  delivery for a keyup, and a lost keyup is a paddle that never stops. */
   let dir = 0;
 
-  // The type arguments are STATED rather than inferred from `decodeSnapshot`.
-  // Inference produced a structurally wider shape (`inputLead` present and
-  // possibly `undefined`, rather than optional), which is fine while nothing
-  // names the type and is not assignable to `PongSnapshot` the moment
-  // `PongClient` does.
+  // The type arguments are STATED rather than inferred from `decodeSnapshot`,
+  // so a decoder that drifts from `PongSnapshot` is an error here rather than
+  // a wider shape reaching `onSnapshot` and `PongClient.conn`.
   const conn = new RoomConnection<PongSnapshot, string>({
     // Required rather than defaulted, because a client silently running on the
     // wrong basis skews the tick counter, the server-tick estimate and the
@@ -208,18 +193,11 @@ export function createPongClient(opts: PongClientOptions): PongClient {
     socketUrl: opts.socketUrl,
     WebSocketImpl: opts.WebSocketImpl,
 
-    decodeSnapshot: (buf) => {
-      const snap = decode(buf);
-      // STEP 3 OF THE FEEDBACK LOOP `sim.ts`'s `onBufferHealth` OPENED: pick
-      // OUR OWN pid's depth out of the per-paddle field and hand it back as
-      // `inputLead`. The connection folds it into its stamping lead, trimming
-      // toward a two-tick cushion, so the lead converges on the smallest one
-      // that keeps the server's buffer fed rather than staying at the
-      // open-loop `rttMs + inputLeadMs` guess. Omit this and nothing breaks:
-      // the open-loop lead applies on its own.
-      const mine = snap.paddles.find((p) => p.pid === selfPid);
-      return { ...snap, inputLead: mine?.inputLead };
-    },
+    // The host's decoder and nothing else. The server's playout depth, which
+    // trims the stamping lead toward a two-tick cushion, reaches the
+    // connection on the library's own `input-lead` frame rather than through
+    // anything this snapshot carries.
+    decodeSnapshot: decode,
 
     // The connection owns the interpolator: it pushes every decoded snapshot in
     // with the right two timestamps and clears the buffer on every epoch

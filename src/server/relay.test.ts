@@ -9,6 +9,7 @@ import {
   ROOM_REJECT_FRAME,
   RELAY_EXPIRY_LEAD_MS,
   JOIN_HEARTBEAT_MS,
+  encodeDepth,
   type ClientInput,
   type RoomEnvelope,
 } from '../core/index.js';
@@ -1131,12 +1132,17 @@ describe('attachRelay', () => {
     }
 
     it('sends room-full and closes with the capacity code when the reject names its own pid', async () => {
-      const { redis, socket, onClose, keys } = await attachedRelay();
+      const log = vi.fn();
+      const { redis, socket, onClose, keys } = await attachedRelay({ log });
       await redis.publish(keys.metaout, JSON.stringify({ t: ROOM_REJECT_FRAME, pid: 'p1' }));
 
       expect(socket.sent).toEqual([JSON.stringify({ t: SERVER_FRAMES.roomFull })]);
       expect(socket.closed).toContain(CLOSE_CODES.capacity);
       expect(onClose).toHaveBeenCalledWith(CLOSE_CODES.capacity);
+      // And says so, once: the only line for a socket admitted and then turned away.
+      const lines = log.mock.calls.filter((c) => c[0]?.kind === 'relay.room-full');
+      expect(lines).toHaveLength(1);
+      expect(lines[0][0].pid).toBe('p1');
     });
 
     it('drops a reject aimed at another pid instead of forwarding it to everyone', async () => {
@@ -1170,6 +1176,71 @@ describe('attachRelay', () => {
       expect(socket.sent).toHaveLength(1);
       expect(Buffer.isBuffer(socket.sent[0])).toBe(true);
       expect(Buffer.from(socket.sent[0] as Buffer).equals(snapshot)).toBe(true);
+    });
+  });
+
+  // B4b. The ticker's depth frame is a broadcast naming every buffered pid;
+  // the relay is the only place that knows which socket carries which pid, so
+  // it is where the frame is turned into one client's own `input-lead`.
+  describe('the depth frame is aimed at this socket, never forwarded', () => {
+    async function attachedRelay(overrides: Partial<Parameters<typeof attachRelay>[0]> = {}) {
+      const { redis, socket, opts } = baseOptions({ livenessTimeoutMs: 10_000, ...overrides });
+      const handle = attachRelay(opts);
+      await new Promise((r) => setTimeout(r, 10));
+      socket.sent.length = 0;
+      return { redis, socket, handle, keys: roomKeys('r1', NS) };
+    }
+
+    it('forwards its own pid\'s depth as an input-lead frame, and nothing else out of the map', async () => {
+      const { redis, socket, handle, keys } = await attachedRelay();
+      await redis.publish(keys.metaout, encodeDepth({ p1: 3.25, p2: 0 }));
+
+      expect(socket.sent).toEqual([JSON.stringify({ t: SERVER_FRAMES.inputLead, lead: 3.25 })]);
+      // The client is told its own depth and learns nothing about p2's.
+      expect(String(socket.sent[0])).not.toContain('p2');
+      handle.close();
+    });
+
+    it('a frame that does not name this pid produces nothing: an unstamped client has no lead to steer', async () => {
+      const { redis, socket, handle, keys } = await attachedRelay();
+      await redis.publish(keys.metaout, encodeDepth({ p2: 4 }));
+      await redis.publish(keys.metaout, encodeDepth({}));
+
+      expect(socket.sent).toHaveLength(0);
+      handle.close();
+    });
+
+    it('reads OWN properties only and finite numbers only, because the pid is the client\'s claim', async () => {
+      // A pid of `constructor` against a plain-object map would read a
+      // function off the prototype; a wrong-typed value must not become a
+      // lead the client folds into its stamping arithmetic.
+      const { redis, socket, handle, keys } = await attachedRelay({ pid: 'constructor' });
+      await redis.publish(keys.metaout, encodeDepth({ p1: 1 }));
+      await redis.publish(keys.metaout, JSON.stringify({ t: 'depth', d: { constructor: 'two' } }));
+      await redis.publish(keys.metaout, JSON.stringify({ t: 'depth', d: { constructor: null } }));
+
+      expect(socket.sent).toHaveLength(0);
+      await redis.publish(keys.metaout, encodeDepth({ constructor: 2 }));
+      expect(socket.sent).toEqual([JSON.stringify({ t: SERVER_FRAMES.inputLead, lead: 2 })]);
+      handle.close();
+    });
+
+    it('is dropped rather than queued for a socket that has not opened yet', async () => {
+      // One of these a second into the eight-slot control queue would crowd
+      // out the roster seed for a value that is stale by the time the socket
+      // opens; the next interval carries a fresh one.
+      const { redis, socket, opts } = baseOptions({ livenessTimeoutMs: 10_000 });
+      socket.readyState = 0;
+      const handle = attachRelay(opts);
+      await new Promise((r) => setTimeout(r, 10));
+      const keys = roomKeys('r1', NS);
+      await redis.publish(keys.metaout, encodeDepth({ p1: 5 }));
+      socket.readyState = 1;
+      socket.fire('open');
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(socket.sent.some((f) => typeof f === 'string' && f.includes(SERVER_FRAMES.inputLead))).toBe(false);
+      handle.close();
     });
   });
 
@@ -2318,7 +2389,7 @@ describe('attachRelay', () => {
     it('drops a per-socket server frame published on the ROSTER channel, and counts it on the heartbeat', async () => {
       // Measured: one `{ t: 'room-full' }` on the roster channel latched
       // every client in the room into a terminal capacity state, closed
-      // their sockets and stopped their reconnect ladders. Four of the five
+      // their sockets and stopped their reconnect ladders. Five of the six
       // frames this library defines are per-socket and only the relay
       // holding that socket may originate one.
       const log = vi.fn();
@@ -2333,6 +2404,7 @@ describe('attachRelay', () => {
       await redis.publish(keys.metaout, JSON.stringify({ t: SERVER_FRAMES.connLimit }));
       await redis.publish(keys.metaout, JSON.stringify({ t: SERVER_FRAMES.relayExpiring, inMs: 5000 }));
       await redis.publish(keys.metaout, JSON.stringify({ t: SERVER_FRAMES.pong, n: 1, c: 2 }));
+      await redis.publish(keys.metaout, JSON.stringify({ t: SERVER_FRAMES.inputLead, lead: 3 }));
 
       expect(socket.sent).toHaveLength(0);
       expect(socket.closed).toHaveLength(0);
@@ -2341,7 +2413,7 @@ describe('attachRelay', () => {
       await new Promise((r) => setTimeout(r, 120));
       const lines = log.mock.calls.filter((c) => c[0]?.kind === 'relay.misaddressed-frame');
       expect(lines).toHaveLength(1); // once a beat, never once a frame
-      expect(lines[0][0].meta.count).toBe(4);
+      expect(lines[0][0].meta.count).toBe(5);
       handle.close();
     });
 

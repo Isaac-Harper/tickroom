@@ -24,11 +24,10 @@ simulation's own exported function, not a copy of it) on its own paddle so the
 paddle answers the key with no round trip in it. The server applies the record
 stamped for tick T on tick T, both ends therefore land on the same y, and a
 snapshot is a confirmation rather than a correction. When they do disagree, the
-difference goes into an `ErrorOffset` and is bled off over a few frames. Pong
-also closes the depth loop: `onBufferHealth` stores the server's playout depth
-per player, `encodeSnapshot` carries it per paddle, `decodeSnapshot` picks out
-its own pid's value as `inputLead`, and the connection trims its stamping lead
-to the smallest one that keeps the buffer fed.
+difference goes into an `ErrorOffset` and is bled off over a few frames. The
+depth loop that trims the stamping lead to the smallest one that keeps the
+server's buffer fed runs on the library's own frames, so nothing in pong
+carries anything for it.
 
 ## What to notice
 
@@ -155,12 +154,6 @@ the stamped path's central claim is not something a comment can assert:
   would pass forever. A second test feeds the same records in
   apply-on-arrival order and asserts the traces DIVERGE, so the first one
   cannot pass vacuously.
-- **The playout depth is excluded from the checkpoint on purpose, and the
-  exclusion is invisible to the simulation.** `onBufferHealth`'s reading
-  describes the ticker that is exiting, so `serialize` leaves it out and a
-  restore starts it empty. The test asserts the empty `Map` and then ticks
-  both rooms forward through identical input, which is what would catch a
-  tick path that had started reading it.
 
 ## The JSON-to-binary upgrade path, worked all the way through
 
@@ -187,12 +180,6 @@ is what makes the switch worth making: a full room publishing at 20Hz turns
 this file's 190-byte-per-tick saving into a real bandwidth line, and a
 two-player room barely notices either way.
 
-The per-paddle `inputLead` (the server's playout depth, the field that closes
-the feedback loop) costs **one byte per paddle** here against fourteen
-characters of JSON, which is the same argument in miniature: the field a
-binary wire adds for free is the field a JSON wire makes you think twice
-about.
-
 **Do not make this switch on day one.** Measure `bytesDelivered` first.
 `pong/sim.ts` keeps its JSON `encodeSnapshot` exactly as it was; `codec.ts` is
 presented as the upgrade a room reaches for once its entity shape has
@@ -208,12 +195,14 @@ The three things worth reading `codec.ts` for, beyond the size number:
   what makes a rolling deploy safe. A mismatched version has to fail as a
   clean, immediate throw naming the mismatch, not a decoder that reads a
   new layout's bytes at an old layout's offsets and returns a snapshot full
-  of plausible-looking garbage. **It reads 2, not 1**, because adding
-  `inputLead` to each paddle changed what the wire MEANS and not only how
-  long it is, and this repo's rule is that meaning is what a version bump
-  tracks. A v1 decoder pointed at a v2 buffer would read the next paddle's
-  pid length out of that byte, which is precisely the plausible-garbage
-  failure the check turns into a throw.
+  of plausible-looking garbage. **It reads 3**, because version 2 added a
+  per-paddle `inputLead` (the server's playout depth) and version 3 took it
+  back out once that number moved onto the library's own control frames:
+  each change altered what the wire MEANS and not only how long it is, and
+  this repo's rule is that meaning is what a version bump tracks. A v2
+  decoder pointed at a v3 buffer would read the next paddle's pid length as
+  a depth byte, which is precisely the plausible-garbage failure the check
+  turns into a throw.
 - **Quantised fields are picked with a stated range and headroom**, not
   just "the smallest type that fits today". Pong's ball and paddle
   positions use an `i16` at 1/100-unit precision, which covers -327.68 to

@@ -19,7 +19,7 @@
 // themselves are the ones a ROUTE genuinely owns: the ones it derives from the
 // request (the room id, the claims, the spawn callbacks) or from the platform
 // (the duration caps below).
-import type { ClientInput, Logger, RoomRuntime } from '../core/index.js';
+import type { ClientInput, Logger, LogKind, RoomRuntime } from '../core/index.js';
 import { MAX_TICKER_MS, RELAY_EXPIRY_LEAD_MS, baseOf, normalizeBase, normalizeRoomId } from '../core/index.js';
 import { decodeInputWindow, inputWindowToClientInputs } from '../codec/index.js';
 import type {
@@ -72,7 +72,7 @@ const RAW_ROOM_LOG_CHARS = 64;
  * the rate is not a client's to drive. See the invariant in AGENTS.md about
  * anything whose rate a client controls.
  */
-function logRoomNormalised(log: Logger | undefined, kind: string, raw: string | null, room: string): void {
+function logRoomNormalised(log: Logger | undefined, kind: LogKind, raw: string | null, room: string): void {
   if (!log || !raw || raw === room) return;
   // Guarded, like every other logger call in this library: this one runs
   // OUTSIDE the upgrade handler's own catch, so a host hook that throws would

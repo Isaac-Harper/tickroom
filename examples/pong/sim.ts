@@ -11,10 +11,11 @@
 //
 // IT IS ALSO THE REFERENCE FOR THE STAMPED PATH, which is the library's central
 // input promise and the half an example cannot leave to prose: inputs carry the
-// tick they apply on (`usesPlayout`), the paddle step is a shared pure function
-// the predicting client in client.ts runs on its own copy, and the server's
-// playout depth is echoed back down the wire (`onBufferHealth`) so the client
-// can trim its stamping lead to the smallest one that keeps the buffer fed.
+// tick they apply on (`usesPlayout`) and the paddle step is a shared pure
+// function the predicting client in client.ts runs on its own copy. The
+// server's playout depth, which trims the client's stamping lead to the
+// smallest one that keeps the buffer fed, travels on the library's own control
+// frames and needs nothing from this file.
 
 import type { ClientInput, RoomRuntime } from '../../src/core/index.js';
 
@@ -62,12 +63,6 @@ export interface PongState {
    *  players were watching. */
   seed: number;
   winner: string | null;
-  /** Server-side playout depth per pid, in ticks, as `onBufferHealth` reports
-   *  it. NOT part of the room: it describes the ticker that is running right
-   *  now, which is why `serialize` leaves it out and every restore starts it
-   *  empty. It lives in state at all because the buffer is inside the ticker
-   *  and this hook is the only route by which its depth can reach a snapshot. */
-  depth: Map<string, number>;
 }
 
 export type PongEvent =
@@ -139,7 +134,6 @@ export const pongRuntime: RoomRuntime<PongState, PongEvent> = {
       serveIn: 40,
       seed: 0x9e3779b9,
       winner: null,
-      depth: new Map(),
     };
     serve(state, 1);
     return state;
@@ -156,18 +150,6 @@ export const pongRuntime: RoomRuntime<PongState, PongEvent> = {
   // (`targetTick: 0`) still applies on arrival either way, so this costs a
   // client that does not stamp nothing at all.
   usesPlayout: () => true,
-
-  // How deep this player's buffer is running, reported every tick including
-  // starved ones. The buffer lives inside the ticker, so this hook is the ONLY
-  // route by which its depth can reach the state and therefore the snapshot:
-  // `encodeSnapshot` puts it on the wire per paddle, the client picks its own
-  // pid's value out in `decodeSnapshot` and hands it back as `inputLead`, and
-  // the connection trims its stamping lead toward the smallest one that keeps
-  // the buffer fed. Skip the hook and the loop is simply inert: an
-  // optimisation lost, not a working connection lost.
-  onBufferHealth(s, pid, health) {
-    s.depth.set(pid, health);
-  },
 
   // IDEMPOTENT, and this is a contract requirement rather than politeness. The
   // relay republishes a join every second as a heartbeat (pub/sub is lossy, so
@@ -188,7 +170,6 @@ export const pongRuntime: RoomRuntime<PongState, PongEvent> = {
 
   leave(s, pid) {
     s.paddles.delete(pid);
-    s.depth.delete(pid);
   },
 
   applyInput(s, pid, input: ClientInput) {
@@ -273,12 +254,6 @@ export const pongRuntime: RoomRuntime<PongState, PongEvent> = {
   // A Map does not survive JSON.stringify, which is the single most common way a
   // checkpoint silently loses half a room. Convert explicitly, both ways, and let
   // the round-trip test catch it if you forget.
-  //
-  // `depth` IS DELIBERATELY NOT HERE, and that is not the same mistake. It is
-  // the playout depth of the ticker that is exiting, measured against a client
-  // whose stamping lead is about to be re-anchored across the handoff, so
-  // carrying it over would hand the successor a reading about a buffer that no
-  // longer exists. The successor rebuilds it from its own first tick.
   serialize(s) {
     return JSON.stringify({
       tick: s.tick,
@@ -307,7 +282,6 @@ export const pongRuntime: RoomRuntime<PongState, PongEvent> = {
       serveIn: raw.serveIn ?? 0,
       seed: raw.seed >>> 0,
       winner: raw.winner ?? null,
-      depth: new Map(),
     };
   },
 
@@ -326,11 +300,6 @@ export const pongRuntime: RoomRuntime<PongState, PongEvent> = {
         side: p.side,
         y: Math.round(p.y * 10) / 10,
         score: p.score,
-        // Step 2 of the feedback loop `onBufferHealth` opened. Per paddle
-        // rather than "just mine", because a snapshot is published ONCE for
-        // the whole room and delivered to every player: there is no per-client
-        // snapshot to put a single value in. Each client picks out its own.
-        inputLead: s.depth.get(p.pid) ?? 0,
       })),
     });
   },

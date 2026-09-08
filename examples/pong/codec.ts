@@ -42,29 +42,25 @@ import type { PongState } from './sim.js';
  * touched. `decodeDefaultSnapshot` in `src/codec/snapshot.ts` follows the
  * same pattern for the shipped default codec.
  *
- * IT IS 2 BECAUSE THE MEANING OF THE WIRE CHANGED, not merely its length.
- * Each paddle now carries `inputLead`, the server's playout depth for that
- * player, which is a new fact about the room rather than a re-encoding of an
- * old one. The repo's rule is that a wire change bumps the version when it
- * changes MEANING and not only when it changes SHAPE (re-ordering an enum
- * moves no byte and is still a bump), so a change that does both was never a
- * judgement call. A v1 decoder reading a v2 buffer would read the next
- * paddle's pid length out of this byte, which is exactly the plausible-garbage
- * failure the version check exists to turn into a clean throw.
+ * IT IS 3 BECAUSE THE MEANING OF THE WIRE CHANGED, not merely its length.
+ * Version 2 added a per-paddle `inputLead`, the server's playout depth for
+ * that player, so the client could trim its stamping lead; version 3 takes it
+ * back out, because that number now travels on the library's own control
+ * frames and a snapshot has nothing to carry for it. The repo's rule is that
+ * a wire change bumps the version when it changes MEANING and not only when
+ * it changes SHAPE (re-ordering an enum moves no byte and is still a bump),
+ * so a change that does both was never a judgement call. A v2 decoder reading
+ * a v3 buffer would read the next paddle's pid length as this paddle's depth,
+ * which is exactly the plausible-garbage failure the version check exists to
+ * turn into a clean throw.
  */
-export const PONG_PROTOCOL_VERSION = 2;
+export const PONG_PROTOCOL_VERSION = 3;
 
 export interface DecodedPongPaddle {
   pid: string;
   side: 'left' | 'right';
   y: number;
   score: number;
-  /** The server's playout depth for this player at its last consume, in ticks,
-   *  from `RoomRuntime.onBufferHealth`. The client picks its OWN pid's value
-   *  out of the decoded snapshot and hands it back to `RoomConnection` as
-   *  `DecodedSnapshotLike.inputLead`; every other paddle's is carried for
-   *  observability and read by nothing. */
-  inputLead: number;
 }
 
 export interface DecodedPongSnapshot {
@@ -129,8 +125,7 @@ const NO_WINNER = 0xff;
  *
  *   header:  u8 version, u32 tick, f64 serverTime, i16 ballX, i16 ballY,
  *            u16 serveIn, u8 winnerIndex, u8 paddleCount
- *   paddle:  str pid (u16 length + utf8), u8 side, i16 y, u8 score,
- *            u8 inputLead
+ *   paddle:  str pid (u16 length + utf8), u8 side, i16 y, u8 score
  *            ... repeated paddleCount times
  */
 export function encodePongSnapshot(s: PongState, serverTimeMs: number): Uint8Array {
@@ -156,15 +151,6 @@ export function encodePongSnapshot(s: PongState, serverTimeMs: number): Uint8Arr
     w.u8(p.side === 'left' ? SIDE_LEFT : SIDE_RIGHT);
     w.i16(quantizePos(p.y));
     w.u8(p.score);
-    // `PlayoutBuffer.health()` is already a saturating 0..255 gauge, so this
-    // clamp is not narrowing a wider number: it is a guard on the ONE field
-    // here whose value arrives from a hook a host wired up itself. `ByteWriter`
-    // REFUSES an out-of-range integer rather than wrapping it (which is the
-    // right call for a codec), and `encodeSnapshot` is one of the few runtime
-    // methods the ticker deliberately leaves unguarded, so a stray value here
-    // would throw the tick loop rather than encode a wrong byte. Clamping is
-    // the cheap end of that trade for a field nothing renders.
-    w.u8(Math.max(0, Math.min(255, Math.round(s.depth.get(p.pid) ?? 0))));
   }
   return w.finish();
 }
@@ -204,8 +190,7 @@ export function decodePongSnapshot(buf: ArrayBuffer | Uint8Array): DecodedPongSn
     const sideByte = r.u8();
     const y = dequantizePos(r.i16());
     const score = r.u8();
-    const inputLead = r.u8();
-    paddles.push({ pid, side: sideByte === SIDE_LEFT ? 'left' : 'right', y, score, inputLead });
+    paddles.push({ pid, side: sideByte === SIDE_LEFT ? 'left' : 'right', y, score });
   }
 
   // winnerIndex came off the wire, so it is exactly as untrusted as anything

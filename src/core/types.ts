@@ -18,6 +18,8 @@
 // buffer that makes an input land on the same tick at both ends, and the client
 // that reconnects, resumes, and interpolates.
 
+import type { LogKind } from './log.js';
+
 /**
  * Anything that can be published on the snapshot channel. A `Uint8Array` is
  * strongly preferred (a binary codec is typically 5-20x smaller than the
@@ -290,27 +292,14 @@ export interface RoomRuntime<TState = unknown, TEvent = unknown> {
    * ticks. Reported every tick the ticker maintains one, and reported as 0 once
    * on the tick a buffer is dropped.
    *
-   * THE BUFFER LIVES INSIDE THE TICKER, SO THIS IS THE ONLY ROUTE BY WHICH ITS
-   * DEPTH CAN REACH YOUR STATE AND THEREFORE YOUR SNAPSHOT. That path is the
-   * whole point of the hook, and it has four steps:
-   *
-   *   1. this hook stores the depth per player in your state;
-   *   2. your `encodeSnapshot` puts it on your own wire, per player or just
-   *      the one, in whatever shape your wire already has room for;
-   *   3. your client's `decodeSnapshot` picks out ITS OWN pid's value and
-   *      returns it as `DecodedSnapshotLike.inputLead`;
-   *   4. `RoomConnection` uses that to steer its stamping lead toward a
-   *      two-tick cushion, correcting slowly and coarsely.
-   *
-   * `rttMs + inputLeadMs` is an open loop: a good guess at how much lead an
-   * input needs, made entirely from the client's side of the wire. This closes
-   * it, so the lead converges on the smallest one that keeps the buffer fed,
-   * which is the smallest input latency that player can have.
-   *
-   * ALL FOUR STEPS ARE OPTIONAL AND THE LOOP FAILS INERT. A host that never
-   * implements this hook, or has no room on its wire for the depth, simply
-   * never returns `inputLead`, and the open-loop lead applies on its own: an
-   * optimisation lost, not a working connection lost.
+   * FOR YOUR OWN STATE ONLY (a HUD, a per-player gauge on your wire). The
+   * client's stamping lead does NOT depend on this hook: the ticker publishes
+   * the same depth on its own control frame (`DEPTH_FRAME` in `core/wire.ts`),
+   * the relay forwards each client its own value as `input-lead`, and
+   * `RoomConnection` trims its lead from that. It used to take four host
+   * steps (this hook into state, `encodeSnapshot` onto the wire,
+   * `decodeSnapshot` picking the pid's value back out as `inputLead`), and
+   * the missed step was invisible: the lead simply stayed open-loop.
    *
    * Reported on starved ticks as well as consumed ones, deliberately: a starve
    * is exactly when the depth matters and is exactly when `ackTick` does not
@@ -487,8 +476,8 @@ export interface RoomStats {
    * Stamped inputs that arrived AFTER their tick had already been consumed and
    * were re-stamped forward (`PlayoutBuffer`'s never-drop-late rule). Sustained
    * lateness means that client's stamping lead is too small for its round
-   * trip; the client corrects its own lead from the `inputLead` a host echoes
-   * in its snapshot, and this is the server-side aggregate of the same fact.
+   * trip; the client corrects its own lead from the depth the ticker publishes
+   * on `DEPTH_FRAME`, and this is the server-side aggregate of the same fact.
    */
   lateInputs: number;
   /** Bytes of CONFIRMED publishes only, on the same counted-on-success rule as `publishes`: bytes that never left the process are not bandwidth. */
@@ -532,10 +521,10 @@ export interface Percentiles {
   max: number;
 }
 
-/** Structured log line. Supply a sink or accept the console default; never let it block or throw into a caller. */
+/** Structured log line. Supply a sink or accept the console default; never let it block or throw into a caller. `kind` is one of `LOG_KINDS`, so a sink can switch over it exhaustively. */
 export interface LogEvent {
   lvl: 'info' | 'warn' | 'error';
-  kind: string;
+  kind: LogKind;
   msg?: string | undefined;
   room?: string | undefined;
   pid?: string | undefined;

@@ -17,6 +17,7 @@ import {
   encodePing,
   isPongFrame,
   isRelayExpiringFrame,
+  isInputLeadFrame,
 } from '../core/index.js';
 import { ClientTick, TICK_STEP_CAP, type ClientTickView } from './clientTick.js';
 import type { SnapshotInterpolator, EntitySample, InterpolatedEntity } from './interpolation.js';
@@ -40,12 +41,14 @@ export interface SessionInfo {
 }
 
 /**
- * The FOUR fields this class reads out of a decoded snapshot, and the whole
+ * The THREE fields this class reads out of a decoded snapshot, and the whole
  * contract a host's own snapshot type has to satisfy. `tick` and `serverTime`
  * run the tick timeline and the smoothed clock; `version` drives the
- * protocol-skew check when the host opts into one; `inputLead` closes the
- * optional server-depth feedback loop. Everything else in a snapshot is the
- * host's and is carried through untouched.
+ * protocol-skew check when the host opts into one. Everything else in a
+ * snapshot is the host's and is carried through untouched. The server's
+ * playout depth is NOT read from here any more: it arrives on the library's
+ * own `input-lead` control frame (see `core/wire.ts`), so a host's snapshot
+ * carries nothing for the feedback loop.
  *
  * THERE IS NO INDEX SIGNATURE HERE, AND REMOVING IT WAS A FIX. It used to
  * carry `[k: string]: unknown`, which bought nothing (nothing in this class
@@ -65,21 +68,6 @@ export interface DecodedSnapshotLike {
   version?: number | undefined;
   tick: number;
   serverTime: number;
-  /**
-   * Optional: the server's playout depth for THIS client at its last consume,
-   * in ticks. It is the value `RoomRuntime.onBufferHealth` receives, which the
-   * host routes through its own snapshot (per player, or just this player's,
-   * as its wire allows) and picks out for its own pid inside `decodeSnapshot`.
-   * Positive means this client's stamped inputs are arriving EARLY and are
-   * sitting in the buffer; 0 means they land just in time, or late.
-   *
-   * Present, it closes a slow feedback loop that trims the stamping lead
-   * toward a two-tick cushion. Absent, the loop is simply inert and the
-   * RTT-compensated lead from `inputLeadMs` applies on its own, which is why
-   * this is optional rather than required: a host with no room on its wire
-   * loses an optimisation, not a working connection.
-   */
-  inputLead?: number | undefined;
 }
 
 /**
@@ -209,7 +197,7 @@ export interface SnapshotInterpolationOptions<TSnap, K extends string | number> 
  * consumer whose `tsconfig.json` came from a stock `tsc --init` has
  * `exactOptionalPropertyTypes` on, where `?: number` means "present with a
  * number, or absent" and REFUSES an explicit `undefined`. This library's own
- * README tells a host to write `return { ...snap, inputLead: mine?.[1] }`,
+ * README used to tell a host to write `return { ...snap, inputLead: mine?.[1] }`,
  * which is exactly that, so the quickstart did not compile under the default
  * tsconfig of the ecosystem it ships into. Same reasoning as the
  * `upgradeWebSocket` signature fix: a type that only compiles under THIS
@@ -400,7 +388,7 @@ const RTT_MAX_SAMPLE_MS = 5000;
  * of headroom at 20Hz gives the same slack back at the same latency the old
  * timing had, with the input now landing on the tick it names. A host that
  * measures its own link lower can set `inputLeadMs` down; the feedback loop
- * trims toward the target depth on its own where the server echoes it.
+ * trims toward the target depth on its own from the ticker's depth frame.
  */
 const DEFAULT_INPUT_LEAD_MS = 150;
 const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
@@ -1703,6 +1691,13 @@ export class RoomConnection<
       this.beginWarmSwap(msg.inMs);
       return;
     }
+    // The server's playout depth for THIS client, forwarded by its relay out
+    // of the ticker's depth frame. Transport bookkeeping like the pong: it
+    // steers the stamping lead and a host has nothing to do with it.
+    if (isInputLeadFrame(msg)) {
+      this.observeInputLead(now(), msg.lead);
+      return;
+    }
 
     this.emit(() => this.opts.onText?.(msg));
 
@@ -1912,8 +1907,6 @@ export class RoomConnection<
       if (wasInitialized) this.emit(() => this.opts.onTickReanchor?.(delta));
     }
 
-    this.observeInputLead(t, decoded.inputLead);
-
     // BEFORE `onSnapshot`, deliberately, and the ordering is kept even now
     // that the callback is wrapped. `emit()` stops a throw from unwinding this
     // class, and pushing first means the frame is already in the buffer when
@@ -2057,12 +2050,15 @@ export class RoomConnection<
   }
 
   /**
-   * The optional feedback half of the stamping lead. `rttMs + inputLeadMs` is
-   * an OPEN loop: it is a good guess at how much lead an input needs, made
-   * entirely from measurements taken on this side of the wire. When the host
-   * echoes back what the server's playout buffer actually saw, the loop closes
-   * and the lead converges on the smallest one that keeps the buffer fed, which
-   * is the smallest input latency this player can have.
+   * The feedback half of the stamping lead. `rttMs + inputLeadMs` is an OPEN
+   * loop: it is a good guess at how much lead an input needs, made entirely
+   * from measurements taken on this side of the wire. Once the ticker's depth
+   * frame reaches this client (one `input-lead` frame a second from its relay,
+   * carrying the mean depth of its own buffer over that second; open-loop
+   * until the first one, which is at most `DEPTH_INTERVAL_MS` after joining),
+   * the loop closes and the lead converges on the smallest one that keeps the
+   * buffer fed, which is the smallest input latency this player can have.
+   * Nothing in the host's snapshot is involved, so there is no step to miss.
    *
    * Deliberately slow and deliberately coarse: at most two ticks of correction
    * per `REANCHOR_MIN_INTERVAL_MS`, and only when the depth is at least two
@@ -2079,9 +2075,7 @@ export class RoomConnection<
    * between depths of one and three. The cushion a host wants by default is
    * set with `inputLeadMs`, not by making this loop nervous.
    */
-  private observeInputLead(nowMs: number, inputLead: number | undefined): void {
-    if (typeof inputLead !== 'number' || !Number.isFinite(inputLead)) return;
-
+  private observeInputLead(nowMs: number, inputLead: number): void {
     if (!this.depthSeeded) {
       this.depthEma = inputLead;
       this.depthSeeded = true;

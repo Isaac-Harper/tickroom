@@ -8,6 +8,7 @@
 // barrel for the browser on every run, so a regression reddens here rather than
 // downstream.
 export * from './types.js';
+export * from './log.js';
 export * from './redisLike.js';
 export * from './ids.js';
 export * from './lease.js';

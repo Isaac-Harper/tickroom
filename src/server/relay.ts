@@ -15,6 +15,9 @@ import {
   RELAY_EXPIRY_LEAD_MS,
   JOIN_HEARTBEAT_MS,
   encodePong,
+  encodeInputLead,
+  DEPTH_FRAME,
+  depthFor,
 } from '../core/index.js';
 import type { Subscriber } from './redis.js';
 
@@ -1086,10 +1089,11 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
     const text = messageBuf.toString('utf8');
     // THE ROSTER CHANNEL IS A BROADCAST, SO WHAT MAY LEAVE IT FOR A SOCKET IS
     // AN ALLOWLIST. Every frame published here reaches every relay in the
-    // room, while four of the five frames in `SERVER_FRAMES` are PER SOCKET
+    // room, while five of the six frames in `SERVER_FRAMES` are PER SOCKET
     // by construction: only this relay may tell its own client that the room
     // is full, that its subject is at the connection limit, that this relay
-    // is expiring, or what its own ping measured. Forwarding them verbatim
+    // is expiring, what its own ping measured, or how deep its own buffer
+    // runs. Forwarding them verbatim
     // meant one `{ t: 'room-full' }` on the roster channel latched every
     // client in the room into a terminal capacity state, closed their
     // sockets, and stopped their reconnect ladders: measured on an innocent
@@ -1133,6 +1137,10 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
       // that is present and does not match this connection is not ours,
       // whatever shape it arrived in.
       if (reject.c !== undefined && reject.c !== conn) return;
+      // The one refusal a relay hands out AFTER admission, and the only line
+      // that says a socket which passed the cap check was still turned away.
+      // Once per socket by construction: `cleanup` runs right after it.
+      log({ lvl: 'info', kind: 'relay.room-full', room: roomId, pid, meta: { conn } });
       sendControl(JSON.stringify({ t: SERVER_FRAMES.roomFull }));
       cleanup(CLOSE_CODES.capacity);
       try {
@@ -1142,7 +1150,30 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
       }
       return;
     }
-    // The other four library frames are per-socket and this relay is the only
+    // THE DEPTH FRAME IS CONSUMED HERE TOO, and aimed the same way. The
+    // ticker publishes one map of every buffered pid's depth once a second;
+    // this relay serves exactly one socket, so it forwards ONLY its own pid's
+    // value, as an `input-lead` control frame, and a frame that does not name
+    // this pid produces nothing at all (an unstamped client has no lead to
+    // steer, and 0 would read as "starving, lead more"). The map itself never
+    // reaches a socket: which pids are in a room is the roster's business,
+    // and a client has no use for anyone else's buffer.
+    //
+    // Only on an OPEN socket, where every other control frame is queued. A
+    // socket still CONNECTING would collect one of these a second into the
+    // eight-slot control queue, crowding out the roster seed for a value that
+    // is stale by the time the socket opens; the next interval carries a
+    // fresh one. That is also the answer for a socket that joined mid
+    // interval: its client's lead is open-loop for at most one second, which
+    // is today's behaviour on every connection, and a warm swap's
+    // replacement socket simply forwards the next frame with nothing to
+    // carry over from the old one.
+    if (frameType === DEPTH_FRAME) {
+      const lead = depthFor(frame, pid);
+      if (lead !== undefined && socket.readyState === WS_OPEN) rawSend(encodeInputLead(lead));
+      return;
+    }
+    // The other five library frames are per-socket and this relay is the only
     // thing that may originate one, so an instance arriving on the roster
     // channel is misaddressed by construction: dropped, and COUNTED on the
     // heartbeat rather than logged per frame, because the publisher chooses
