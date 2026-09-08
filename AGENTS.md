@@ -1728,6 +1728,14 @@ which drops method BIVARIANCE. A consumer that annotates a hook's parameters
 NARROWER than the contract compiled before 0.2.0 and errors now. Everything in
 this repo uses contextual typing, so nothing here saw it.
 
+THE BENCH'S OWN VERCEL PROJECT WAS REMOVED ON 2026-09-08 at the owner's request.
+Every `tickroom-bench.vercel.app` URL in this file names a deployment that no
+longer exists; the numbers stand as measured. The measurement page now lives in
+the demo app at `https://tickroom-demo.vercel.app/bench` (room base `bench`, its
+own sim with the marker entity and the per-invocation instance id), and the
+harness in the tickroom-bench repository targets that URL. The demo's own pages
+are the package's site.
+
 ## Status
 
 MEASURED ON THIS TREE, not estimated, PER TIER, on the 1.0.0 commit:
