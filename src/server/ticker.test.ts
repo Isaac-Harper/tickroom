@@ -9,6 +9,8 @@ import {
   acquireLease,
   unpackCheckpoint,
   JOIN_HEARTBEAT_MS,
+  DEPTH_INTERVAL_MS,
+  DEPTH_FRAME,
 } from '../core/index.js';
 import { decodeCheckpoint, readCheckpoint } from './checkpoint.js';
 import type { Subscriber } from './redis.js';
@@ -1901,6 +1903,72 @@ const withAlice = (): CounterState => ({
  * `TickerOptions` and never reaches a route is an option nobody can use. A
  * compile-time assertion, because the failure is a compile-time one.
  */
+describe('runTicker: the depth frame', () => {
+  /**
+   * Runs a ticker for `runMs` with one stamped player whose buffer sits at a
+   * known depth for the whole run, and returns every depth frame the roster
+   * channel carried, with when each arrived relative to the run's start.
+   */
+  async function depthRun(runMs: number, window: ClientInput[] | null) {
+    const redis = new FakeRedis();
+    const keys = roomKeys('r-depth', NS);
+    const frames: { at: number; d: Record<string, number>; bytes: number }[] = [];
+    const startedAt = Date.now();
+    const listener = redis.fork();
+    listener.on('message', (_ch: unknown, msg: unknown) => {
+      if (typeof msg !== 'string') return;
+      const parsed = JSON.parse(msg) as { t?: unknown; d?: Record<string, number> };
+      if (parsed.t === DEPTH_FRAME) frames.push({ at: Date.now() - startedAt, d: parsed.d!, bytes: Buffer.byteLength(msg) });
+    });
+    await listener.subscribe(keys.metaout);
+
+    const resultPromise = runTicker({
+      runtime: makeCounterRuntime({
+        tickHz: 50,
+        create: () => ({ tick: 0, players: new Map([['alice', { counter: 0, playout: true }]]), full: false, starves: {} }),
+      }),
+      redis,
+      createSubscriber: () => redis.fork(),
+      roomId: 'r-depth',
+      namespace: NS,
+      maxRunMs: runMs,
+      emptyGraceMs: 100_000,
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    if (window !== null) await redis.publish(keys.in, JSON.stringify({ t: 'in', pid: 'alice', w: window }));
+    const result = await resultPromise;
+    return { frames, result };
+  }
+
+  it('publishes every buffered pid\'s mean depth once per DEPTH_INTERVAL_MS, on the roster channel', async () => {
+    // Six records stamped for ticks the run will not reach inside the first
+    // interval (tick 80 at 50Hz is 1.6s in), so the buffer holds six entries
+    // on every consume of that interval and the MEAN is exactly six: a depth
+    // the client could never have learned without the host carrying it.
+    const window: ClientInput[] = [];
+    for (let k = 0; k < 6; k++) window.push({ seq: k + 1, targetTick: 80 + k, data: 1 });
+    const { frames, result } = await depthRun(DEPTH_INTERVAL_MS + 300, window);
+
+    expect(result.reason).toBe('duration');
+    expect(frames).toHaveLength(1);
+    expect(frames[0]!.d).toEqual({ alice: 6 });
+    // Not before its interval: the first frame lands one `DEPTH_INTERVAL_MS`
+    // after the loop starts, and a client that joined before it runs
+    // open-loop until then, exactly as before the frame existed.
+    expect(frames[0]!.at).toBeGreaterThanOrEqual(DEPTH_INTERVAL_MS - 50);
+    // THE BUS COST, stated rather than assumed: one frame like this per room
+    // per second, fanned out once per socket, at this many bytes per pid.
+    expect(frames[0]!.bytes).toBeLessThan(40);
+  });
+
+  it('publishes nothing at all for a room with no buffered player', async () => {
+    // An unstamped room costs the bus nothing extra: the frame exists for
+    // the stamping lead and a room with no playout buffer has none to steer.
+    const { frames } = await depthRun(DEPTH_INTERVAL_MS + 300, null);
+    expect(frames).toHaveLength(0);
+  });
+});
+
 describe('HostTickerOptions', () => {
   it('carries every host-owned option and none of the four an adapter owns', () => {
     const hostOpts: HostTickerOptions<CounterState, CounterEvent> = {
@@ -1961,8 +2029,9 @@ describe('runTicker: the host-call guard', () => {
     expect(result.reason).toBe('duration');
     expect(stats.reduce((n, s) => n + s.hostErrors, 0)).toBe(5);
     // COUNTED, NOT LOGGED PER ENVELOPE: five inputs used to produce five warn
-    // lines on a path a client's send rate drives.
-    expect(logs.filter((l) => l.kind === 'ticker.envelope-threw')).toHaveLength(0);
+    // lines on a path a client's send rate drives. The only error line the
+    // run may carry is the per-flush summary.
+    expect(logs.filter((l) => l.lvl === 'error' && l.kind !== 'ticker.host-errors')).toHaveLength(0);
     const summaries = logs.filter((l) => l.kind === 'ticker.host-errors');
     expect(summaries.length).toBeGreaterThan(0);
     expect(summaries.length).toBeLessThanOrEqual(stats.length);
@@ -2190,7 +2259,7 @@ describe('runTicker: the host-call guard', () => {
     expect(result.reason).toBe('duration');
     // Roughly twenty ticks, every one of them throwing.
     expect(stats.reduce((n, st) => n + st.hostErrors, 0)).toBeGreaterThan(10);
-    expect(logs.filter((l) => l.kind === 'ticker.onEvents-threw')).toHaveLength(0);
+    expect(logs.filter((l) => l.lvl === 'error' && l.kind !== 'ticker.host-errors')).toHaveLength(0);
     const summaries = logs.filter((l) => l.kind === 'ticker.host-errors');
     expect(summaries.length).toBeGreaterThan(0);
     expect(summaries.length).toBeLessThanOrEqual(stats.length + 1);

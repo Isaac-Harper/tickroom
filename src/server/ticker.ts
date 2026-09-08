@@ -20,6 +20,8 @@ import {
   CHECKPOINT_VERSION,
   JOIN_HEARTBEAT_MS,
   PRESENCE_TIMEOUT_HEARTBEATS,
+  DEPTH_INTERVAL_MS,
+  encodeDepth,
   packCheckpoint,
   inspectCheckpoint,
   PlayoutBuffer,
@@ -33,6 +35,7 @@ import {
   type CheckpointEnvelope,
   type RoomStats,
   type Logger,
+  type LogKind,
 } from '../core/index.js';
 import { writeCheckpoint, readCheckpoint, STATE_TTL_S } from './checkpoint.js';
 import type { Subscriber } from './redis.js';
@@ -743,7 +746,7 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
    * are deliberately NOT wrapped: those are not reached through a payload, so
    * a throw in one is a genuine loop failure and must stay one.
    */
-  function guardHost<T>(fn: () => T, hook: string, logKind?: string): T | undefined {
+  function guardHost<T>(fn: () => T, hook: string, logKind?: LogKind): T | undefined {
     const report = (err: unknown): void => {
       noteHostError(err, hook);
       // LOGGED PER CALL ONLY WHERE THE RATE IS NOT A TICK, which is the whole
@@ -945,6 +948,16 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
   const starve = new StarveTracker();
   /** Each buffer's `lateCount` as of the last stats flush, so the gauge reports the WINDOW's late inputs rather than a lifetime total that only ever climbs. */
   const lateSeen = new Map<string, number>();
+  /**
+   * Each buffer's depth summed over the current `DEPTH_INTERVAL_MS`, and how
+   * many consumes it was summed over, so the depth frame carries a MEAN
+   * rather than whatever one tick happened to read. Sampled at the same
+   * point `onBufferHealth` is reported, cleared on every publish, dropped
+   * with the buffer. A successor starts this empty, like the buffers it
+   * describes: the depth it publishes is measured against its own
+   * buffers from its own first consume, exactly as `onBufferHealth` restarts.
+   */
+  const depthSamples = new Map<string, { sum: number; n: number }>();
 
   // --- SETUP, GUARDED AS ONE UNIT ---
   //
@@ -1475,12 +1488,20 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
     if (!playouts.delete(pid)) return;
     starve.forget(pid);
     lateSeen.delete(pid);
+    // Dropped rather than zeroed: the client's frame simply stops naming
+    // this pid, and a lead the client is not steering is left where it is.
+    depthSamples.delete(pid);
     guardHost(() => runtime.onBufferHealth?.(state, pid, 0), 'onBufferHealth');
   }
 
   let ticks = 0;
   let lastCheckpointAt = 0;
   let lastStatsAt = Date.now();
+  // Dated from the loop's start, so the first depth frame lands one interval
+  // in. A client that joins before it (every client, on a fresh room) runs
+  // its lead open-loop until then, which is at most one interval and is
+  // what every connection did on every host before the frame existed.
+  let lastDepthAt = Date.now();
   let lastLoopAt = Date.now();
   let exitReason: TickerResult['reason'] = 'duration';
   // THE GRID SURVIVES A PLANNED HANDOFF, WHICH IS THE OTHER HALF OF STAMPING
@@ -2200,7 +2221,16 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
         // Hanging the health off `ackTick` instead would report it only on
         // ticks where the buffer was healthy enough to consume, which is the
         // one measurement nobody needs.
-        guardHost(() => runtime.onBufferHealth?.(state, pid, buf.health()), 'onBufferHealth');
+        const health = buf.health();
+        guardHost(() => runtime.onBufferHealth?.(state, pid, health), 'onBufferHealth');
+        // And the same reading into the library's own frame, so the client's
+        // lead closes without the host carrying anything. See `DEPTH_FRAME`.
+        const sample = depthSamples.get(pid);
+        if (sample === undefined) depthSamples.set(pid, { sum: health, n: 1 });
+        else {
+          sample.sum += health;
+          sample.n += 1;
+        }
       }
 
       // 6. the sim step itself
@@ -2371,6 +2401,29 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
               publishFails++;
               log({ lvl: 'error', kind: 'ticker.publish-failed', room: roomId, meta: { error: String(err) } });
             });
+        }
+
+        // 8b. THE DEPTH FRAME, once per `DEPTH_INTERVAL_MS` and only from the
+        // owner, like the snapshot: it describes THIS ticker's buffers, and a
+        // ticker that has lost the lease has buffers nobody is feeding. The
+        // map carries the interval's mean per buffered pid, rounded to a
+        // hundredth of a tick (the client smooths it further and rounds the
+        // correction, so more precision is bytes for nothing), and a pid
+        // with no sample this interval is simply absent. Suppressed outright
+        // when nothing is buffered, so an unstamped room costs the bus
+        // nothing. Fire-and-forget with a `.catch`, like every other publish
+        // in this loop: a lost frame is a second of open-loop lead, and the
+        // next interval carries a fresh mean rather than a retry of a stale one.
+        if (now - lastDepthAt >= DEPTH_INTERVAL_MS) {
+          lastDepthAt = now;
+          if (depthSamples.size > 0) {
+            const d: Record<string, number> = Object.create(null) as Record<string, number>;
+            for (const [pid, sample] of depthSamples) d[pid] = Math.round((sample.sum / sample.n) * 100) / 100;
+            depthSamples.clear();
+            redis.publish(keys.metaout, encodeDepth(d)).catch((err) => {
+              log({ lvl: 'error', kind: 'ticker.depth-failed', room: roomId, meta: { error: String(err) } });
+            });
+          }
         }
 
         // 9. checkpoint, gated on still owning the lease

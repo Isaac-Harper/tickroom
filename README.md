@@ -125,8 +125,6 @@ interface Player { x: number; y: number; vx: number; vy: number; }
 interface State {
   tick: number;
   players: Map<string, Player>;
-  /** Server-side playout depth per player. See `onBufferHealth` below. */
-  depth: Map<string, number>;
 }
 
 /** Units per second, per axis. Exported because the client bounds its own correction glide with it (step 3). */
@@ -152,7 +150,7 @@ export function stepPlayer(p: { x: number; y: number }, input: { x: number; y: n
 export const pong: RoomRuntime<State> = {
   tickHz: 20,
 
-  create: () => ({ tick: 0, players: new Map(), depth: new Map() }),
+  create: () => ({ tick: 0, players: new Map() }),
 
   tick(s, dt) {
     for (const p of s.players.values()) Object.assign(p, stepPlayer(p, { x: p.vx, y: p.vy }, dt));
@@ -168,16 +166,6 @@ export const pong: RoomRuntime<State> = {
   // input (`targetTick: 0`) still applies on arrival either way.
   usesPlayout: () => true,
 
-  // How many ticks deep this player's buffer is running, reported every tick
-  // including starved ones. The buffer lives inside the ticker, so this is the
-  // ONLY route by which its depth can reach your state and therefore your
-  // snapshot. Echo it back and the client trims its stamping lead to the
-  // smallest one that keeps the buffer fed. Skip the hook and the loop is
-  // simply inert: an optimisation lost, not a working connection lost.
-  onBufferHealth(s, pid, health) {
-    s.depth.set(pid, health);
-  },
-
   // Idempotent on purpose: the relay republishes a join every second as a
   // heartbeat, and a reconnecting player rejoins under the same id. A join
   // that reset position would teleport a live player once a second.
@@ -187,7 +175,6 @@ export const pong: RoomRuntime<State> = {
 
   leave(s, pid) {
     s.players.delete(pid);
-    s.depth.delete(pid);
   },
 
   applyInput(s, pid, input) {
@@ -202,9 +189,7 @@ export const pong: RoomRuntime<State> = {
 
   deserialize(json) {
     const raw = JSON.parse(json) as { tick: number; players: [string, Player][] };
-    // `depth` is deliberately not serialised: it describes the ticker that is
-    // exiting, not the room.
-    return { tick: raw.tick, players: new Map(raw.players), depth: new Map() };
+    return { tick: raw.tick, players: new Map(raw.players) };
   },
 
   encodeSnapshot(s, serverTime) {
@@ -212,7 +197,6 @@ export const pong: RoomRuntime<State> = {
       tick: s.tick,
       serverTime,
       players: [...s.players],
-      depth: [...s.depth],
     });
   },
 };
@@ -387,12 +371,8 @@ interface Snapshot {
   tick: number;
   serverTime: number;
   players: [string, { x: number; y: number }][];
-  /** From `onBufferHealth`, per pid. Optional on the wire, optional here. */
-  depth: [string, number][];
   /** Pids this tick PUT somewhere rather than moved: a respawn, an elimination. See `onSnapshot`. */
   respawned?: string[];
-  /** The one field `RoomConnection` reads out of this: your own pid's depth. */
-  inputLead?: number;
 }
 
 // The key type is REQUIRED and it is the one decision here. Pids are strings
@@ -430,8 +410,8 @@ const conn = new RoomConnection<Snapshot, string>({
   //
   // The symptom, if you ever see it: `onTickReanchor` firing every couple of
   // seconds with a delta of the SAME SIGN every time (the counter running at
-  // the wrong slope, dragged back on a timer it can never catch), and
-  // `inputLead` pinned at 0 because the playout buffer is starved on every
+  // the wrong slope, dragged back on a timer it can never catch), and the
+  // server's playout depth pinned at 0 because the buffer is starved on every
   // tick it was stamped for. A connection that looks healthy in every other
   // number.
   tickHz: 20,
@@ -478,23 +458,11 @@ const conn = new RoomConnection<Snapshot, string>({
     return session;
   },
 
-  decodeSnapshot: (buf) => {
-    const snap = JSON.parse(new TextDecoder().decode(buf)) as Snapshot;
-    // Pick YOUR OWN pid's depth out and hand it back as `inputLead`. That
-    // closes the loop the runtime's `onBufferHealth` opened, and the
-    // connection trims its stamping lead toward a two-tick cushion. Omit it
-    // and nothing breaks; the RTT-compensated lead applies on its own.
-    //
-    // `inputLead: mine?.[1]` compiles too, because the library declares the
-    // field `inputLead?: number | undefined` rather than `inputLead?: number`.
-    // That is deliberate and it is the rule every optional on a PUBLIC type in
-    // this library follows: `exactOptionalPropertyTypes` is on in a stock
-    // `tsc --init`, and under it a bare `?: number` accepts an absent key but
-    // NOT an `undefined` value, which turns every `?.` at a call site into a
-    // compile error. Write it whichever way reads better in your codec.
-    const mine = snap.depth.find(([pid]) => pid === myPid);
-    return mine ? { ...snap, inputLead: mine[1] } : snap;
-  },
+  // Your decoder and nothing else. `tick` and `serverTime` are the two fields
+  // the connection reads; the server's playout depth, which trims the
+  // stamping lead, arrives on the library's own control frame rather than
+  // through anything your snapshot carries.
+  decodeSnapshot: (buf) => JSON.parse(new TextDecoder().decode(buf)) as Snapshot,
 
   // The connection pushes every snapshot into the interpolator with the right
   // timestamps and clears it on every reconnect. You say which parts move.
@@ -825,6 +793,8 @@ Each of these cost real production time to learn. They are documented at length 
 
 **And the three `maxRooms` values must agree.** It is an independent option on the ticker route, the relay route and the balancer route, each defaulting to `MAX_ROOMS_PER_BASE` (50), and a balancer at 50 against a relay at 4 hands a client `lobby~7` that the relay refuses as out of range and silently replaces with the fallback room. The session then says one room and the snapshots come from another, while every signal on both ends reads healthy: socket open, roster populated, tick rate nominal, and the player alone in a game nobody can see them in. The tell is a `ticker.room-normalised` or `relay.room-normalised` warn, one per authenticated request, carrying the raw id that was refused. It is the only symptom this failure has, so wire the routes' `log` before you need it.
 
+**Every route takes a `log`, and what it receives is typed.** A `Logger` is `(ev: LogEvent) => void`, and `LogEvent.kind` is not a string: it is `LogKind`, the union derived from `LOG_KINDS` in `tickroom/core`, one `const` array listing every kind the library emits, grouped by emitter (`ticker.*`, `relay.*`, `node-relay.*`, `balancer.*`) with a one-line doc on each. A sink can therefore switch over it exhaustively and a `kind` the library stopped emitting is a compile error in your switch rather than a filter that quietly matches nothing; on the library's side a source test proves every kind in the list is still emitted and every kind emitted is in the list. The list is the reference for which lines exist: `ticker.fresh`, `ticker.restore` and `relay.room-full` are the positive ones, `ticker.lease-lost` carries `meta.finder`, and every counted-not-logged path (`relay.misaddressed-frame`, `ticker.host-errors`) flushes one line per cadence with a `count`. The default sink is the console; supply your own and never let it throw.
+
 **Interpolate remote entities on the SERVER's clock, never on the local arrival clock.** The server emits on a uniform grid and the network smears the arrivals; timing playback against arrival stamps replays that smear as motion, so a burst of packets plays a quarter-second of the world in three milliseconds. Measured on an entity moving at a constant 100 u/s, that read as a peak of 1568 u/s and nine visible backward rewinds, against 261 and zero for the same frames played on the server clock. The arrival stamp is still required, as the sole input to the local-versus-server clock estimate.
 
 **Never freeze a remote entity on interpolation underrun.** Extrapolate for up to 150ms. A frozen entity that then teleports reads far worse than one that drifts and is corrected, and this is the single rule most likely to be optimised away by someone who has not watched it happen.
@@ -858,7 +828,7 @@ The scale is not on the wire, so encoder and decoder must agree, and changing it
 
 **And the swap reuses the session it already has, so the token has to outlive the chain rather than one relay.** This is the one failure mode the mechanism makes more likely rather than less: past the session's `maxAgeS` every replacement is refused, with a 401 before the upgrade or a 4001 after it, the swap is discarded, and each cap quietly goes back to the cold reconnect the swap exists to remove. Nothing on the server says so, because from the relay's side a refused socket is an ordinary refused socket. A replacement that closes or errors before delivering therefore marks the session for re-mint on the next connect, so the *following* cap has a token that works. The cached session is not torn up on the spot, because the old socket is still open and still serving: the held poses and the own-pid `room-reject` check both read it in that window. A replacement that merely misses its deadline keeps the session outright, because a slow answer is far more likely to be a cold relay start than a bad token. Both count on `conn.stats().swapsFailed`. Read it against `swapsAttempted`: the two climbing together is this, and the fix is a longer `maxAgeS` on the token rather than anything in the client.
 
-**Route `onBufferHealth` into your snapshot if you want the feedback loop.** The client's stamping lead is an open-loop guess (`measured RTT + your jitter headroom`) until the server tells it how deep the playout buffer is actually running. That quantity only exists inside the ticker, so the path is: `onBufferHealth` writes it into your state, `encodeSnapshot` puts it on your wire, `decodeSnapshot` picks out your own pid's value as `inputLead`. Skip any step and the loop is simply inert, which is an optimisation lost rather than a working connection lost.
+**The depth loop closes on its own, with nothing on your wire.** The client's stamping lead is an open-loop guess (`measured RTT + your jitter headroom`) until the server tells it how deep the playout buffer is actually running. That quantity only exists inside the ticker, so the ticker publishes it: once a second, one `depth` frame on the roster channel carrying the mean depth over that second for every player it holds a buffer for, and each relay forwards its own client one `input-lead` frame with that client's value. `RoomConnection` consumes the frame the way it consumes a `pong`, so it never reaches `onText`, and trims the lead toward a two-tick cushion. A client that joins before the first frame runs open-loop for at most that one second, which is what every connection did before the frame existed. The cost is one publish per room per second of about 30 bytes plus a dozen per buffered player, fanned out once per socket: measured at 29 bytes a second beside 1,610 bytes a second of snapshots for a one-player room at 20Hz. `RoomRuntime.onBufferHealth` still fires with the same reading, for a host that wants the number in its own state for a HUD; the loop no longer depends on it.
 
 **And set the headroom before you reach for the loop.** `inputLeadMs` defaults to **150ms** and that is a swept knee rather than a chosen number: three five-minute three-client runs on a real deployment from a jittery path (round trip medians 87 to 99ms) measured `starves` of 345, 53 and 36 at 100, 150 and 200ms of headroom, over about 6,000 room ticks each. 100 to 150 is a 6.5x cut, because at 100 the cushion is one tick and the feedback loop's two-tick deadband never lifts a buffer that shallow; 150 to 200 buys another 1.5x for one more tick (50ms at 20Hz) of input latency on every action. Mobile, a container or any path with real jitter wants `inputLeadMs: 200`; a measured-lower link wants it down.
 
@@ -922,7 +892,7 @@ If bandwidth ever becomes the bill, the lever is not a bigger plan, it is ending
 
 | | |
 | --- | --- |
-| [`examples/pong`](examples/pong) | Two-player 2D game. Server-authoritative paddles and ball, and the reference for the STAMPED path: tick-stamped inputs, a paddle owned by a `PredictedEntity` running the simulation's own exported step function, and the `onBufferHealth` depth loop closed end to end. |
+| [`examples/pong`](examples/pong) | Two-player 2D game. Server-authoritative paddles and ball, and the reference for the STAMPED path: tick-stamped inputs and a paddle owned by a `PredictedEntity` running the simulation's own exported step function, with the stamping lead trimmed from the ticker's own depth frame. |
 | [`examples/cursors`](examples/cursors) | Multiplayer cursors, both halves. Not a game at all; realtime presence, at 10Hz with unstamped inputs. |
 | [`examples/node-server`](examples/node-server/README.md) | The same simulation on a plain Node `ws` server, no serverless. Its README has the run command, the env knobs, a headless Node client, and recipes for watching a planned handoff and the relay's warm swap. |
 
@@ -1424,7 +1394,7 @@ weaker.
   and cursors on the unstamped one. The bench deployment *is* the drive through
   the Vercel adapter, so what is missing here is a test rather than a
   measurement.
-- **The `inputLead` loop's two-tick target is a reasoned default, not a swept
+- **The depth loop's two-tick target is a reasoned default, not a swept
   one.** The headroom beside it is swept (100, 150 and 200ms on a real
   deployment) and the band was measured; the target itself would need the
   constant exposed as an option, which was a deliberate no.

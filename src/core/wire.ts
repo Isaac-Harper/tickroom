@@ -43,6 +43,14 @@ export const SERVER_FRAMES = {
   relayExpiring: 'relay-expiring',
   /** `{ t: 'pong', n, c }`: the echo of a client `ping`, both fields copied verbatim. */
   pong: 'pong',
+  /**
+   * `{ t: 'input-lead', lead }`: how deep the ticker's playout buffer for
+   * THIS client ran over the last `DEPTH_INTERVAL_MS`, in ticks. The relay
+   * derives it from the ticker's `DEPTH_FRAME` (below), forwarding only its
+   * own pid's value, and `RoomConnection` consumes it to trim its stamping
+   * lead. Never reaches `onText`, exactly like `pong`.
+   */
+  inputLead: 'input-lead',
 } as const;
 
 /** `t` values of the text control frames a CLIENT sends to the relay. */
@@ -69,6 +77,40 @@ export const CLIENT_FRAMES = {
  * loses only the one that was refused.
  */
 export const ROOM_REJECT_FRAME = 'room-reject';
+
+/**
+ * The ticker publishes `{ t: 'depth', d: { [pid]: ticks } }` on the roster
+ * channel every `DEPTH_INTERVAL_MS`, carrying the MEAN playout depth over that
+ * interval for every pid it currently holds a buffer for (a pid without one
+ * is absent, not 0: an unstamped client has no lead to steer). The RELAY
+ * consumes it, exactly as it consumes `room-reject`: it looks up its own pid
+ * and sends the client one `SERVER_FRAMES.inputLead`, or nothing when the
+ * frame does not name it. The frame itself is never forwarded.
+ *
+ * THIS IS THE LIBRARY'S OWN NUMBER ON THE LIBRARY'S OWN FRAMES. The depth used
+ * to reach the client only if the host routed it: `RoomRuntime.onBufferHealth`
+ * into state, `encodeSnapshot` onto its wire, `decodeSnapshot` picking its own
+ * pid's value back out. Three host steps for one library number, and the one
+ * most often missed, which left the stamping lead open-loop with nothing
+ * saying so. `onBufferHealth` stays for a host that wants the number in its
+ * own state (a HUD); the loop no longer depends on it.
+ */
+export const DEPTH_FRAME = 'depth';
+
+/**
+ * How often the ticker publishes `DEPTH_FRAME`, and why once a second. The
+ * client corrects its lead at most once per `REANCHOR_MIN_INTERVAL_MS` (2000)
+ * and against an EMA, so a faster frame buys it nothing it can act on; and
+ * the value is a MEAN over the interval rather than a point sample, so one
+ * frame carries a whole second of consumes (twenty at 20Hz) rather than one
+ * tick's reading of a buffer that jitters by a tick on a healthy link. Fixed
+ * rather than change-triggered, because a change-triggered publish is a rate
+ * a client's own stamping jitter can drive, and every client-driven rate in
+ * this library is counted and flushed on a cadence instead. The bus cost is
+ * one publish per room per second, fanned out once per socket, against
+ * `tickHz` snapshot publishes in the same second.
+ */
+export const DEPTH_INTERVAL_MS = 1000;
 
 /** The ping cadence a `RoomConnection` uses. Two seconds is frequent enough to track a mobile client's changing path and cheap enough to be free. */
 export const PING_INTERVAL_MS = 2000;
@@ -115,6 +157,16 @@ export interface RelayExpiringFrame {
   inMs: number;
 }
 
+export interface DepthFrame {
+  t: typeof DEPTH_FRAME;
+  d: Record<string, number>;
+}
+
+export interface InputLeadFrame {
+  t: typeof SERVER_FRAMES.inputLead;
+  lead: number;
+}
+
 /** The prefix test the relay uses to spot a ping without parsing every input frame. */
 export const PING_FRAME_PREFIX = '{"t":"ping"';
 
@@ -136,4 +188,34 @@ export function isRelayExpiringFrame(msg: unknown): msg is RelayExpiringFrame {
   if (typeof msg !== 'object' || msg === null) return false;
   const f = msg as { t?: unknown; inMs?: unknown };
   return f.t === SERVER_FRAMES.relayExpiring && typeof f.inMs === 'number';
+}
+
+export function encodeDepth(d: Record<string, number>): string {
+  return JSON.stringify({ t: DEPTH_FRAME, d } satisfies DepthFrame);
+}
+
+export function encodeInputLead(lead: number): string {
+  return JSON.stringify({ t: SERVER_FRAMES.inputLead, lead } satisfies InputLeadFrame);
+}
+
+export function isInputLeadFrame(msg: unknown): msg is InputLeadFrame {
+  if (typeof msg !== 'object' || msg === null) return false;
+  const f = msg as { t?: unknown; lead?: unknown };
+  return f.t === SERVER_FRAMES.inputLead && typeof f.lead === 'number' && Number.isFinite(f.lead);
+}
+
+/**
+ * The depth a `DEPTH_FRAME` carries for `pid`, or `undefined` when the frame
+ * does not name it or is not a depth frame at all. An OWN property only, and
+ * a finite number only: the pid is the client's claim and the frame came off
+ * the bus, so `d['constructor']` must not read a function off the prototype
+ * as a depth.
+ */
+export function depthFor(msg: unknown, pid: string): number | undefined {
+  if (typeof msg !== 'object' || msg === null) return undefined;
+  const f = msg as { t?: unknown; d?: unknown };
+  if (f.t !== DEPTH_FRAME || typeof f.d !== 'object' || f.d === null) return undefined;
+  if (!Object.prototype.hasOwnProperty.call(f.d, pid)) return undefined;
+  const lead = (f.d as Record<string, unknown>)[pid];
+  return typeof lead === 'number' && Number.isFinite(lead) ? lead : undefined;
 }

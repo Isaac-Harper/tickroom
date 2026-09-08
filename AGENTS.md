@@ -70,11 +70,14 @@ that entities glide back onto the confirmed path rather than snapping. See the
 arithmetic in `docs/ARCHITECTURE.md` section 1.
 
 The library also owns a small CONTROL PLANE on top of the host's own traffic:
-close codes, `ping`/`pong`, `relay-expiring`, `room-full`, `conn-limit` and the
-ticker's `room-reject`, all defined once in `src/core/wire.ts` and imported by
-both the relay and `RoomConnection`. A host's own frames never look like one:
-the relay recognises a ping by the literal prefix `{"t":"ping"` before it
-decodes anything.
+close codes, `ping`/`pong`, `relay-expiring`, `room-full`, `conn-limit`, the
+ticker's `room-reject`, and the ticker's once-a-second `depth` frame that each
+relay turns into its own client's `input-lead`, all defined once in
+`src/core/wire.ts` and imported by both the relay and `RoomConnection`. A
+host's own frames never look like one: the relay recognises a ping by the
+literal prefix `{"t":"ping"` before it decodes anything. The control plane is
+also how the stamping lead closes its loop: the playout depth travels on the
+library's frames, so a host's snapshot carries nothing for it.
 
 ## Layers, and the rule that separates them
 
@@ -127,6 +130,21 @@ whole timing guarantee rests on nothing in it ever awaiting.
 - `src/core/types.ts` - THE CONTRACT. `RoomRuntime`, `RoomEnvelope`, `ClientInput`,
   `CheckpointEnvelope`, `RoomStats`, `Logger`. Written first, deliberately, because
   everything else is built against it. Change it only with a very good reason.
+  `LogEvent.kind` is `LogKind`, not `string`: see `src/core/log.ts`.
+- `src/core/log.ts` - `LOG_KINDS`, ONE `const` array of every `LogEvent.kind`
+  the library emits, grouped by emitter with a one-line doc each, and
+  `type LogKind = (typeof LOG_KINDS)[number]`. `tsc` proves every
+  `log({ kind })` is in the union; `log.test.ts` reads the source under `src/`
+  to prove the converse, that every kind in the union is still emitted
+  somewhere and every kind-shaped literal (including one passed through a
+  parameter, which `tsc` sees as a string) is in the list. It exists because
+  the handoff diagnosis of 2026-09-06 was written against `ticker.fresh`
+  before that kind existed and nothing could say so; the day it landed it
+  also found two test assertions filtering on kinds that had never been
+  emitted (`ticker.envelope-threw`, `ticker.onEvents-threw`). ADD THE KIND
+  HERE FIRST, THEN EMIT IT. One line per emission site in a file another
+  agent is editing (`adapters/vercel.ts`'s `logRoomNormalised` takes a
+  `LogKind` parameter now) is the whole cost.
   `CheckpointEnvelope` gained OPTIONAL `gridAt`, the SCHEDULED GRID TIME of the
   tick the checkpoint describes, so a successor can continue the predecessor's
   timeline instead of restarting it at its own `Date.now()`. Optional and
@@ -136,9 +154,15 @@ whole timing guarantee rests on nothing in it ever awaiting.
   import: `CLOSE_CODES` (4001 closedByServer, 4002 capacity, 4003 connLimit,
   4004 relayUnavailable, and only the last of those is not terminal for the
   client), `SERVER_FRAMES` (`meta`, `room-full`, `conn-limit`,
-  `relay-expiring {t,inMs}`, `pong {t,n,c}`), `CLIENT_FRAMES` (`ping {t,n,c}`),
-  `ROOM_REJECT_FRAME`, `PING_INTERVAL_MS` (2000), `RELAY_EXPIRY_LEAD_MS` (5000),
-  and the encode/narrow helpers. These were string and number literals repeated
+  `relay-expiring {t,inMs}`, `pong {t,n,c}`, `input-lead {t,lead}`),
+  `CLIENT_FRAMES` (`ping {t,n,c}`), `ROOM_REJECT_FRAME`, `DEPTH_FRAME`
+  (`{ t: 'depth', d: { [pid]: ticks } }`, the ticker's once-per-
+  `DEPTH_INTERVAL_MS` (1000) broadcast of every buffered pid's MEAN playout
+  depth over the interval, consumed by the relay and never forwarded),
+  `PING_INTERVAL_MS` (2000), `RELAY_EXPIRY_LEAD_MS` (5000), and the
+  encode/narrow helpers (`encodeDepth`, `encodeInputLead`, `isInputLeadFrame`,
+  `depthFor(frame, pid)`, which reads OWN properties and finite numbers only
+  because the pid is the client's claim). These were string and number literals repeated
   in the client, two adapters and an example, and the client latched a terminal
   reason off a code an adapter happened to pick, so a change on one side could
   not be seen from the other. Pure constants, so `core` stays browser-safe.
@@ -404,6 +428,26 @@ whole timing guarantee rests on nothing in it ever awaiting.
   `EXIT_SPAWN_WAIT_MS` is exported so the test can pin it and deliberately NOT
   re-exported from the server barrel: it is a coupling to check, not a knob to
   turn.
+  AND THE DEPTH FRAME, which is how the client's stamping lead closes its loop
+  without the host carrying anything. Every consume samples `buf.health()`
+  into `depthSamples` (sum and count per pid, at the same point
+  `onBufferHealth` is reported, dropped with the buffer), and once per
+  `DEPTH_INTERVAL_MS` the OWNER publishes `encodeDepth(mean per pid)` on
+  `keys.metaout`, rounded to a hundredth of a tick, suppressed outright when
+  nothing is buffered, fire-and-forget with `ticker.depth-failed` on a
+  rejection. `lastDepthAt` is dated from the loop's start, so the first frame
+  lands one interval in and a client that joined before it runs open-loop for
+  at most a second (what every connection did before the frame existed); a
+  successor starts the samples empty like the buffers they describe, so its
+  depth restarts from its own first consume exactly as `onBufferHealth`
+  does. A MEAN rather than a point sample because one frame then carries a
+  second of consumes rather than one tick's reading of a buffer that jitters
+  by a tick on a healthy link, and a FIXED cadence rather than a
+  change-triggered one because a change-triggered publish is a rate a
+  client's stamping jitter can drive. Cost: one publish per room per second
+  of about 30 bytes plus a dozen per buffered pid, fanned out once per
+  socket; `tests/depth.redis.test.ts` measured 29 B/s beside 1,610 B/s of
+  snapshots for one 20Hz player.
 - `src/server/relay.ts` - `attachRelay`, `checkAdmission`, `HostRelayOptions`.
   One socket to the bus, and now also a CONSUMER of the control plane: a
   `room-reject` naming its own pid ends this socket rather than being forwarded,
@@ -477,6 +521,24 @@ whole timing guarantee rests on nothing in it ever awaiting.
   `RelayHandle.gapsSample()` exposes the window in progress for a host that
   wants the numbers on its own cadence. See the attribution invariant for how
   to read one of those lines against a client's own gap.
+  AND IT CONSUMES THE TICKER'S `depth` FRAME the way it consumes `room-reject`:
+  the frame is a broadcast naming every buffered pid, this relay serves one
+  socket, so it forwards ONLY `depthFor(frame, pid)` as an `input-lead`
+  control frame and drops the map, and a frame that does not name this pid
+  produces nothing (an unstamped client has no lead to steer, and a 0 would
+  read as "starving, lead more"). Sent through `rawSend` on an OPEN socket
+  only, never queued: one of these a second into the eight-slot control queue
+  would crowd out the roster seed for a value stale by the time the socket
+  opens, and the next interval carries a fresh one. That is also the whole
+  answer for a warm swap, whose replacement socket forwards the next frame
+  with nothing to carry over. `SERVER_FRAMES` is six now and five are
+  per-socket, so a forged `input-lead` on the roster channel is dropped and
+  counted as misaddressed like the other four. The first version of this
+  branch forwarded a depth frame that did not name the pid as a HOST frame,
+  which the relay test caught before it shipped. AND IT LOGS
+  `relay.room-full` (info) when it honours a `room-reject`: the one refusal
+  handed out after admission, and the only line that says a socket which
+  passed the cap check was still turned away.
 - `src/server/memoryRedis.ts` - THE IN-MEMORY REDIS, AND IT SHIPS. `MemoryRedis`
   is the former test fake under its real name: three plain Maps (strings, hashes,
   sorted sets) plus a pub/sub bus, shared through a `Hub` so `fork()` hands back a
@@ -849,9 +911,12 @@ whole timing guarantee rests on nothing in it ever awaiting.
   since the last `frame()` (`projectedTick`, capped at `TICK_STEP_CAP` and
   only once a frame has run this epoch), so a sub-frozen main-thread hitch
   is not read as drift while every other use of `tick.value` stays raw; an
-  unanchor on a frozen render frame; the optional
-  `inputLead` feedback loop; a WARM SWAP at the relay's lifetime cap (counted on
-  `relaySwaps`); holding the last poses until the new epoch's first snapshot;
+  unanchor on a frozen render frame; the server-depth feedback loop, fed
+  from the relay's `input-lead` control frame (consumed in `handleTextFrame`
+  beside `pong` and `relay-expiring`, never handed to `onText`; the
+  `inputLead` field `DecodedSnapshotLike` used to carry is GONE, so the
+  interface is `version?`, `tick`, `serverTime` and nothing else); a WARM SWAP
+  at the relay's lifetime cap (counted on `relaySwaps`); holding the last poses until the new epoch's first snapshot;
   terminals `'conn-limit'` (was `'rate-limited'`), `'connect-error'` and
   `'mint-failed'`; a 4001 before this epoch delivered anything read as a stale
   token that re-mints; `start({ remint })` after a terminal; `room-full`,
@@ -1068,9 +1133,10 @@ whole timing guarantee rests on nothing in it ever awaiting.
 - `examples/pong/` - THE SHIPPED STAMPED REFERENCE, and the claim
   "no shipped example stamps inputs end to end" is retired. `sim.ts` exports
   `readDir` and `stepPaddleY`, ONE definition of the paddle rule run by both
-  ends, plus `usesPlayout` and an `onBufferHealth` that writes the server's
-  playout depth into `PongState.depth` (deliberately NOT serialised: it
-  describes the ticker that is exiting, not the room). `client.ts` IS IN TWO
+  ends, plus `usesPlayout`. It implements no `onBufferHealth` and carries no
+  depth on its wire any more: the loop that trims the client's lead runs on
+  the library's own `depth`/`input-lead` frames, and the example is the proof
+  that a host has nothing to route. `client.ts` IS IN TWO
   HALVES, AND THE SPLIT IS THE DOM. `createPongClient` is all of the netcode
   and none of the browser (the connection, the decode, the interpolator, the
   `PredictedEntity` and the `frame()`-then-`advance()` ordering the three
@@ -1087,8 +1153,8 @@ whole timing guarantee rests on nothing in it ever awaiting.
   and the draw between tick states that this file used to hand-write are the
   library's now, and two of those four rules were wrong here until the day
   before that landed. `codec.ts` is
-  `PONG_PROTOCOL_VERSION` 2, because adding `inputLead` per paddle changed what
-  the wire MEANS. `sim.test.ts` (23 cases) is the differential test: the
+  `PONG_PROTOCOL_VERSION` 3: 2 added `inputLead` per paddle and 3 took it back
+  out, and each changed what the wire MEANS. `sim.test.ts` (23 cases) is the differential test: the
   client's `stepPaddleY` against the server's `applyInput` plus `tick` on the
   same stamped ticks, EXACT equality over 60 ticks, with a contrast case that
   applies the same records on arrival with a tick of jitter and asserts the
@@ -1197,7 +1263,19 @@ whole timing guarantee rests on nothing in it ever awaiting.
   is a coordinate the server has never held (the join seats a cursor at 0.5,
   0.5), so an arrival is proof the input crossed the wire and mutated the
   server's state. CI collects it, and `tests/helpers/env.ts`'s counting
-  sentences say TWELVE files now.
+  sentences say THIRTEEN files now.
+- `tests/depth.redis.test.ts` - integration file THIRTEEN: the depth loop
+  closed with the host carrying NOTHING. A real ticker on the toy counter
+  runtime with only `usesPlayout: () => true` added (no `onBufferHealth`, no
+  depth field on its JSON snapshot), a real relay on a real `ws` socket, and a
+  `RoomConnection` at `inputLeadMs: 500` (ten ticks at 20Hz) stamping one
+  record per advanced tick. It taps both bus channels and asserts the client
+  ran open-loop at ten ticks first, the ticker's own frames read that buffer
+  at nine deep, the lead then came down by at least two ticks (measured: ten
+  to two over four corrections at `REANCHOR_MIN_INTERVAL_MS`), the server's
+  reading came down with it (9 to 5), no `input-lead` ever reached `onText`,
+  and the depth frames cost under a twentieth of the snapshot bytes (29 B/s
+  against 1,610). About 14 seconds.
 - `tests/memory.test.ts` - THE ONE FILE IN `tests/` THAT NEEDS NOTHING, which is
   why it is named without the `.redis` and why it never skips. It is file ten's
   shape with the bus swapped out: `createMemoryRedis()` supplies the command
@@ -2830,11 +2908,11 @@ nothing here saw it.
 
 ## Status
 
-MEASURED ON THIS TREE, not estimated: `npx vitest run` collects 1161 tests
-across 44 files (with a local Redis up on 6399, so the TWELVE integration files
+MEASURED ON THIS TREE, not estimated: `npx vitest run` collects 1171 tests
+across 46 files (with a local Redis up on 6399, so the THIRTEEN integration files
 run rather than skip; pointed at an unreachable one with
-`TICKROOM_TEST_REDIS_URL=redis://127.0.0.1:6499` it is 1098 passed and 63
-skipped across 32 files run and 12 skipped, still exit 0, because
+`TICKROOM_TEST_REDIS_URL=redis://127.0.0.1:6499` it is 1107 passed and 64
+skipped across 33 files run and 13 skipped, still exit 0, because
 `tests/memory.test.ts` needs nothing and runs either way); the last fw13 run of
 the same suite, at the 1130 it collected at 0.2.0 before the 0.3.0 client work,
 `src/testing/lockstep.test.ts` and the relay's fragment cases, was exit 0 with
@@ -5083,10 +5161,10 @@ the render loop" rather than "the network", and closing that needs a
 
 ### Verified against a real Redis and a real socket
 
-`tests/` runs against a REAL Redis (twelve files, 63 cases), not the fake.
-A thirteenth file, `tests/memory.test.ts`, sits in the same directory and needs
+`tests/` runs against a REAL Redis (thirteen files, 64 cases), not the fake.
+A fourteenth file, `tests/memory.test.ts`, sits in the same directory and needs
 nothing at all, which is the whole claim it exists to check, so `vitest run
-tests` collects 64 cases and only 63 of them can skip. Start one with
+tests` collects 65 cases and only 64 of them can skip. Start one with
 `redis-server --port 6399 --save '' --appendonly no --daemonize yes`, then
 `npm run test:integration`. Every key is namespaced per run (`itest-{uuid}`) and
 deleted afterwards, so it never disturbs a shared instance, and the suite SKIPS
@@ -5199,24 +5277,43 @@ feedback loop from a signal this library's own comment calls a biased PROXY. A
 wrong-but-plausible control loop nobody can measure is the exact failure this
 repo is built to avoid.
 
-WHAT WAS BUILT, WHICH IS FOUR STEPS AND NO NEW WIRE FRAME:
+WHAT WAS BUILT ON 2026-09-02, AND WHAT REPLACED IT ON 2026-09-07. The rebuild
+routed the depth through the HOST: `RoomRuntime.onBufferHealth` into state,
+`encodeSnapshot` onto the host's wire, `decodeSnapshot` picking its own pid's
+value back out as `DecodedSnapshotLike.inputLead`, and `RoomConnection` reading
+that. Four steps and no new wire frame, and every step optional. The trouble
+was the optionality: three of the four steps were the host's, the one most
+often missed (the `decodeSnapshot` pick) left the lead open-loop with nothing
+anywhere saying so, and the README's routing paragraph was the most commonly
+skipped paragraph in it. So the number travels on the library's own frames now:
 
-1. `src/server/ticker.ts` calls `RoomRuntime.onBufferHealth(state, pid, depth)`
-   on every tick it maintains a buffer for that player, on the STARVED path as
-   well as the consumed one, and once with 0 on the tick a buffer is dropped.
-   The buffer lives in the ticker's own Map, so this is the only route by which
-   its depth can reach the host's state.
-2. The HOST writes that depth into its own snapshot, per player or just the one,
-   as its wire allows. Nothing in the library dictates the shape, which is the
-   whole reason this needs no `TickerOptions` formatter and no new control frame.
-3. The host's `decodeSnapshot` picks out its OWN pid's value and returns it as
-   `DecodedSnapshotLike.inputLead`.
-4. `RoomConnection` reads it: an EMA (`DEPTH_EMA_ALPHA` 0.2) against a target of
-   `TARGET_DEPTH_TICKS` (2), corrected by at most two ticks and at most once per
-   `REANCHOR_MIN_INTERVAL_MS`, and only when the depth is at least two ticks off
-   target. The correction lands as `feedbackTicks` inside `desiredTick()`, so it
-   arrives as one ordinary re-anchor with an `onTickReanchor` delta rather than
-   as a silent drift.
+1. `src/server/ticker.ts` still calls `RoomRuntime.onBufferHealth(state, pid,
+   depth)` on every tick it maintains a buffer for that player, on the STARVED
+   path as well as the consumed one, and once with 0 on the tick a buffer is
+   dropped. That hook is for a host that wants the number in its own state (a
+   HUD); nothing below depends on it.
+2. The same reading is summed per pid, and once per `DEPTH_INTERVAL_MS` (1000)
+   the owning ticker publishes `{ t: 'depth', d: { [pid]: mean } }` on the
+   roster channel: every buffered pid, the interval's mean, absent when there
+   is no buffer, suppressed when nothing is buffered at all.
+3. Each RELAY consumes the frame and forwards ONLY its own pid's value to its
+   one socket as `{ t: 'input-lead', lead }`, on an open socket, never queued.
+4. `RoomConnection` consumes `input-lead` in `handleTextFrame` beside `pong`
+   and `relay-expiring` (it never reaches `onText`) and feeds it to the same
+   `observeInputLead`: an EMA (`DEPTH_EMA_ALPHA` 0.2) against
+   `TARGET_DEPTH_TICKS` (2), corrected by at most two ticks and at most once
+   per `REANCHOR_MIN_INTERVAL_MS`, and only when the depth is at least two
+   ticks off target. The correction lands as `feedbackTicks` inside
+   `desiredTick()`, so it arrives as one ordinary re-anchor with an
+   `onTickReanchor` delta rather than as a silent drift.
+
+THE THREE ORDERINGS, STATED. A relay that joined before the first depth frame
+(every relay, on a fresh room, for up to one interval) leaves its client
+open-loop until the frame arrives, which is what every connection did on every
+host before this. A warm relay swap carries nothing: the replacement socket
+forwards the next frame. The ticker's own successor starts its samples empty,
+like its buffers, so the depth restarts from its first consume exactly as
+`onBufferHealth` restarts.
 
 THE CLIENT TICK STILL DOES NOT DILATE, AND THAT IS THE DESIGN CHANGE. The old
 seam steered the RATE the counter advanced at, which is a control loop over
@@ -5225,13 +5322,9 @@ which is a coarse correction a couple of times a minute against a quantity the
 server actually measured. The open loop (`rttMs + inputLeadMs`) is a good guess
 made entirely from this side of the wire; closing it converges the lead on the
 smallest one that keeps the buffer fed, which is the smallest input latency that
-player can have.
-
-IT IS OPTIONAL AT EVERY STEP, deliberately. A host that never implements
-`onBufferHealth`, or has no room on its wire for the depth, simply never returns
-`inputLead`, the loop is inert, and the RTT-compensated lead applies on its own.
-That is an optimisation lost, not a working connection lost, which is why
-`inputLead` is optional on `DecodedSnapshotLike` rather than required.
+player can have. It is measured end to end in `tests/depth.redis.test.ts`: a
+client at ten ticks of headroom comes down to two over four corrections with a
+runtime that implements no `onBufferHealth` and a snapshot with no depth on it.
 
 ### Owed before a 1.0
 
@@ -5418,9 +5511,11 @@ its reasoning and everything unstruck is open today.
   `examples/cursors` stays unstamped as a deliberate documented contrast, and
   its comments point at pong rather than sketching the shape hypothetically.
 - ~~The buffer-health seam~~ LANDED, in a different shape from the one this file
-  used to specify: the depth reaches the client through the HOST's own snapshot
-  (`onBufferHealth` to `inputLead`) and steers the stamping LEAD rather than
-  dilating the tick RATE. See the section above it. Still owed: the two-tick
+  used to specify: the depth reaches the client on the library's own frames
+  (the ticker's `depth`, the relay's `input-lead`) and steers the stamping
+  LEAD rather than dilating the tick RATE. It went through the host's snapshot
+  first (`onBufferHealth` to `inputLead`) and that route is gone. See the
+  section above it. Still owed: the two-tick
   TARGET is a reasoned default rather than a swept one. The band beside it is
   no longer only reasoned: on 2026-09-03 a one-tick deadband was measured on
   the deployment and was worse (re-anchors 1 to 4, 6 and 8 per client per

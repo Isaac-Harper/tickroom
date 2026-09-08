@@ -1351,24 +1351,31 @@ describe('RoomConnection re-anchor', () => {
 });
 
 describe('RoomConnection server-depth feedback', () => {
+  /**
+   * Feed `count` snapshots 50ms apart, each preceded by an `input-lead`
+   * control frame carrying `lead` when one is given. The frame is what the
+   * relay forwards out of the ticker's depth frame; the snapshot carries
+   * nothing for the loop, which is the whole point of the frame.
+   */
   async function feed(
     deliver: (s: DecodedSnapshotLike) => void,
     conn: RoomConnection<DecodedSnapshotLike, string>,
     count: number,
     startTick: number,
-    inputLead?: number,
+    lead?: number,
   ): Promise<number> {
     let tick = startTick;
     for (let i = 0; i < count; i++) {
       await vi.advanceTimersByTimeAsync(50);
-      deliver({ tick, serverTime: performance.now(), inputLead });
+      if (lead !== undefined) live().message(JSON.stringify({ t: 'input-lead', lead }));
+      deliver({ tick, serverTime: performance.now() });
       conn.frame();
       tick++;
     }
     return tick;
   }
 
-  it('trims the lead when the host echoes back a server buffer that is running early', async () => {
+  it('trims the lead when the relay reports a server buffer that is running early', async () => {
     useMonotonicFakeTimers();
     const { conn, deliver } = clockRoom({ inputLeadMs: 100 });
     await conn.start();
@@ -1385,7 +1392,10 @@ describe('RoomConnection server-depth feedback', () => {
     conn.stop();
   });
 
-  it('is inert when the snapshot does not carry the field, and the RTT-compensated lead applies alone', async () => {
+  it('is inert until the first input-lead frame, and the RTT-compensated lead applies alone', async () => {
+    // A client that joined before the ticker's first depth frame, which is
+    // every client for up to one `DEPTH_INTERVAL_MS`: open-loop, exactly as
+    // every connection was before the frame existed.
     useMonotonicFakeTimers();
     const { conn, deliver } = clockRoom({ inputLeadMs: 100 });
     await conn.start();
@@ -1395,6 +1405,24 @@ describe('RoomConnection server-depth feedback', () => {
     const leadBefore = conn.desiredTick() - conn.estimateServerTick();
     tick = await feed(deliver, conn, 60, tick);
     expect(conn.desiredTick() - conn.estimateServerTick()).toBeCloseTo(leadBefore, 5);
+    conn.stop();
+  });
+
+  it('the input-lead frame is consumed by the library and never reaches onText', async () => {
+    // Transport bookkeeping, like the pong: a host has no opinion about the
+    // depth of a buffer it does not own, and one that switched on `t` in its
+    // own `onText` would otherwise have to know to skip it.
+    useMonotonicFakeTimers();
+    const onText = vi.fn();
+    const { conn, deliver } = clockRoom({ inputLeadMs: 100, onText });
+    await conn.start();
+    live().open();
+
+    await feed(deliver, conn, 64, 100, 10);
+    live().message(JSON.stringify({ t: 'meta', map: {} }));
+    expect(conn.desiredTick() - conn.estimateServerTick()).toBeCloseTo(0, 5);
+    expect(onText).toHaveBeenCalledTimes(1);
+    expect(onText).toHaveBeenCalledWith({ t: 'meta', map: {} });
     conn.stop();
   });
 
@@ -3642,9 +3670,9 @@ describe('RoomConnection server-depth feedback is bounded', () => {
   it('a pathological inputLead stream moves feedbackTicks by at most 2 per correction and never past PLAYOUT_MAX_AHEAD / 2 - leadTicks, and an error under 2 changes nothing', async () => {
     // The thing being controlled is the input latency every action in the game
     // passes through, so the loop is deliberately slow and deliberately coarse.
-    // `inputLead` is a number the HOST routes through its own snapshot, which
-    // makes a wild one an ordinary decoder bug rather than an attack, and an
-    // uncapped step turns one into the whole stamping lead in a single frame.
+    // The lead arrives on a control frame from a socket the client does not
+    // control, so a wild one is a forgery as easily as a bug, and an uncapped
+    // step turns one into the whole stamping lead in a single frame.
     useMonotonicFakeTimers();
     const leadTicks = 2; // ceil(inputLeadMs 100 / tickMs 50)
 
@@ -3657,7 +3685,8 @@ describe('RoomConnection server-depth feedback is bounded', () => {
       let tick = 1000;
       for (let i = 0; i < count; i++) {
         await vi.advanceTimersByTimeAsync(500);
-        deliver({ tick, serverTime: performance.now(), inputLead });
+        live().message(JSON.stringify({ t: 'input-lead', lead: inputLead }));
+        deliver({ tick, serverTime: performance.now() });
         conn.frame();
         tick += 10;
         // No pong is ever answered, so `rttMs()` is 0 and this is exactly
@@ -3669,7 +3698,7 @@ describe('RoomConnection server-depth feedback is bounded', () => {
     }
 
     // A server buffer permanently a thousand ticks short of target, which is
-    // the shape of a host that echoes the wrong field.
+    // the shape of a forged frame.
     const starved = await run(-1000, 60);
     const jumps = starved.slice(1).map((v, i) => Math.abs(v - starved[i]!));
     expect(Math.max(...jumps)).toBeLessThanOrEqual(2 + 1e-6);

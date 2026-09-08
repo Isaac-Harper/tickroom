@@ -60,7 +60,6 @@ export interface Snap {
   /** Which ticker instance published this snapshot, so a handoff is visible from the client. */
   inst: string;
   entities: Record<string, { x: number; y: number }>;
-  inputLead?: number;
   leads: Record<string, number>;
 }
 
@@ -557,11 +556,7 @@ export async function runSmoothness(opts: SmoothnessOptions): Promise<Smoothness
       mint: async () => ({ token: 'tok', playerId: pid, handle: 1, room: roomId }),
       socketUrl: (s) => `ws://127.0.0.1:${port}/?room=${roomId}&pid=${s.playerId}&subject=${s.playerId}`,
       WebSocketImpl: sockets.Ctor,
-      decodeSnapshot: (buf) => {
-        const p = JSON.parse(decoder.decode(buf)) as Snap;
-        p.inputLead = p.leads?.[pid];
-        return p;
-      },
+      decodeSnapshot: (buf) => JSON.parse(decoder.decode(buf)) as Snap,
       interpolate: {
         into: interp,
         entities: (snap) => {
