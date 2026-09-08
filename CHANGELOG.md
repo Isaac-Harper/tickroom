@@ -5,7 +5,39 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.0] - Unreleased
+## [1.0.0] - 2026-09-08
+
+The release that makes the client half one object and the server half one call.
+Everything a host used to wire by hand between two objects (three call orders on
+a predicted entity, four routes restating the same facts, a playout depth routed
+through its own snapshot) is the library's now.
+
+### Migrating from 0.3
+
+Each line is a break and its replacement, most likely first.
+
+- `conn.frame(now)` is `conn.frame(now, input)` once `predict` is set. Omitting
+  the input is a `TypeError` naming the option, thrown before anything moves.
+- A hand-held `PredictedEntity` becomes `predict: { step, maxSpeed, ownPose }`
+  on the connection. Delete the `advance`, `reconcile` and `snapTo` call sites;
+  draw `frame().own` and read `conn.own` / `conn.ownStats`.
+- `DecodedSnapshotLike.inputLead` is gone. Delete the field from your snapshot,
+  your `encodeSnapshot` and your `decodeSnapshot`: the depth reaches the client
+  on the library's own `depth` and `input-lead` frames instead.
+- The input wire is binary by default. An input that is not `DefaultInput`
+  (`{ axes: [x, y], buttons }`) needs `predict.wire: 'json'`, which is exactly
+  the 0.3.x frame, or `predict.encodeInput`.
+- The default `decodeInput` returns `[]` for malformed input instead of
+  throwing. A host that counted those on `onBadInput` writes a `decodeInput`
+  that throws.
+- `LogEvent.kind` is `LogKind` rather than `string`. A sink that switches over
+  it exhaustively compiles; one that manufactures a kind of its own does not.
+- `interpolate.into` is optional, so `new SnapshotInterpolator()` on the line
+  above the connection can go. `conn.interpolator` is the handle either way.
+- Four hand-mounted routes become one `createRoom` call. The three factories
+  are still exported and still supported as the low-level form.
+- `npm test` is three scripts. `test:unit` needs nothing, `test:integration` is
+  the release gate, `test:measure` needs a quiet machine.
 
 ### Changed
 
@@ -49,8 +81,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `decodeInputAuto`.
 - **`interpolate.into` is optional.** The connection constructs a
   `SnapshotInterpolator` with the default options when it is omitted; the key
-  type comes off `interpolate.entities`. Pass it to pin the delay bounds or to
-  keep a handle.
+  type comes off `interpolate.entities`. Pass it to pin the delay bounds, or
+  read `conn.interpolator` for the one the connection is driving either way.
 - **The one-entity-per-connection rule is gone.** A second `PredictedEntity`
   on the same `conn` used to throw a `RangeError` from a module-level
   `WeakMap`. The connection now builds exactly one for `predict`, which is what
@@ -67,9 +99,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TInput`,** defaulting to `DefaultInput` and inferred from `predict.step`. A
   host that states the first two and passes a `predict` whose input is a
   different shape states the third as well.
+- **The playout depth travels on the library's own frames, and
+  `DecodedSnapshotLike.inputLead` is gone.** The ticker publishes one `depth`
+  frame per room per second on the roster channel carrying the mean playout
+  depth of every buffered pid, each relay forwards its own client's value as an
+  `input-lead` control frame, and `RoomConnection` consumes it beside `pong`
+  (it never reaches `onText`). The 0.3.x route was four host-owned steps
+  (`onBufferHealth` into state, onto the wire, out of `decodeSnapshot`, into
+  `inputLead`) and the one most often missed left the stamping lead open-loop
+  with nothing saying so. `DecodedSnapshotLike` is `version?`, `tick` and
+  `serverTime` and nothing else; `RoomRuntime.onBufferHealth` still fires with
+  the same reading for a host that wants it in its own state. Measured at 29
+  bytes a second beside 1,610 of snapshots for one 20Hz player.
+- **`LogEvent.kind` is `LogKind`, not `string`.** `LOG_KINDS` in
+  `tickroom/core` is one `const` array of every kind the library emits
+  (`ticker.*`, `relay.*`, `node-relay.*`, `balancer.*`, `ticker.fresh` among
+  them), grouped by emitter with a one-line doc each, and `LogKind` is its
+  union. A sink can switch over it exhaustively, and a kind the library stopped
+  emitting is a compile error in that switch rather than a filter matching
+  nothing. `tsc` proves every `log({ kind })` is in the union and `log.test.ts`
+  reads the source to prove the converse.
+- **`createRelayRoute` takes `maxAgeS`.** It is passed into the route's own
+  `verifyToken`, which previously always took the 12 hour default, so an expiry
+  a session states is one the socket path enforces. `adapters/node` honours it
+  the same way through the option type it derives.
+- **The suite is three scripts rather than one.** `npm run test:unit` needs no
+  service anywhere, `npm run test:integration` (unit plus integration, a real
+  Redis) is the release gate, and `npm run test:measure` is the wall-clock tier
+  that runs nightly and by hand on a quiet machine, one file at a time.
+  `TICKROOM_TIER` in `vitest.config.ts` selects them, `tests/tiers.test.ts`
+  fails the unit tier if a file under `tests/` is in no tier, and the release
+  workflow stands up the same Redis service CI does and requires it.
 
 ### Added
 
+- `createRoom` in `tickroom/adapters/vercel`, the primary entry point: one bag
+  (`runtime`, `secret`, `rooms`, `maxDurationS`, `namespace?`,
+  `upgradeWebSocket`, and `ticker`/`relay`/`balancer` partials as escape
+  hatches) returning `{ ticker, ws, session, balancer, config }`, each a
+  `(req: Request) => Promise<Response>`. Every shared fact is stated once, so a
+  relay admitting 20 against a balancer assigning for 8, or a ticker on
+  `maxDurationS: 300` beside a relay on 800, is unreachable rather than silent.
+  It validates at creation, which is module evaluation.
+  `createTickerRoute`, `createRelayRoute` and `createBalancerRoute` are still
+  exported and documented as the low-level form.
+- `room.session`, the session route made real: it answers the `SessionInfo`
+  shape `RoomConnection.mint` expects, refuses a room its own pool does not
+  recognise with 400 rather than reassigning it, and takes `sub` from the body
+  only when it is short and key-safe.
+- `namespace` at the top level of `createRoom`, applied to all three factories
+  before the escape hatches. It prefixes keys AND channels, which is the seam
+  that actually separates two deployments: a Redis DB index does not, because
+  pub/sub is instance-wide.
+- `RoomConnection.interpolator`: the `SnapshotInterpolator` this connection is
+  driving, whether it was passed as `interpolate.into` or built by the
+  constructor, so a host that omits `into` can still read `delayMs` and
+  `underrunRate`. `null` without `interpolate`.
 - `predict` on `RoomConnectionOptions` (`PredictionOptions`), `frame(now,
   input)`, `FrameView.own`, `conn.own` and `conn.ownStats`.
 - `interpolate.teleported(snap)`: the keys this snapshot PUT somewhere. The
@@ -82,6 +167,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PredictionOptions` in `tickroom/client`.
 - `wire` and `encodeInput` on `PredictedEntityOptions`, `LockstepOptions` and
   `PredictionOptions`.
+- `LOG_KINDS` and `LogKind` in `tickroom/core`, and `DEPTH_FRAME`,
+  `encodeDepth`, `encodeInputLead`, `isInputLeadFrame` and `depthFor` in
+  `src/core/wire.ts` for the control plane both ends import.
+- `relay.room-full` (info), the one line that says a socket which passed the
+  cap check was still turned away.
+- `.github/workflows/nightly.yml`, which runs the measurement tier on a
+  schedule, uploads its log and blocks nothing.
 
 ## [0.3.1] - 2026-09-07
 

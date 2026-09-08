@@ -787,6 +787,17 @@ export class RoomConnection<
   }
 
   /**
+   * The interpolator this connection is driving: the one passed as
+   * `interpolate.into`, or the one the constructor built when `into` was
+   * omitted. `null` without `interpolate`. It exists because `into` is
+   * optional now, and a host that omits it would otherwise have no way to
+   * reach `delayMs` or `underrunRate` at all.
+   */
+  get interpolator(): SnapshotInterpolator<K> | null {
+    return this.interp;
+  }
+
+  /**
    * Start, restart after a `stop()`, or restart after a TERMINAL. Resolves
    * once the first connect attempt has been dispatched, not once a socket is
    * open: use `onStatus`/`onSnapshot` to observe readiness. Rejects only if

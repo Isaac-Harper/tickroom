@@ -4216,6 +4216,35 @@ describe('RoomConnection owns the prediction', () => {
     expect(conn.frame(1000).entities.get('p2')).toMatchObject({ x: 7, y: 9 });
     conn.stop();
   });
+
+  it('`interpolator` hands back the one it is driving, given or built', async () => {
+    // The whole point of the getter: a host that omits `into` still has to be
+    // able to read `delayMs` and `underrunRate`, and before this there was no
+    // route to the object at all.
+    interface Snap extends DecodedSnapshotLike {
+      players: { id: string; x: number; y: number }[];
+    }
+    const base = {
+      tickHz: 20,
+      mint: vi.fn().mockResolvedValue(makeSession()),
+      WebSocketImpl: IMPL,
+      socketUrl: () => 'ws://x',
+      decodeSnapshot: (): Snap => ({ tick: 100, serverTime: Date.now(), players: [{ id: 'p2', x: 7, y: 9 }] }),
+    };
+    const entities = (snap: Snap) => new Map(snap.players.map((p) => [p.id, { x: p.x, y: p.y }]));
+
+    const given = new SnapshotInterpolator<string>();
+    const withInto = new RoomConnection<Snap, string>({ ...base, interpolate: { into: given, entities } });
+    expect(withInto.interpolator).toBe(given);
+
+    const built = new RoomConnection<Snap, string>({ ...base, interpolate: { entities } });
+    expect(built.interpolator).toBeInstanceOf(SnapshotInterpolator);
+    expect(built.interpolator).not.toBe(given);
+    expect(typeof built.interpolator?.delayMs).toBe('number');
+
+    const none = new RoomConnection<Snap, string>({ ...base });
+    expect(none.interpolator).toBeNull();
+  });
 });
 
 describe('RoomConnection input wire', () => {
