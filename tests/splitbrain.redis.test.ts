@@ -85,7 +85,7 @@ import { randomUUID } from 'node:crypto';
 import { type LogEvent, type RoomRuntime, roomKeys } from '../src/core/index.js';
 import { runTicker, getRedis, createSubscriber, resetRedisForTests } from '../src/server/index.js';
 import { createCounterRuntime, type CounterEvent, type CounterState } from './helpers/toyRuntime.js';
-import { TIMER_JITTER } from './helpers/jitter.js';
+import { TIMER_JITTER, TOO_JITTERY, jitterSkipReason } from './helpers/jitter.js';
 import { startProxy, proxyTargetFrom, type FaultProxy, type ReplyShape } from './helpers/proxy.js';
 import {
   TEST_REDIS_URL,
@@ -99,7 +99,19 @@ import {
 const REDIS_AVAILABLE = await probeRedisAvailable();
 if (!REDIS_AVAILABLE) console.warn(`[tickroom integration: splitbrain] ${skipReason()}`);
 
-const d = REDIS_AVAILABLE ? describe : describe.skip;
+// THE WHOLE FILE IS A WALL-CLOCK MEASUREMENT, which is why it is in the
+// `measure` tier (`vitest.config.ts`) rather than on the release gate. Every
+// case here shapes a real connection with a real proxy, kills a real ticker,
+// and then compares two clocks: an overlap in milliseconds, a lapse landing a
+// TTL after the death, a successor in within a poll. The lapse assertions carry
+// NO slack term at all by design (see the header), and `SCHEDULING_SLACK_MS`
+// caps its allowance at 3x, so a host past that cap is a host whose readings
+// are the runner's rather than the library's. It skips there, loudly, rather
+// than widening a bound derived from the shipped constants: see
+// `helpers/jitter.ts`.
+if (TOO_JITTERY) console.warn(jitterSkipReason('splitbrain'));
+
+const d = REDIS_AVAILABLE && !TOO_JITTERY ? describe : describe.skip;
 
 /** Repetitions of every case. One is the CI form; the long form is for a quiet machine that can afford the sweep. */
 const REPS = Math.max(1, Math.floor(Number(process.env.TICKROOM_SPLITBRAIN_REPS ?? '1')) || 1);

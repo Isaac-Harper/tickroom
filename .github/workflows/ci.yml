@@ -1,16 +1,37 @@
+# WHICH TIER THIS RUNS, AND WHY: `unit` and `integration`, never `measure`.
+#
+# The suite is split three ways in `vitest.config.ts` and the split is about
+# what a shared runner can honestly answer. `unit` and `integration` are
+# decided by the code: a checkpoint round trips or it does not, a lease is
+# refused or it is not, a subscriber survives a reconnect or it dies. Those are
+# the same answer on any machine, so they belong on a required check.
+# `measure` is decided by the wall clock, and a GitHub runner is a shared,
+# noisy, unpredictable machine: the v0.3.0 release failed twice on two
+# different timing bounds while the same commit was green locally both times.
+# So the measurement tier runs in `nightly.yml`, on a schedule, blocking
+# nothing, and this workflow does not run it at all.
+#
 # Two jobs, split by what they need rather than by what they are.
 #
-# `check` runs everything that works with no services at all, which is the same
-# set a contributor runs locally. The integration files under `tests/` are in
-# the default `vitest run` glob and SKIP cleanly here, by design: they are
-# covered by the second job and duplicating them would just make this one slow.
+# `unit` runs `test:unit` with NO services anywhere, which is the claim the
+# library makes to a consumer who never stands up a Redis: `createMemoryRedis`
+# is the bus and `tests/memory.test.ts` is the file that checks it. It is also
+# the fast half, so a typo reddens in a minute rather than in ten.
 #
-# `integration` is the job the library actually owes (AGENTS.md, "Owed before a
-# 1.0": the integration suite needs a Redis service container to run in CI). It
-# is the only place `ioredis` meets a real server, a real TTL expires on the
-# server's own clock, a lease is contested by concurrent clients, and the
-# handoff claim that is the headline of this library is executed rather than
-# asserted.
+# `integration` is the job the library actually owes. It is the only place
+# `ioredis` meets a real server, a real TTL expires on the server's own clock,
+# a lease is contested by concurrent clients, and the handoff claim that is the
+# headline of this library is executed rather than asserted. The tier INCLUDES
+# the unit files rather than replacing them, so this job is a superset of the
+# first: the first exists for its no-services promise and its speed, not to
+# cover something this one misses.
+#
+# A few wall-clock cases still ride along inside `ticker.redis.test.ts` and
+# `faults.redis.test.ts`, because the rest of each file is deterministic and
+# worth gating on. Those cases are gated on `TOO_JITTERY` inside the file, so a
+# loaded runner skips them loudly with the measured number in the reason rather
+# than reddening on a bound it has no instrument for. See
+# `tests/helpers/jitter.ts`.
 name: CI
 
 on:
@@ -26,8 +47,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check:
-    name: typecheck, unit tests, build
+  unit:
+    name: typecheck, unit tier, build
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -53,14 +74,17 @@ jobs:
       # a linter added by CI rather than by the repo is a config nobody can run
       # locally. Add `"lint"` to package.json first, then a step here.
 
-      - name: Unit tests
-        run: npx vitest run
+      # NO REDIS SERVICE ON THIS JOB, ON PURPOSE. The unit tier must pass with
+      # nothing listening anywhere, and the only way to keep that true is to run
+      # it somewhere nothing is listening.
+      - name: Unit tier
+        run: npm run test:unit
 
       - name: Build
         run: npm run build
 
   integration:
-    name: integration tests (real Redis)
+    name: integration tier (real Redis)
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -92,14 +116,21 @@ jobs:
 
       - run: npm ci
 
-      - name: Integration tests
+      - name: Build
+        run: npm run build
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Integration tier
         env:
           TICKROOM_TEST_REDIS_URL: redis://127.0.0.1:6399
           # THE FLAG THAT STOPS THIS JOB PASSING VACUOUSLY. The suite skips
           # cleanly when Redis is unreachable, which is right on a laptop and
           # wrong here: a misnamed service or a wrong port would otherwise
-          # produce a green job that ran no assertions at all. With this set,
-          # an unreachable Redis throws from the probe at collection time and
-          # the job fails. See tests/helpers/env.ts.
+          # produce a green job that ran no assertions at all. The `npm run
+          # test:integration` script sets it too; it is repeated here so the
+          # job's own file states the requirement rather than inheriting it
+          # silently from a script somebody could edit. See tests/helpers/env.ts.
           TICKROOM_REQUIRE_REDIS: '1'
         run: npm run test:integration

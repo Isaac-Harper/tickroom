@@ -42,11 +42,23 @@ import { PADDLE_SPEED, pongRuntime, type PongEvent, type PongState } from '../ex
 import { decodePongSnapshot, encodePongSnapshot, type DecodedPongSnapshot } from '../examples/pong/codec.js';
 import { createPongClient } from '../examples/pong/client.js';
 import { TEST_REDIS_URL, probeRedisAvailable, newNamespace, flushNamespace, skipReason, waitFor } from './helpers/env.js';
+import { TOO_JITTERY, jitterSkipReason } from './helpers/jitter.js';
 
 const REDIS_AVAILABLE = await probeRedisAvailable();
 if (!REDIS_AVAILABLE) console.warn(`[tickroom integration: example] ${skipReason()}`);
 
-const d = REDIS_AVAILABLE ? describe : describe.skip;
+// THE ONE CASE IN THIS FILE IS A WALL-CLOCK MEASUREMENT, which is why the file
+// is in the `measure` tier (`vitest.config.ts`) rather than on the release
+// gate. It runs a real client on a 16ms timer for the whole run and then
+// asserts a snapshot rate inside +-10% of 20Hz, a paddle step that is EXACTLY
+// one tick of `PADDLE_SPEED` on every unsaturated step, and zero frames that
+// failed to draw. A host that cannot hold a 16ms timer produces a rate outside
+// the band and doubled or skipped steps, neither of which is a fact about the
+// library, and none of the three can be loosened without deleting what they
+// pin. It skips there, loudly: see `helpers/jitter.ts`.
+if (TOO_JITTERY) console.warn(jitterSkipReason('example'));
+
+const d = REDIS_AVAILABLE && !TOO_JITTERY ? describe : describe.skip;
 
 /** The example's own rate, read off the runtime rather than restated, so a change to pong moves this with it. */
 const TICK_HZ = pongRuntime.tickHz;
