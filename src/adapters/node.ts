@@ -125,6 +125,7 @@ export function attachNodeRelay(wss: any, opts: NodeRelayServerOptions): void { 
     connStaleMs,
     maxPlayers,
     maxSocketsPerSubject,
+    maxAgeS,
     joinMeta,
     spawnTicker,
     // Destructured out rather than left in `relay`, because `admitSocket`
@@ -148,9 +149,11 @@ export function attachNodeRelay(wss: any, opts: NodeRelayServerOptions): void { 
       // same reason: `verifyToken` needs the pid/handle the caller already
       // believes it is talking to, so a token minted for one player cannot
       // be replayed to authenticate as a different one by forging the query
-      // string alone.
+      // string alone. `maxAgeS` rides through for the same reason it does
+      // there: an expiry the mint states and the socket path ignores is an
+      // expiry only on paper.
       const claims: TokenClaims | null =
-        pid && Number.isFinite(handle) ? verifyToken(token, { pid, handle }, { secret }) : null;
+        pid && Number.isFinite(handle) ? verifyToken(token, { pid, handle }, { secret, maxAgeS }) : null;
       if (!claims) {
         ws.close(CLOSE_CODES.closedByServer);
         return;

@@ -19,8 +19,9 @@
 // themselves are the ones a ROUTE genuinely owns: the ones it derives from the
 // request (the room id, the claims, the spawn callbacks) or from the platform
 // (the duration caps below).
-import type { Logger } from '../core/index.js';
-import { MAX_TICKER_MS, RELAY_EXPIRY_LEAD_MS, normalizeBase, normalizeRoomId } from '../core/index.js';
+import type { ClientInput, Logger, RoomRuntime } from '../core/index.js';
+import { MAX_TICKER_MS, RELAY_EXPIRY_LEAD_MS, baseOf, normalizeBase, normalizeRoomId } from '../core/index.js';
+import { decodeInputWindow, inputWindowToClientInputs } from '../codec/index.js';
 import type {
   AdmitSocketOptions,
   HostRelayOptions,
@@ -34,6 +35,7 @@ import {
   createSubscriber,
   getRedis,
   makeSpawnToken,
+  makeToken,
   runTicker,
   verifySpawnToken,
   verifyToken,
@@ -493,6 +495,24 @@ export type VercelRelayRouteOptions = Omit<HostRelayOptions, 'joinMeta' | 'spawn
      */
     tickerUrl: string;
     /**
+     * How old a session token may be and still open a socket, in seconds.
+     * Defaults to `verifyToken`'s own 12 hours.
+     *
+     * THIS IS THE VERIFYING HALF OF A NUMBER THE MINT ALSO STATES, and the two
+     * have to be the same one. A session route minting one-hour tokens against
+     * a relay that accepts twelve-hour ones has an expiry only on paper: the
+     * token that outlived its intended life is still redeemable for a socket,
+     * which is the exact failure `session.ts`'s header calls not optional.
+     * `createRoom` states it once and passes it to both, which is the reason
+     * this option exists.
+     *
+     * AND SIZE IT AGAINST THE RELAY LIFETIME CHAIN, NOT AGAINST ONE RELAY: the
+     * warm swap at a relay's cap reuses the session already on hand, so a token
+     * that expires part way along the chain has every replacement after it
+     * refused and every cap back to costing a cold reconnect, silently.
+     */
+    maxAgeS?: number | undefined;
+    /**
      * Called with the verified claims; return extra join metadata (a display
      * name, a colour). This stands in for `RelayOptions.joinMeta`, which is a
      * fixed value: one route serves every socket, so the value has to be
@@ -586,6 +606,7 @@ export function createRelayRoute(opts: VercelRelayRouteOptions): (req: Request) 
     maxPlayers,
     maxSocketsPerSubject,
     tickerUrl,
+    maxAgeS,
     joinMeta,
     upgradeWebSocket,
     maxDurationS = relayRouteConfig.maxDuration,
@@ -614,7 +635,7 @@ export function createRelayRoute(opts: VercelRelayRouteOptions): (req: Request) 
     const pid = url.searchParams.get('pid');
     const handle = Number(url.searchParams.get('h'));
     const claims: TokenClaims | null =
-      pid && Number.isFinite(handle) ? verifyToken(token, { pid, handle }, { secret }) : null;
+      pid && Number.isFinite(handle) ? verifyToken(token, { pid, handle }, { secret, maxAgeS }) : null;
     if (!claims) {
       return new Response('unauthorized', { status: 401 });
     }
@@ -812,6 +833,407 @@ export function createBalancerRoute(
 
     return jsonResponse(result, 200);
   };
+}
+
+// ---------------------------------------------------------------------------
+// The four routes, composed. Everything below this line is wiring over the
+// three factories above plus `makeToken`; it decides nothing they do not.
+// ---------------------------------------------------------------------------
+
+/**
+ * The room pool, STATED ONCE.
+ *
+ * These four values are the ones a host used to write out three or four times,
+ * and a disagreement between any two of them is silent by construction. The
+ * balancer assigns for `maxPlayers` while the relay admits to its own copy, so
+ * 8 against 20 means a room the balancer calls full while twelve seats sit
+ * empty, or a room the balancer keeps filling that the ticker then bounces.
+ * `maxRooms` disagreeing hands a client `lobby~7` that the relay silently
+ * replaces with the fallback (see `logRoomNormalised`). `isValidBase` and
+ * `fallbackRoom` disagreeing put the session's room and the socket's room in
+ * different places. None of that is reachable from here: there is one of each.
+ */
+export interface VercelRoomsOptions {
+  /** See `normalizeRoomId` in `core`: must recognise only base ids your registry actually serves. */
+  isValidBase(base: string): boolean;
+  /** The room a request that names none, or names one this pool refuses, is served. Must itself be valid: it is trusted unchecked. */
+  fallbackRoom: string;
+  /** Capacity per room INSTANCE, read by the relay's admission check and by the balancer's assignment at once. */
+  maxPlayers: number;
+  /** Instances per base. Defaults to `MAX_ROOMS_PER_BASE` in all four routes, which is the same default they had separately. */
+  maxRooms?: number | undefined;
+}
+
+/**
+ * How the default session route mints. Every field is optional, and a host
+ * with no accounts needs none of them.
+ */
+export interface VercelRoomSessionOptions {
+  /**
+   * How long a minted token stays redeemable, in seconds. Defaults to
+   * `verifyToken`'s 12 hours, and is passed to the RELAY as well as to the
+   * mint, because an expiry only one of the two knows about is not one.
+   */
+  maxAgeS?: number | undefined;
+  /**
+   * Extra claims for this request's token: a real account id as `sub`, a
+   * stable `handle`, anything else your own code reads back off the verified
+   * claims at the relay. Whatever it returns WINS over the generated values,
+   * and the response reports the identity that was actually signed.
+   *
+   * Claims are baked in here and no auth provider is consulted again on the
+   * socket path, which is the point (it keeps an auth outage off the hot
+   * path) and the reason the expiry above matters.
+   */
+  claims?: ((req: Request, body: unknown) => Partial<TokenClaims> | Promise<Partial<TokenClaims>>) | undefined;
+  /**
+   * Which room this session is for. Defaults to `room` from the JSON body,
+   * then `?room=`, then `rooms.fallbackRoom`. Returning null refuses the
+   * request with a 400, exactly as an unrecognised room id does: whatever this
+   * returns is still put through `normalizeRoomId`, so a hook cannot mint a
+   * token for an id the relay would not accept.
+   */
+  room?: ((req: Request, body: unknown) => string | null) | undefined;
+}
+
+export type VercelRoomOptions<TState, TEvent> = {
+  runtime: RoomRuntime<TState, TEvent>;
+  /** Signs session tokens AND spawn tokens, for all four routes. Never exposed to a browser. */
+  secret: string;
+  rooms: VercelRoomsOptions;
+  /**
+   * The `maxDuration` your ticker and relay route files export, in seconds.
+   * Defaults to `tickerRouteConfig.maxDuration`.
+   *
+   * ONE NUMBER, TWO LIFETIMES. The ticker derives `maxRunMs` from it and the
+   * relay derives `lifetimeMs` from it, and they used to be typed into two
+   * files: a ticker on 300 next to a relay on 800 is a room whose sockets
+   * outlive their tick loop by eight minutes, with nothing anywhere reporting
+   * it. Both routes still check their own derived lifetime at creation, so a
+   * number too small to fit its margin throws here with the failing route's
+   * name in the message.
+   */
+  maxDurationS?: number | undefined;
+  /** Injected, never imported: see `createRelayRoute`. `experimental_upgradeWebSocket` from `@vercel/functions`. */
+  upgradeWebSocket: VercelRelayRouteOptions['upgradeWebSocket'];
+  /** Where the relay sends its ticker spawn. Relative, so it resolves against the request's own origin. Defaults to `/api/ticker`. */
+  tickerUrl?: string | undefined;
+  /**
+   * Reads a client frame into inputs. Defaults to `defaultDecodeInput`: a JSON
+   * text frame (what `PredictedEntity` sends) or a binary frame through
+   * `tickroom/codec`'s input window, sniffed by type.
+   */
+  decodeInput?: ((data: unknown) => ClientInput[]) | undefined;
+  /** Passed through to the relay. See `VercelRelayRouteOptions`. */
+  joinMeta?: VercelRelayRouteOptions['joinMeta'];
+  /** Passed through to the relay. COUNT, NEVER LOG: it fires at a rate the client owns. */
+  onBadInput?: HostRelayOptions['onBadInput'];
+  /** Passed through to the relay. The twin of `onBadInput`, for the frames the token bucket rejects before the decoder runs. */
+  onRateDrop?: HostRelayOptions['onRateDrop'];
+  session?: VercelRoomSessionOptions | undefined;
+  /**
+   * THE ESCAPE HATCHES, APPLIED LAST. Everything a factory accepts is
+   * reachable through the matching bag here (`init`, `geomKey`, `metaPayload`,
+   * `log`, `namespace`, every bound and every observability hook), and a key
+   * that also appears above WINS over the composed value, because a host
+   * reaching for one of these is asking for exactly that.
+   *
+   * A shared fact set in one of these is set in ONE route only, which is the
+   * failure this whole function exists to remove: state `maxPlayers`,
+   * `maxRooms`, `maxDurationS`, `secret`, `isValidBase` and `fallbackRoom`
+   * above, and use these for what genuinely differs between the routes.
+   */
+  ticker?: Partial<VercelTickerRouteOptions<TState, TEvent>> | undefined;
+  relay?: Partial<VercelRelayRouteOptions> | undefined;
+  balancer?: Partial<VercelBalancerRouteOptions> | undefined;
+};
+
+/** The four handlers, plus the two route configs a host reads its `runtime`/`maxDuration` literals from. */
+export interface VercelRoom {
+  /** `app/api/ticker/route.ts`, as its `GET`. */
+  ticker: (req: Request) => Promise<Response>;
+  /** `app/api/ws/route.ts`, as its `GET`. */
+  ws: (req: Request) => Promise<Response>;
+  /** `app/api/session/route.ts`, as its `POST`. */
+  session: (req: Request) => Promise<Response>;
+  /** `app/api/room/route.ts`, as its `GET`. */
+  balancer: (req: Request) => Promise<Response>;
+  /**
+   * STILL DOCUMENTATION, NOT SOMETHING TO RE-EXPORT: Next reads `runtime` and
+   * `maxDuration` out of a route file's source text, so both stay literals in
+   * the route file itself. See `tickerRouteConfig`.
+   */
+  config: { ticker: typeof tickerRouteConfig; relay: typeof relayRouteConfig };
+}
+
+/** Where the relay spawns a ticker when it finds no live lease, unless a host says otherwise. */
+const DEFAULT_TICKER_URL = '/api/ticker';
+
+/** Longest `sub` the default session route will take from a request body. See `readSubject`. */
+const MAX_SUBJECT_CHARS = 64;
+
+/**
+ * What a `sub` taken from an untrusted body may contain.
+ *
+ * `sub` IS A REDIS KEY SEGMENT, not merely a label: `admitSocket` counts a
+ * player's sockets in `<connNamespace>:conns:<sub>`, and Redis key names have
+ * no escaping. So a body-supplied subject goes through the same kind of filter
+ * `normalizeBase` applies to a base id, for the same reason: a ':' would let
+ * one client's sockets be counted in another subject's set (or in no set that
+ * anything prunes), which disables the per-subject cap for whoever asks.
+ * Anything outside this class falls back to the generated `d.<pid>` rather
+ * than being sanitised into something adjacent, because a trust boundary that
+ * best-effort rewrites is not one.
+ */
+const SAFE_SUBJECT = /^[A-Za-z0-9._~@-]+$/;
+
+/**
+ * The default `decodeInput`: the README's own hand-written decoder, plus the
+ * binary path the shipped codec already implements.
+ *
+ * SNIFFED BY TYPE, because the two frames are genuinely different transports
+ * and a host running both should not have to write the branch. A `string` is a
+ * text frame, which is what `PredictedEntity` sends (one JSON array of
+ * `{ targetTick, data }` records per message, the last few ticks re-sent whole
+ * so a lost packet does not starve a tick); bytes are an `encodeInputWindow`
+ * frame. Anything else decodes to `[]`.
+ *
+ * Fragmentation is NOT handled here and does not need to be: `attachRelay`
+ * joins a fragmented message before any decoder sees it.
+ *
+ * A host whose client sends something else passes its own `decodeInput`. This
+ * one is a default, not a protocol.
+ */
+export function defaultDecodeInput(data: unknown): ClientInput[] {
+  if (typeof data === 'string') {
+    // Left to THROW on malformed JSON, deliberately: the relay catches it,
+    // drops the frame and fires `onBadInput`, which is the seam that exists to
+    // count it. Returning `[]` here would report a broken client as an
+    // ordinary empty window.
+    const parsed = JSON.parse(data) as ClientInput | ClientInput[];
+    return Array.isArray(parsed) ? parsed : [parsed];
+  }
+  if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+    // `decodeInputWindow` answers ANY malformed frame with `[]` rather than
+    // throwing, including a crafted `count`, so this path needs no guard of
+    // its own. See its doc comment.
+    return inputWindowToClientInputs(decodeInputWindow(data as ArrayBuffer | Uint8Array));
+  }
+  return [];
+}
+
+/** One field off a JSON body that may be anything at all, including not an object. */
+function bodyField(body: unknown, key: string): unknown {
+  if (typeof body !== 'object' || body === null) return undefined;
+  return (body as Record<string, unknown>)[key];
+}
+
+/** The durable identity behind the pid: the body's own `sub` when it is short and safe, else one derived from the pid. See `SAFE_SUBJECT`. */
+function readSubject(body: unknown, pid: string): string {
+  const raw = bodyField(body, 'sub');
+  if (typeof raw === 'string' && raw.length > 0 && raw.length <= MAX_SUBJECT_CHARS && SAFE_SUBJECT.test(raw)) {
+    return raw;
+  }
+  return `d.${pid}`;
+}
+
+/**
+ * The README's hand-written session route, made real.
+ *
+ * It answers `{ token, playerId, handle, room }`, which is the `SessionInfo`
+ * shape `RoomConnection.mint` expects, and it is the one of the four pieces
+ * that was never a factory: every host copied thirty lines out of the
+ * quickstart and every copy restated the secret, the fallback room and the
+ * room validator a fourth time. The identity in the response is the identity
+ * that was SIGNED, not the one that was generated, so a `claims` hook that
+ * supplies its own pid or handle does not desynchronise the token from the
+ * query string the relay checks it against.
+ *
+ * `pid` is random here because this route has no accounts. A host with them
+ * passes `session.claims` and returns its own user id: it is also the key the
+ * per-subject socket cap counts against.
+ */
+function createSessionRoute(opts: {
+  secret: string;
+  rooms: VercelRoomsOptions;
+  session: VercelRoomSessionOptions;
+}): (req: Request) => Promise<Response> {
+  const { secret, rooms, session } = opts;
+
+  return async function sessionRoute(req: Request): Promise<Response> {
+    if (req.method !== 'POST') {
+      return jsonResponse({ error: 'method not allowed' }, 405);
+    }
+
+    // A body is OPTIONAL: the quickstart client posts none at all, and
+    // `Request.json()` throws on an empty one. Every reader below already
+    // handles `undefined`, so a missing or unparseable body is simply a
+    // request that supplied no fields rather than a 400.
+    let body: unknown;
+    try {
+      body = await req.json();
+    } catch {
+      body = undefined;
+    }
+
+    // A HOOK'S `null` IS A REFUSAL AND MUST NOT FALL THROUGH, which is why
+    // this is a branch rather than a chain of `??`: `??` cannot tell "this
+    // host says no" from "this host said nothing", and reading the first as
+    // the second would serve the fallback room to the request a host wrote
+    // that hook to turn away.
+    let requested: string | null;
+    if (session.room) {
+      requested = session.room(req, body);
+    } else {
+      const fromBody = bodyField(body, 'room');
+      requested =
+        typeof fromBody === 'string'
+          ? fromBody
+          : new URL(req.url).searchParams.get('room') ?? rooms.fallbackRoom;
+    }
+    if (requested === null) {
+      return jsonResponse({ error: 'unknown room' }, 400);
+    }
+
+    // REFUSED, NOT REASSIGNED. `normalizeRoomId` answers an id it cannot
+    // validate with the fallback, which is right on the socket path (a
+    // hostile `?room=` must never become a key name) and wrong here: a client
+    // that asked for one room and was quietly minted a session for another
+    // joins a game it did not ask for, and the only place that could have
+    // told it is this response. So anything that does not come back
+    // unchanged, whether refused outright or merely spelled non-canonically,
+    // is a 400 the client can see.
+    const room = normalizeRoomId(requested, {
+      isValidBase: rooms.isValidBase,
+      fallback: rooms.fallbackRoom,
+      maxRooms: rooms.maxRooms,
+    });
+    if (room !== requested) {
+      return jsonResponse({ error: 'unknown room' }, 400);
+    }
+
+    const extra: Partial<TokenClaims> = (await session.claims?.(req, body)) ?? {};
+    const pid = typeof extra.pid === 'string' ? extra.pid : crypto.randomUUID();
+    const handle = typeof extra.handle === 'number' ? extra.handle : Math.floor(Math.random() * 65535);
+    const sub = typeof extra.sub === 'string' ? extra.sub : readSubject(body, pid);
+
+    const claims: TokenClaims = { pid, handle, sub };
+    // Every other claim copied through by VALUE TYPE, not merely by key.
+    // `verifyToken` fails closed on a claim that is not a string or a number,
+    // so a hook returning an object or an `undefined` would mint a token this
+    // deployment's own relay refuses, on every socket, silently.
+    for (const [key, value] of Object.entries(extra)) {
+      if (key === 'pid' || key === 'handle' || key === 'sub') continue;
+      if (typeof value === 'string' || typeof value === 'number') claims[key] = value;
+    }
+
+    const token = makeToken(claims, { secret, maxAgeS: session.maxAgeS });
+    return jsonResponse({ token, playerId: pid, handle, room }, 200);
+  };
+}
+
+/**
+ * THE WHOLE ROOM, IN ONE CALL, and the reason to prefer it over the four
+ * factories: every fact below is stated once and used everywhere it applies.
+ *
+ * ```ts
+ * const room = createRoom({
+ *   runtime: pong,
+ *   secret: process.env.SESSION_SECRET!,
+ *   rooms: { isValidBase: (b) => b === 'pong', fallbackRoom: 'pong', maxPlayers: 20 },
+ *   maxDurationS: 800,
+ *   upgradeWebSocket: experimental_upgradeWebSocket,
+ * });
+ * export const { ticker, ws, session, balancer } = room;
+ * ```
+ *
+ * WHAT IT ACTUALLY BUYS IS THE MISMATCH IT MAKES UNREACHABLE. Four route files
+ * each restated the secret, the room validator, the fallback room, the
+ * capacity and the duration cap, and every disagreement between two of them is
+ * SILENT: a relay admitting 20 against a balancer assigning for 8 fills a room
+ * the balancer thinks is full, a ticker on `maxDurationS: 300` beside a relay
+ * on 800 holds sockets for eight minutes after its own tick loop is gone, and
+ * a `maxRooms` that differs hands out an instance id the relay replaces with
+ * the fallback. Nothing in the system can notice any of them, because from
+ * each route's own point of view nothing went wrong.
+ *
+ * The four factories are still exported and still supported: this composes
+ * them, and a host that genuinely wants four different configurations (two
+ * deployments, two plans, a relay on a different platform) writes them out.
+ * The `ticker`/`relay`/`balancer` bags here are the escape hatch for
+ * everything short of that.
+ *
+ * Throws at creation for a `maxPlayers` that is not a positive integer, a
+ * missing secret, and (from the factory that owns the number, with its name in
+ * the message) a `maxDurationS` whose derived lifetimes do not fit.
+ */
+export function createRoom<TState, TEvent>(opts: VercelRoomOptions<TState, TEvent>): VercelRoom {
+  const { runtime, secret, rooms, upgradeWebSocket } = opts;
+  const { isValidBase, fallbackRoom, maxPlayers, maxRooms } = rooms;
+
+  // CHECKED AT CREATION, WHICH IS MODULE EVALUATION, for the same reason the
+  // two lifetimes are: a deployment whose numbers do not fit should fail on
+  // its first request rather than on every join for the rest of its life.
+  if (!secret) {
+    throw new Error(
+      'createRoom: secret is empty. It signs every session token and every ticker spawn token, so an empty one means both are forgeable by anyone who can read this source. ' +
+        'Set SESSION_SECRET in this deployment, or use `requireSecret()` from tickroom/server, which throws in production and hands back a clearly-marked insecure value elsewhere.'
+    );
+  }
+  // `maxPlayers` reaches the relay's admission check and the balancer's
+  // assignment, and a non-integer or non-positive value is a different failure
+  // in each: a room nobody may enter, or a comparison against NaN that admits
+  // everyone. Neither reports anything.
+  if (!Number.isInteger(maxPlayers) || maxPlayers <= 0) {
+    throw new Error(
+      `createRoom: rooms.maxPlayers is ${String(maxPlayers)}, which is not a positive integer. ` +
+        'It is the capacity the relay admits against AND the capacity the balancer assigns against, so a value neither can compare with means a room that refuses everyone or one that refuses no one.'
+    );
+  }
+
+  const maxDurationS = opts.maxDurationS ?? tickerRouteConfig.maxDuration;
+
+  const ticker = createTickerRoute<TState, TEvent>({
+    runtime,
+    secret,
+    isValidBase,
+    fallbackRoom,
+    maxRooms,
+    maxDurationS,
+    ...opts.ticker,
+  });
+
+  const ws = createRelayRoute({
+    secret,
+    isValidBase,
+    fallbackRoom,
+    maxRooms,
+    maxPlayers,
+    maxDurationS,
+    maxAgeS: opts.session?.maxAgeS,
+    tickerUrl: opts.tickerUrl ?? DEFAULT_TICKER_URL,
+    decodeInput: opts.decodeInput ?? defaultDecodeInput,
+    joinMeta: opts.joinMeta,
+    onBadInput: opts.onBadInput,
+    onRateDrop: opts.onRateDrop,
+    upgradeWebSocket,
+    ...opts.relay,
+  });
+
+  const balancer = createBalancerRoute({
+    isValidBase,
+    // The balancer works in BASES where the other three work in room ids, so
+    // the pool's fallback is stripped of any instance suffix rather than being
+    // a fifth value a host has to keep in agreement with the fourth.
+    fallbackBase: baseOf(fallbackRoom),
+    maxPlayers,
+    maxRooms,
+    ...opts.balancer,
+  });
+
+  const session = createSessionRoute({ secret, rooms, session: opts.session ?? {} });
+
+  return { ticker, ws, session, balancer, config: { ticker: tickerRouteConfig, relay: relayRouteConfig } };
 }
 
 function jsonResponse(body: unknown, status: number): Response {

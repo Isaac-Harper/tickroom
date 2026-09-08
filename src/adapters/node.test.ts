@@ -154,6 +154,29 @@ describe('attachNodeRelay', () => {
     expect(passed).toMatchObject({ roomId: 'lobby', pid: 'p1', subject: 'd.abc' });
   });
 
+  it('honours maxAgeS on the socket path, so an expiry the mint states is one the relay enforces', async () => {
+    // The verifying half of a number the mint also states. Without it the
+    // route accepts `verifyToken`'s 12 hour default whatever the session
+    // endpoint minted under, and a token kept past its intended life still
+    // opens a socket: an expiry on paper, in the module whose own header says
+    // an expiry is not optional.
+    const wss = new FakeWss();
+    attachNodeRelay(wss, baseOpts({ maxAgeS: 60 }));
+
+    const stale = makeToken({ pid: 'p1', handle: 7, sub: 'd.abc' }, { secret: SECRET }, Date.now() - 61_000);
+    const socket = new MockSocket();
+    await wss.connect(socket, `/ws?room=lobby&pid=p1&h=7&token=${encodeURIComponent(stale)}`);
+
+    expect(socket.closed).toEqual([CLOSE_CODES.closedByServer]);
+    expect(mocks.admitSocket).not.toHaveBeenCalled();
+
+    // CONTROL: the same token inside the window is admitted, so the case above
+    // is about the age and not about the shape.
+    const fresh = makeToken({ pid: 'p1', handle: 7, sub: 'd.abc' }, { secret: SECRET }, Date.now() - 59_000);
+    await wss.connect(new MockSocket(), `/ws?room=lobby&pid=p1&h=7&token=${encodeURIComponent(fresh)}`);
+    expect(mocks.admitSocket).toHaveBeenCalledTimes(1);
+  });
+
   it('WARNS ONCE when a well-formed room id was refused and replaced by the fallback', async () => {
     // Same silent mismatch as the Vercel route, same reason it matters: with
     // maxRooms disagreeing between the balancer and the relay, `lobby~7` is a

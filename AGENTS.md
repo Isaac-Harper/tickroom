@@ -1023,6 +1023,43 @@ whole timing guarantee rests on nothing in it ever awaiting.
   reasoning and the arithmetic. The assertion lives on this side because the
   ticker must not import an adapter, and 3000 is argued from DNS, TLS and the
   platform accepting the request rather than derived from the ticker's number.
+  AND `createRoom` IS THE PRIMARY ENTRY POINT NOW, with the three factories
+  kept exported and documented as the low-level form. It takes one bag
+  (`runtime`, `secret`, `rooms: { isValidBase, fallbackRoom, maxPlayers,
+  maxRooms? }`, `maxDurationS`, `upgradeWebSocket`, `tickerUrl?`,
+  `decodeInput?`, `joinMeta?`, `onBadInput?`, `onRateDrop?`, `session?`, plus
+  `ticker`/`relay`/`balancer` partial bags applied LAST as escape hatches) and
+  returns `{ ticker, ws, session, balancer, config }`, each a
+  `(req: Request) => Promise<Response>`. WHAT IT BUYS IS A MISMATCH MADE
+  UNREACHABLE rather than a shorter file: every one of those shared facts used
+  to be written into four route files, and a disagreement between two of them
+  is silent by construction (a relay admitting 20 against a balancer assigning
+  for 8, a ticker on `maxDurationS: 300` beside a relay on 800, a `maxRooms`
+  that hands out an instance the relay replaces with the fallback). It
+  validates at creation: a `maxPlayers` that is not a positive integer, an
+  empty secret, and the two lifetimes through the factories that own them, so
+  the message still names `createTickerRoute` or `createRelayRoute`. THE
+  SESSION ROUTE IS THE FOURTH PIECE AND WAS NEVER A FACTORY: the README's
+  hand-written mint is now `room.session`, answering the `SessionInfo` shape
+  `RoomConnection.mint` expects, refusing a room its own pool does not
+  recognise with 400 rather than reassigning it, taking `sub` from the body
+  only when it is short and key-safe (it is a Redis key segment,
+  `<connNamespace>:conns:<sub>`, so it is filtered on the same terms a room id
+  is), and copying a `claims` hook's extra claims through by VALUE TYPE
+  because `verifyToken` fails closed on a claim that is not a string or a
+  number. `defaultDecodeInput` is exported beside it: a `string` is JSON (what
+  `PredictedEntity` sends), bytes go through `tickroom/codec`'s
+  `decodeInputWindow`, anything else is `[]`, and malformed JSON is left to
+  throw because that is the only thing `onBadInput` can count. ONE OPTION WAS
+  ADDED TO `createRelayRoute` TO MAKE `session.maxAgeS` HONEST: the route
+  passes `maxAgeS` into its own `verifyToken`, where it previously always took
+  the 12 hour default, so an expiry the mint states is one the socket path
+  enforces rather than one on paper. `adapters/node.ts` takes the same field
+  through the type it derives, and honours it the same way.
+  THE ONE SHARED FACT `createRoom` DOES NOT STATE ONCE IS `namespace`: it
+  rides the three escape hatches, so a staging namespace is still written
+  three times, and a namespace on one route and not another still splits the
+  room in half. The README says so where it documents the namespace seam.
 - `src/adapters/node.ts` - the same server core behind a plain `ws` server, no
   serverless at all. Proves the design is not platform-specific. Derives its
   own option type from the Vercel one minus the three genuinely Vercel-route
@@ -1031,7 +1068,18 @@ whole timing guarantee rests on nothing in it ever awaiting.
   handler, logging `node-relay.connection` and closing 1011. It carries its own
   copy of `logRoomNormalised` (eight lines, duplicated rather than imported,
   because an adapter must not depend on another platform's adapter; on a third
-  host it moves to `core/ids.ts` beside `normalizeRoomId`).
+  host it moves to `core/ids.ts` beside `normalizeRoomId`). IT HAS TWO OF THE
+  FOUR PIECES `createRoom` COMPOSES, not four, which is why there is no
+  `createNodeRoom`: `attachNodeRelay` and `runNodeTicker` are the pair, there
+  is no HTTP layer here at all (no balancer route and no session route: the
+  node example serves both off its own `http.createServer`), and the two
+  functions share almost nothing to state once, since `runNodeTicker` takes a
+  `roomId` rather than a pool. What the two DO share is `redis`/
+  `createSubscriber` (already documented as pass both or neither) and the
+  `ensureTicker` guard the example hand-rolls, which is the composition worth
+  adding here on the day a second host wants it. `maxAgeS` arrives through the
+  derived option type and is passed to this adapter's own `verifyToken`, for
+  the same reason the Vercel route does it.
 - `src/adapters/index.ts` - DELETED. It was dead output: `package.json` names
   `./adapters/vercel` and `./adapters/node` as the entry points, so nothing
   could reach a combined barrel, and a barrel over two platform adapters would

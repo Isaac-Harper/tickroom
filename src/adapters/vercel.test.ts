@@ -48,7 +48,15 @@ vi.mock('../server/index.js', async (importOriginal) => {
 
 /* eslint-disable import/first */
 import { CLOSE_CODES, MAX_TICKER_MS, RELAY_EXPIRY_LEAD_MS, SERVER_FRAMES, roomKeys } from '../core/index.js';
-import { makeSpawnToken, makeToken, verifySpawnToken, type RelaySocket } from '../server/index.js';
+import {
+  makeSpawnToken,
+  makeToken,
+  verifySpawnToken,
+  verifyToken,
+  type RelaySocket,
+  type TokenClaims,
+} from '../server/index.js';
+import { encodeInputWindow } from '../codec/index.js';
 // Straight from the module rather than the barrel, which does not re-export it
 // and should not: it is a coupling between two files, not part of the hosting
 // API. See the case that pins it against `SPAWN_ACK_MS`.
@@ -64,10 +72,14 @@ import {
   TICKER_EXIT_MARGIN_MS,
   createBalancerRoute,
   createRelayRoute,
+  createRoom,
   createTickerRoute,
+  defaultDecodeInput,
   relayRouteConfig,
   tickerRouteConfig,
   type VercelRelayRouteOptions,
+  type VercelRoom,
+  type VercelRoomOptions,
   type VercelTickerRouteOptions,
 } from './vercel.js';
 /* eslint-enable import/first */
@@ -864,5 +876,380 @@ describe('createRelayRoute, against the REAL admission protocol', () => {
 
     socket.fire('close', 1000);
     expect(zrem).toHaveBeenCalledWith(connKey, expect.any(String));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The four routes, composed.
+// ---------------------------------------------------------------------------
+//
+// THE CLAIM UNDER TEST IS NOT "EACH ROUTE STILL WORKS", which the three groups
+// above already cover, but that the composed routes cannot DISAGREE. Every
+// mismatch this function exists to remove is silent in production (a relay
+// admitting 20 against a balancer assigning for 8, a ticker on a different
+// duration cap from the relay holding its sockets), so the only place it can
+// be caught is here, by reading the number out of both bags and comparing.
+
+type RoomOpts = VercelRoomOptions<unknown, unknown>;
+
+function roomWith(socket: MockSocket, extra: Partial<RoomOpts> = {}): VercelRoom {
+  return createRoom<unknown, unknown>({
+    runtime: {} as TickerOpts['runtime'],
+    secret: SECRET,
+    rooms: { isValidBase: (b) => b === 'lobby', fallbackRoom: 'lobby', maxPlayers: 20 },
+    upgradeWebSocket: async (handler) => {
+      await handler(socket);
+      return new Response('ok');
+    },
+    ...extra,
+  });
+}
+
+function sessionRequest(body?: unknown, query = ''): Request {
+  if (body === undefined) {
+    return new Request(`https://example.test/api/session${query}`, { method: 'POST' });
+  }
+  return new Request(`https://example.test/api/session${query}`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+interface MintedSession {
+  token: string;
+  playerId: string;
+  handle: number;
+  room: string;
+}
+
+async function mint(room: VercelRoom, body?: unknown, query = ''): Promise<MintedSession> {
+  const res = await room.session(sessionRequest(body, query));
+  expect(res.status).toBe(200);
+  return (await res.json()) as MintedSession;
+}
+
+/** The socket request a client builds out of a session, the way the default `socketUrl` does. */
+function wsRequestFor(session: MintedSession): Request {
+  const params = new URLSearchParams({
+    room: session.room,
+    pid: session.playerId,
+    h: String(session.handle),
+    token: session.token,
+  });
+  return new Request(`https://example.test/api/ws?${params.toString()}`);
+}
+
+/** `team` off a body that may be anything at all, for the claims-hook case below. */
+function bodyTeam(body: unknown): unknown {
+  return typeof body === 'object' && body !== null ? (body as Record<string, unknown>).team : undefined;
+}
+
+describe('createRoom', () => {
+  beforeEach(() => {
+    mocks.runTicker.mockReset();
+    mocks.runTicker.mockResolvedValue({ reason: 'duration', ticks: 0, uptimeMs: 0 });
+    mocks.admitSocket.mockReset();
+    mocks.admitSocket.mockResolvedValue(null);
+    mocks.assignRoom.mockReset();
+    mocks.assignRoom.mockResolvedValue({ room: 'lobby', base: 'lobby', index: 0 });
+    mocks.getRedis.mockReset();
+    mocks.getRedis.mockReturnValue({});
+    mocks.createSubscriber.mockReset();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('states the capacity ONCE, and the relay and the balancer both read that number', async () => {
+    // The mismatch this replaces: `maxPlayers: 20` in the relay route file and
+    // `maxPlayers: 8` in the balancer's is a room the balancer calls full with
+    // twelve seats free, and nothing on either side can see it.
+    const room = roomWith(new MockSocket(), {
+      rooms: { isValidBase: (b) => b === 'lobby', fallbackRoom: 'lobby', maxPlayers: 8 },
+    });
+
+    await room.ws(wsRequestFor(await mint(room)));
+    await room.balancer(new Request('https://example.test/api/room?base=lobby'));
+
+    expect(admitOptionsPassed().maxPlayers).toBe(8);
+    expect(mocks.assignRoom.mock.calls[0]?.[0]).toMatchObject({ maxPlayers: 8 });
+  });
+
+  it('states maxRooms ONCE, so no route hands out an instance another would refuse', async () => {
+    const room = roomWith(new MockSocket(), {
+      rooms: { isValidBase: (b) => b === 'lobby', fallbackRoom: 'lobby', maxPlayers: 20, maxRooms: 4 },
+    });
+
+    await room.balancer(new Request('https://example.test/api/room?base=lobby'));
+    expect(mocks.assignRoom.mock.calls[0]?.[0]).toMatchObject({ maxRooms: 4 });
+
+    // And the session route refuses the instance the balancer could never have
+    // assigned, rather than minting a token for a room the relay would replace
+    // with the fallback.
+    expect((await room.session(sessionRequest({ room: 'lobby~7' }))).status).toBe(400);
+  });
+
+  it('states maxDurationS ONCE, and the ticker and the relay derive their lifetimes from it', async () => {
+    // A ticker on 300 beside a relay on 800 holds sockets for eight minutes
+    // after its own tick loop is gone. Both numbers come from one field here,
+    // so the two lifetimes can only ever be derived from the same cap.
+    const room = roomWith(new MockSocket(), { maxDurationS: 300 });
+
+    await callTicker(room.ticker);
+    expect(tickerOptionsPassed().maxRunMs).toBe(300_000 - TICKER_EXIT_MARGIN_MS);
+
+    await room.ws(wsRequestFor(await mint(room)));
+    expect(admitOptionsPassed().relay.lifetimeMs).toBe(300_000 - RELAY_EXIT_MARGIN_MS);
+  });
+
+  it('defaults maxDurationS to the number the route configs already document', async () => {
+    const room = roomWith(new MockSocket());
+    await callTicker(room.ticker);
+    // `MAX_TICKER_MS` wins at the default cap: the platform cap only ever
+    // LOWERS the ticker's lifetime.
+    expect(tickerOptionsPassed().maxRunMs).toBe(MAX_TICKER_MS);
+    expect(room.config.ticker).toBe(tickerRouteConfig);
+    expect(room.config.relay).toBe(relayRouteConfig);
+  });
+
+  it("mints a session the library's own verifyToken accepts, with the claims the relay reads", async () => {
+    const room = roomWith(new MockSocket());
+    const session = await mint(room);
+
+    expect(session.room).toBe('lobby');
+    expect(typeof session.token).toBe('string');
+    const claims = verifyToken(session.token, { pid: session.playerId, handle: session.handle }, { secret: SECRET });
+    expect(claims).toMatchObject({ pid: session.playerId, handle: session.handle, sub: `d.${session.playerId}` });
+  });
+
+  it('mints a session the composed RELAY then admits, which is the whole shape agreeing', async () => {
+    // The four fields are `SessionInfo`, so this is also the assertion that
+    // `RoomConnection.mint` can consume what this route answers: the client
+    // builds exactly this URL out of exactly these fields.
+    const room = roomWith(new MockSocket());
+    const session = await mint(room);
+
+    const res = await room.ws(wsRequestFor(session));
+
+    expect(res.status).toBe(200);
+    expect(admitOptionsPassed()).toMatchObject({
+      roomId: 'lobby',
+      pid: session.playerId,
+      subject: `d.${session.playerId}`,
+    });
+  });
+
+  it('refuses a room its own isValidBase does not recognise with 400, and mints nothing', async () => {
+    // REFUSED, NOT REASSIGNED. `normalizeRoomId` would answer with the
+    // fallback, which on this route means a client quietly minted into a game
+    // it never asked for.
+    const room = roomWith(new MockSocket());
+
+    for (const req of [sessionRequest({ room: 'nope' }), sessionRequest(undefined, '?room=nope')]) {
+      const res = await room.session(req);
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: 'unknown room' });
+    }
+  });
+
+  it('takes `sub` from the body, and refuses one that would smuggle a Redis key segment', async () => {
+    const room = roomWith(new MockSocket());
+
+    const mine = await mint(room, { sub: 'acct-42' });
+    expect(verifyToken(mine.token, { pid: mine.playerId, handle: mine.handle }, { secret: SECRET })).toMatchObject({
+      sub: 'acct-42',
+    });
+
+    // `sub` is the key segment the per-subject socket cap counts against
+    // (`room:conns:<sub>`), and Redis key names have no escaping, so a ':' in
+    // a body-supplied subject would count one client's sockets in another
+    // subject's set. Refused back to the generated id rather than sanitised.
+    for (const hostile of ['a:conns:b', 'a*b', 'a b', 'x'.repeat(65), '']) {
+      const session = await mint(room, { sub: hostile });
+      expect(
+        verifyToken(session.token, { pid: session.playerId, handle: session.handle }, { secret: SECRET })
+      ).toMatchObject({ sub: `d.${session.playerId}` });
+    }
+  });
+
+  it('lets a `claims` hook supply the identity that is actually SIGNED', async () => {
+    const room = roomWith(new MockSocket(), {
+      session: {
+        claims: (_req, body) => ({ pid: 'u1', handle: 3, sub: 'account-1', team: String(bodyTeam(body)) }),
+      },
+    });
+
+    const session = await mint(room, { team: 'red' });
+
+    // The RESPONSE reports what was signed, not what was generated: a pid in
+    // the body and a different one in the token is a socket the relay refuses,
+    // because `verifyToken` checks the claims against the query string.
+    expect(session.playerId).toBe('u1');
+    expect(session.handle).toBe(3);
+    expect(verifyToken(session.token, { pid: 'u1', handle: 3 }, { secret: SECRET })).toMatchObject({
+      pid: 'u1',
+      handle: 3,
+      sub: 'account-1',
+      team: 'red',
+    });
+  });
+
+  it('drops a hook claim that is neither a string nor a number, because verifyToken fails closed on one', async () => {
+    // A claim of the wrong type mints a token this deployment's own relay
+    // refuses, on every socket, with nothing anywhere saying why.
+    const room = roomWith(new MockSocket(), {
+      session: { claims: () => ({ tier: { paid: true } } as unknown as Partial<TokenClaims>) },
+    });
+
+    const session = await mint(room);
+    const claims = verifyToken(session.token, { pid: session.playerId, handle: session.handle }, { secret: SECRET });
+    expect(claims).not.toBeNull();
+    expect(claims).not.toHaveProperty('tier');
+  });
+
+  it('lets a `room` hook refuse with 400 rather than falling through to the fallback', async () => {
+    const room = roomWith(new MockSocket(), { session: { room: () => null } });
+    expect((await room.session(sessionRequest())).status).toBe(400);
+  });
+
+  it("validates a `room` hook's answer too, so a hook cannot mint for a room the relay would replace", async () => {
+    const room = roomWith(new MockSocket(), { session: { room: () => 'somewhere-else' } });
+    expect((await room.session(sessionRequest())).status).toBe(400);
+  });
+
+  it('answers a non-POST with 405 and no token', async () => {
+    const room = roomWith(new MockSocket());
+    expect((await room.session(new Request('https://example.test/api/session'))).status).toBe(405);
+  });
+
+  it('enforces the session maxAgeS ON THE SOCKET PATH, not only at the mint', async () => {
+    // An expiry the mint states and the relay ignores is an expiry on paper:
+    // the token that outlived its intended life still opens a socket. One
+    // number, both halves.
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const room = roomWith(new MockSocket(), { session: { maxAgeS: 60 } });
+    const session = await mint(room);
+
+    expect((await room.ws(wsRequestFor(session))).status).toBe(200);
+
+    mocks.admitSocket.mockClear();
+    vi.setSystemTime(61_000);
+    expect((await room.ws(wsRequestFor(session))).status).toBe(401);
+    expect(mocks.admitSocket).not.toHaveBeenCalled();
+  });
+
+  it('applies the escape hatches LAST, so a per-route override wins', async () => {
+    const room = roomWith(new MockSocket(), {
+      ticker: { maxRunMs: 12_000 },
+      relay: { maxPlayers: 4, maxSocketsPerSubject: 2 },
+      balancer: { maxPlayers: 2 },
+    });
+
+    await callTicker(room.ticker);
+    expect(tickerOptionsPassed().maxRunMs).toBe(12_000);
+
+    await room.ws(wsRequestFor(await mint(room)));
+    expect(admitOptionsPassed()).toMatchObject({ maxPlayers: 4, maxSocketsPerSubject: 2 });
+
+    await room.balancer(new Request('https://example.test/api/room?base=lobby'));
+    expect(mocks.assignRoom.mock.calls[0]?.[0]).toMatchObject({ maxPlayers: 2 });
+  });
+
+  it('passes the relay hooks through, and defaults the ticker url to /api/ticker', async () => {
+    const onBadInput = vi.fn();
+    const onRateDrop = vi.fn();
+    const fetchMock = vi.fn().mockResolvedValue(new Response('ok'));
+    vi.stubGlobal('fetch', fetchMock);
+    const room = roomWith(new MockSocket(), { onBadInput, onRateDrop, joinMeta: (c) => ({ name: c.pid }) });
+
+    const session = await mint(room);
+    await room.ws(wsRequestFor(session));
+
+    const { relay } = admitOptionsPassed();
+    expect(relay.onBadInput).toBe(onBadInput);
+    expect(relay.onRateDrop).toBe(onRateDrop);
+    expect(relay.joinMeta).toEqual({ name: session.playerId });
+
+    await relay.spawnTicker('lobby');
+    expect(new URL(String(fetchMock.mock.calls[0]?.[0])).pathname).toBe('/api/ticker');
+  });
+
+  it('wires the default decoder in, so a host that writes none still reads its client', async () => {
+    const room = roomWith(new MockSocket());
+    await room.ws(wsRequestFor(await mint(room)));
+    expect(admitOptionsPassed().relay.decodeInput).toBe(defaultDecodeInput);
+  });
+
+  it('refuses a maxPlayers that is not a positive integer, at creation', () => {
+    for (const maxPlayers of [0, -1, 2.5, Number.NaN]) {
+      expect(() =>
+        roomWith(new MockSocket(), {
+          rooms: { isValidBase: (b) => b === 'lobby', fallbackRoom: 'lobby', maxPlayers },
+        })
+      ).toThrow(/maxPlayers/);
+    }
+  });
+
+  it('refuses a missing secret, at creation', () => {
+    expect(() => roomWith(new MockSocket(), { secret: '' })).toThrow(/secret/);
+  });
+
+  it('lets the failing FACTORY name itself when the duration cap does not fit', () => {
+    // The floors are the routes' own and stay there: this only has to not
+    // swallow them, so the message a host reads still says which lifetime it
+    // was. `maxDurationS: 10` derives a ticker `maxRunMs` of -20000 and a
+    // relay lifetime of 0.
+    expect(() => roomWith(new MockSocket(), { maxDurationS: 10 })).toThrow(/createTickerRoute/);
+    // The ticker's floor is the higher of the two by 19 seconds (a 30s margin
+    // around a 10s loop against a 10s margin around an 11s lifetime), so no
+    // `maxDurationS` reaches the relay's check first. The relay names itself
+    // from the other door: an explicit `lifetimeMs` through the escape hatch,
+    // which is the one way a composed room can still ask for a swap that
+    // cannot happen.
+    expect(() => roomWith(new MockSocket(), { relay: { lifetimeMs: RELAY_EXPIRY_LEAD_MS } })).toThrow(
+      /createRelayRoute/
+    );
+  });
+});
+
+describe('defaultDecodeInput', () => {
+  it('reads the JSON text frame PredictedEntity actually sends', () => {
+    const records = [
+      { seq: 1, targetTick: 10, data: { x: 1 } },
+      { seq: 2, targetTick: 11, data: { x: 2 } },
+    ];
+    expect(defaultDecodeInput(JSON.stringify(records))).toEqual(records);
+    // A single object is accepted too, which is what the README's own decoder
+    // did and what a host stamping by hand tends to send first.
+    expect(defaultDecodeInput(JSON.stringify(records[0]))).toEqual([records[0]]);
+  });
+
+  it('reads a binary input window through the shipped codec, sniffed by type', () => {
+    const frame = encodeInputWindow([{ seq: 4, targetTick: 20, axes: [1, 0], buttons: 3 }]);
+    const inputs = defaultDecodeInput(frame);
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0]).toMatchObject({ seq: 4, targetTick: 20 });
+
+    // `ws` hands over a Buffer, never a browser-style ArrayBuffer, and a
+    // fragmented message is already joined into one by the relay before any
+    // decoder sees it. Both are views, and both must take the binary arm.
+    expect(defaultDecodeInput(Buffer.from(new Uint8Array(frame)))).toHaveLength(1);
+  });
+
+  it('THROWS on malformed JSON, because that is the only thing onBadInput can count', () => {
+    // A decoder that swallowed this would report a broken client as an
+    // ordinary empty window, and the only symptom of a broken client is one
+    // player whose inputs stop while every other signal reads healthy.
+    expect(() => defaultDecodeInput('{not json')).toThrow();
+  });
+
+  it('answers a malformed binary frame and an unknown shape with an empty window, never a throw', () => {
+    expect(defaultDecodeInput(new Uint8Array([255, 255, 255, 255]))).toEqual([]);
+    expect(defaultDecodeInput(null)).toEqual([]);
+    expect(defaultDecodeInput(42)).toEqual([]);
   });
 });

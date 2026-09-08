@@ -104,11 +104,14 @@ Which makes it right for exactly two shapes: **a single VM** (or container, or P
 **A Redis DB INDEX DOES NOT ISOLATE TWO DEPLOYMENTS, and `namespace` does.** Pointing staging at `/1` and production at `/0` looks like separation and is not: keys are per database, but **pub/sub is instance-wide**, so the two deployments publish into the identical `room:pong:in` and `room:pong:out` channels. Measured: each acquires its own lease against its own `room:pong:lease` key, so both believe they are the exactly-one writer, and each one's relays forward the other's snapshots to their players. Two authorities, no error anywhere, and the lease mechanism cannot see it because it is doing its job correctly on each database separately. `namespace` is the seam that actually works, because it prefixes keys **and** channels together:
 
 ```ts
+createRoom({ ...opts, ticker: { namespace: 'staging' }, relay: { namespace: 'staging' }, balancer: { namespace: 'staging' } });
+
+// or, on the low-level form:
 createTickerRoute({ ...tickerOpts, namespace: 'staging' });
 createRelayRoute({ ...relayOpts, namespace: 'staging' });
 ```
 
-Both routes, the same string: a namespace on one and not the other splits the room in half. (There is a second reason to leave the DB index alone, in `AGENTS.md`: ioredis re-issues `select(db)` on every reconnect with nothing catching the promise, so the shared client belongs on db 0.)
+Every route, the same string: a namespace on one and not the other splits the room in half. It is the one shared fact `createRoom` does not state once, because it rides the per-route escape hatches rather than the shared bag. (There is a second reason to leave the DB index alone, in `AGENTS.md`: ioredis re-issues `select(db)` on every reconnect with nothing catching the promise, so the shared client belongs on db 0.)
 
 ---
 
@@ -218,14 +221,158 @@ export const pong: RoomRuntime<State> = {
 };
 ```
 
-### 2. Mount four routes
+### 2. Mount the room
+
+Four routes, one call. **Every fact below is stated once and used everywhere it applies**, which is the whole reason this exists: mounting the four routes by hand meant writing the secret, the room validator, the fallback room, the capacity and the duration cap into four separate files, and a disagreement between any two of them is silent. A relay admitting 20 against a balancer assigning for 8 fills a room the balancer calls full while seats sit empty. A ticker on 300 beside a relay on 800 holds sockets for eight minutes after its own tick loop is gone. A `maxRooms` that differs hands a client `pong~7` that the relay quietly replaces with the fallback, and the player sits alone in a room nobody else can see them in. None of the three reports anything, because from each route's own point of view nothing went wrong.
+
+```ts
+// lib/room.ts
+import { experimental_upgradeWebSocket } from '@vercel/functions';
+import { createRoom } from 'tickroom/adapters/vercel';
+import { pong } from '@/sim/pong';
+
+export const room = createRoom({
+  runtime: pong,
+  // Signs session tokens AND the spawn tokens the relay calls the ticker with.
+  secret: process.env.SESSION_SECRET!,
+  // The pool, for all four routes at once.
+  rooms: { isValidBase: (b) => b === 'pong', fallbackRoom: 'pong', maxPlayers: 20 },
+  // THE ONE NUMBER THAT COUPLES THIS LIBRARY TO YOUR PLATFORM, in seconds, and
+  // it is the same number the two route files below export as `maxDuration`:
+  // the tick loop stops at min(700s, maxDurationS * 1000 - 30s), because the
+  // final checkpoint, the lease release and the successor spawn all happen
+  // after the loop and the platform must not kill them, and the relay
+  // announces `relay-expiring` at maxDurationS * 1000 - 10s so the client
+  // swaps to a replacement socket before this function dies. Lower it on a
+  // lower plan limit and both lifetimes follow; raising it does NOT extend the
+  // loop past 700s.
+  maxDurationS: 800,
+  // Injected, not imported. See below.
+  upgradeWebSocket: experimental_upgradeWebSocket,
+});
+```
+
+Then each route file is one handler and its literals:
+
+```ts
+// app/api/ticker/route.ts
+import { room } from '@/lib/room';
+
+// Literals, always. See the note under the fourth file.
+export const runtime = 'nodejs';
+export const maxDuration = 800;
+
+export const GET = room.ticker;
+```
+
+```ts
+// app/api/ws/route.ts
+import { room } from '@/lib/room';
+
+export const runtime = 'nodejs';
+export const maxDuration = 800;
+
+export const GET = room.ws;
+```
+
+```ts
+// app/api/session/route.ts
+import { room } from '@/lib/room';
+
+export const runtime = 'nodejs';
+
+// What `mint()` in step 3 calls. Answers `{ token, playerId, handle, room }`,
+// which is exactly the `SessionInfo` the client consumes.
+export const POST = room.session;
+```
+
+```ts
+// app/api/room/route.ts
+import { room } from '@/lib/room';
+
+export const runtime = 'nodejs';
+
+// Answers `{ room, base, index, full? }`: which physical room instance a
+// joiner should land in. Step 3's `mint()` calls this FIRST, before
+// `/api/session`, so the session it asks for names the room the balancer
+// actually placed it in; it calls this again, this time with `?not=` naming
+// every room that has already refused this client, whenever `onTerminal` sees
+// a `'capacity'` terminal. Keep every refused room, not just the last one: see
+// the re-assign recipe under "Things worth knowing".
+export const GET = room.balancer;
+```
+
+**`runtime` and `maxDuration` are literals in all four files, and `maxDuration` must equal the `maxDurationS` beside it.** Next's route-segment-config parser reads those two exports out of the source text at build time, so `export const maxDuration = room.config.ticker.maxDuration` fails the build ("Next.js can't recognize the exported `runtime` field in route. It needs to be a static string"); `room.config` (and `tickerRouteConfig`/`relayRouteConfig` under it) is still the one place to read the numbers this library expects, but it is documentation, not something to re-export.
+
+**The session route is the hand-written one made real.** It mints a random `pid` and `handle`, signs `{ pid, handle, sub }` with `makeToken`, and answers the four fields `RoomConnection.mint` wants. The token carries the claims the relay will trust for the whole socket's life and it EXPIRES: claims are baked in at mint and no auth provider is consulted again on the socket path (that is the point, it keeps an auth outage off the hot path), so without an expiry a token kept from a paid tier stays redeemable forever after the subscription lapsed. Four optional hooks shape it, and a host with no accounts needs none of them:
+
+```ts
+session: {
+  // Passed to the MINT and to the RELAY, so the expiry is one both halves
+  // enforce. An expiry only the mint knows about is an expiry on paper.
+  maxAgeS: 60 * 60,
+  // Your own identity, signed. Whatever this returns wins over the generated
+  // values, and the response reports what was actually signed: `pid` is also
+  // the key the per-subject socket cap counts against, so use your user id the
+  // moment you have one.
+  claims: async (req, body) => ({ pid: await userId(req), sub: 'account-1' }),
+  // Which room this session is for. The default is `room` from the JSON body,
+  // then `?room=`, then `rooms.fallbackRoom`. Returning null refuses with 400.
+  room: (req, body) => (body as { room?: string }).room ?? null,
+},
+```
+
+Without a `claims` hook the subject is the request body's own `sub` when it is a short, key-safe string, and `d.<pid>` otherwise: `sub` is interpolated into a Redis key name (`room:conns:<sub>`, the set the per-subject socket cap counts), and Redis key names have no escaping, so a body-supplied one is filtered on the same terms a room id is. **A room the pool does not recognise is answered with 400, never reassigned.** `normalizeRoomId` answers an id it cannot validate with the fallback, which is right on the socket path and wrong here: a client that asked for one room and was quietly minted a session for another joins a game it did not ask for, and this response is the only place that could have told it.
+
+**`decodeInput` has a default now, and it is the two frames this library actually ships.** A `string` is parsed as JSON, which is what `PredictedEntity` sends in step 3 (one array of `{ targetTick, data }` records per message, the last six ticks re-sent whole, so a lost packet does not starve a tick); a binary frame goes through `tickroom/codec`'s `decodeInputWindow`, which answers any malformed frame with `[]` rather than throwing. Pass your own `decodeInput` for anything else. Fragmentation is not your problem either way: a peer or a proxy chooses its own, and the relay joins a fragmented message before any decoder sees it.
+
+**Wire `onBadInput` and `onRateDrop`, and COUNT rather than log.** Both run at a rate the client owns, so a log line per event hands an abuser an amplifier: the refused frame becomes more expensive than the accepted one. A decoder that throws is caught and dropped in silence by design, which means the only symptom of a broken decoder is one player whose inputs stop while the room, the roster, the snapshots and every other player stay perfectly healthy:
+
+```ts
+let badInputs = 0;
+let rateDrops = 0;
+setInterval(() => {
+  if (badInputs || rateDrops) console.warn('relay.input-refused', { badInputs, rateDrops });
+  badInputs = 0;
+  rateDrops = 0;
+}, 10_000);
+
+// ...in createRoom:
+onBadInput: () => void (badInputs += 1),
+onRateDrop: () => void (rateDrops += 1),
+```
+
+**Everything a route accepts is still reachable, through three escape hatches applied last.** `ticker`, `relay` and `balancer` take a partial of the matching factory's options and win over the composed values, so `init`, `geomKey`, `onGeomMismatch`, `metaPayload`, `metaSeedPayload`, `statsLabels`, `presenceTimeoutMs`, `namespace`, `log`, every observability hook and every bound are just extra keys:
+
+```ts
+createRoom({
+  ...opts,
+  ticker: { geomKey: () => 'pong:v1', init: warmTheAssets },
+  relay: { maxSocketsPerSubject: 3 },
+});
+```
+
+A shared fact set in one of those bags is set in one route only, which is the mismatch this call exists to remove: state `secret`, `rooms` and `maxDurationS` at the top level and keep these for what genuinely differs.
+
+**`createRoom` throws at creation, which is module evaluation**, for a `rooms.maxPlayers` that is not a positive integer, for a missing secret, and (from the factory that owns the number, with its name in the message) for a `maxDurationS` whose derived lifetimes do not fit. A deployment whose numbers do not fit fails on its first request rather than on every handoff for the rest of its life.
+
+**`upgradeWebSocket` is injected, not imported.** tickroom takes no hard dependency on any platform, so the same server core runs behind plain `ws` on a VM (see `adapters/node.ts`).
+
+**`maxDurationS` has a floor as well as a ceiling, and both routes throw at creation if you miss it.** Each derivation is a subtraction (`maxDurationS * 1000` minus a 30s ticker margin, minus a 10s relay margin), so a small enough number produces a *negative* lifetime rather than a short one: `maxDurationS: 10` derived a ticker `maxRunMs` of -20000 and a relay `lifetimeMs` of 0, which announced `relay-expiring` and closed every socket the instant it arrived. `MIN_TICKER_RUN_MS` (10s) and `MIN_RELAY_LIFETIME_MS` (`2 * RELAY_EXPIRY_LEAD_MS + 1000`, so 11s, because a lifetime has to hold the swap's own lead AND a lead of clearance before the next relay announces) are checked on the *resolved* number at route creation.
+
+**Both numbers above are 800 because that is a Pro plan's cap; 300 is the platform default and the Hobby cap**, which makes the ticker's handoff period 270s and the relay's swap period 290s instead of 700s and 790s. Both configurations were measured on a real Pro deployment, at zero server ticks lost per handoff either way: six warm swaps of six at 300, and six of six again at 800 over 27 minutes. **On a project with Vercel Authentication turned on, turn it off** (or set `VERCEL_AUTOMATION_BYPASS_SECRET` and send it on the spawn): Deployment Protection guards every request to the deployment including one function calling another, so it answers the relay's own fire-and-forget spawn of the ticker route with an SSO redirect, and because that spawn is caught and discarded by design the only symptom is a room that joins, seeds its roster, and then never ticks.
+
+**One more coupling if you set `standbyMs` yourself.** The standby successor is spawned `standbyLeadMs` (3000) before the cap and polls the lease until it wins or gives up, so `standbyMs` has to comfortably exceed that lead **plus the incumbent's own exit**: the lease is released after the final checkpoint and the release, not at the cap itself. The routes pass 8000 against 3000. It also has to fit *inside* `maxRunMs`, because a standby's poll is spent out of the same lifetime budget the platform is measuring from the moment the request arrived. Leave both alone and the defaults already satisfy this.
+
+#### The low-level form: the four factories
+
+`createRoom` composes three exported factories and a session handler, and all three factories are still public and still supported. Reach for them when you genuinely want four different configurations (two deployments on two plans, a relay hosted somewhere else) rather than one room stated once; for anything short of that, the escape hatches above are the same thing without the restatement.
 
 ```ts
 // app/api/ticker/route.ts
 import { createTickerRoute } from 'tickroom/adapters/vercel';
 import { pong } from '@/sim/pong';
 
-// Literals, always. See the note under the fourth route.
 export const runtime = 'nodejs';
 export const maxDuration = 800;
 
@@ -234,12 +381,6 @@ export const GET = createTickerRoute({
   secret: process.env.SESSION_SECRET!,
   isValidBase: (b) => b === 'pong',
   fallbackRoom: 'pong',
-  // THE ONE NUMBER THAT COUPLES THIS LIBRARY TO YOUR PLATFORM, and it is the
-  // same number this file exports as `maxDuration`, in seconds: the tick loop
-  // stops at min(700s, maxDurationS * 1000 - 30s), because the final
-  // checkpoint, the lease release and the successor spawn all happen after the
-  // loop and the platform must not kill them. Lower it on a lower plan limit
-  // and the lifetime follows; raising it does NOT extend the loop past 700s.
   maxDurationS: 800,
 });
 ```
@@ -252,55 +393,24 @@ import { createRelayRoute } from 'tickroom/adapters/vercel';
 export const runtime = 'nodejs';
 export const maxDuration = 800;
 
-// Module scope, so these live as long as this instance does and every socket
-// it serves shares one flush. See `onBadInput` below for why the counting and
-// the flushing have to be separate.
-let badInputs = 0;
-let rateDrops = 0;
-setInterval(() => {
-  if (badInputs || rateDrops) console.warn('relay.input-refused', { badInputs, rateDrops });
-  badInputs = 0;
-  rateDrops = 0;
-}, 10_000);
-
 export const GET = createRelayRoute({
   secret: process.env.SESSION_SECRET!,
   isValidBase: (b) => b === 'pong',
   fallbackRoom: 'pong',
   maxPlayers: 20,
-  // Relative, so it resolves against this request's own origin: fine as
-  // long as the ticker route lives in the same deployment, which is the
-  // common case and what the ticker route above sets up.
+  // Relative, so it resolves against this request's own origin: fine as long
+  // as the ticker route lives in the same deployment.
   tickerUrl: '/api/ticker',
-  // Same coupling, other lifetime, same number as `maxDuration` above. The
-  // relay announces `relay-expiring` and closes at maxDurationS * 1000 - 10s,
-  // and the client swaps to a replacement socket before it does, so the
-  // function's own cap costs no visible gap. Without this the socket is simply
-  // dropped every ~13 minutes.
   maxDurationS: 800,
   // `decodeInput`'s parameter is `unknown`, not `ArrayBuffer`: the real
   // transport behind this route is the `ws` package, which hands over a
-  // `Buffer` rather than a browser-style ArrayBuffer. A FRAGMENTED message
-  // (an array of buffers, which a peer or a proxy chooses for itself) is
-  // joined by the relay before it gets here, so there is nothing to
-  // normalise; a text frame arrives as a `string`.
-  // One JSON array of `{ targetTick, data }` per message, which is what
-  // `PredictedEntity` sends in step 3 (the last six ticks, re-sent whole, so
-  // a lost packet is not a starved tick). A single object is accepted too.
-  decodeInput: (buf) => {
-    const parsed = JSON.parse(new TextDecoder().decode(buf as Uint8Array));
+  // `Buffer` rather than a browser-style ArrayBuffer, and a text frame arrives
+  // as a `string`. `createRoom`'s default does both; this is that default,
+  // written out.
+  decodeInput: (data) => {
+    const parsed = JSON.parse(String(data));
     return Array.isArray(parsed) ? parsed : [parsed];
   },
-  // WIRE `onBadInput`. A decoder that throws is caught and dropped in
-  // silence, by design (this path runs at the client's own rate, so a log
-  // line per bad frame is an amplifier handed to whoever is sending them),
-  // which means the ONLY symptom of a broken decoder is one player whose
-  // inputs stop while the room, the roster, the snapshots and every other
-  // player stay perfectly healthy. Nothing closes, nothing warns. Count it
-  // in process and flush on your own cadence, never per event:
-  // `examples/node-server/server.ts` does exactly that, per socket, every
-  // ten seconds, in five lines. `onRateDrop` is its twin for the frames the
-  // token bucket rejects before the decoder ever runs.
   onBadInput: () => void (badInputs += 1),
   onRateDrop: () => void (rateDrops += 1),
   upgradeWebSocket: experimental_upgradeWebSocket,
@@ -313,14 +423,8 @@ import { makeToken } from 'tickroom/server';
 
 export const runtime = 'nodejs';
 
-// What `mint()` in step 3 calls. The token carries the claims the relay will
-// trust for the whole socket's life, and it EXPIRES: claims are baked in here
-// and no auth provider is consulted again on the socket path (that is the
-// point, it keeps an auth outage off the hot path), so without an expiry a
-// token kept from a paid tier stays redeemable forever after the subscription
-// lapsed. `pid` is a random id here because this quickstart has no accounts;
-// use your own user id the moment you have one, because it is also the key the
-// per-subject socket cap counts against.
+// `room.session` is this, with the room validated against the same pool the
+// other three routes use rather than trusted from the query string.
 export async function POST(req: Request): Promise<Response> {
   const pid = crypto.randomUUID();
   const handle = Math.floor(Math.random() * 65535);
@@ -338,42 +442,25 @@ import { createBalancerRoute } from 'tickroom/adapters/vercel';
 
 export const runtime = 'nodejs';
 
-// Answers `{ room, base, index, full? }`: which physical room instance a
-// joiner should land in. Step 3's `mint()` calls this FIRST, before
-// `/api/session`, so the session it asks for names the room the balancer
-// actually placed it in; it calls this again, this time with `?not=` naming
-// every room that has already refused this client, whenever `onTerminal`
-// sees a `'capacity'` terminal. Keep every refused room, not just the last
-// one: see the re-assign recipe under "Things worth knowing".
+// No `secret` here, unlike the two routes above: this route takes no token and
+// reads no claims. It only reads one stats key per candidate room and hands
+// back an index, and that stats key has a 5s TTL while the ticker enforces
+// capacity authoritatively, so a stale answer here costs a bounced connect,
+// never a wrong one.
 //
-// No `secret` here, unlike the two routes above: this route takes no token
-// and reads no claims. It only reads one stats key per candidate room and
-// hands back an index, and that stats key has a 5s TTL while the ticker
-// enforces capacity authoritatively, so a stale answer here costs a bounced
-// connect, never a wrong one.
-//
-// `maxRooms` is left unset, same as the ticker and relay routes above, so
-// all three default to the same `MAX_ROOMS_PER_BASE` (50). AND THE THREE
-// VALUES MUST AGREE: a balancer at 50 against a relay at 4 hands out
-// `pong~7`, which the relay then refuses as out of range and silently
-// replaces with the fallback room, while every signal on both ends reads
-// healthy and the player sits alone in a room nobody else can see them in.
+// `maxRooms` is left unset, same as the ticker and relay routes above, so all
+// three default to the same `MAX_ROOMS_PER_BASE` (50). AND THE THREE VALUES
+// MUST AGREE: a balancer at 50 against a relay at 4 hands out `pong~7`, which
+// the relay then refuses as out of range and silently replaces with the
+// fallback room, while every signal on both ends reads healthy and the player
+// sits alone in a room nobody else can see them in. That agreement is what
+// `createRoom` makes structural instead of a rule you have to keep.
 export const GET = createBalancerRoute({
   isValidBase: (b) => b === 'pong',
   fallbackBase: 'pong',
   maxPlayers: 20,
 });
 ```
-
-**`runtime` and `maxDuration` are literals in all four files, and `maxDuration` must equal the `maxDurationS` beside it.** Next's route-segment-config parser reads those two exports out of the source text at build time, so `export const runtime = tickerRouteConfig.runtime` fails the build ("Next.js can't recognize the exported `runtime` field in route. It needs to be a static string"); `tickerRouteConfig`/`relayRouteConfig` are still exported as the one place to read the numbers this library expects, but they are documentation, not something to re-export.
-
-`upgradeWebSocket` is **injected, not imported**. tickroom takes no hard dependency on any platform, so the same server core runs behind plain `ws` on a VM (see `adapters/node.ts`).
-
-**`maxDurationS` has a floor as well as a ceiling, and both routes throw at creation if you miss it.** Each derivation is a subtraction (`maxDurationS * 1000` minus a 30s ticker margin, minus a 10s relay margin), so a small enough number produces a *negative* lifetime rather than a short one: `maxDurationS: 10` derived a ticker `maxRunMs` of -20000 and a relay `lifetimeMs` of 0, which announced `relay-expiring` and closed every socket the instant it arrived. `MIN_TICKER_RUN_MS` (10s) and `MIN_RELAY_LIFETIME_MS` (`2 * RELAY_EXPIRY_LEAD_MS + 1000`, so 11s, because a lifetime has to hold the swap's own lead AND a lead of clearance before the next relay announces) are checked on the *resolved* number at route creation, which is module evaluation, so a deployment whose numbers do not fit fails on the first request rather than on every handoff for the rest of its life.
-
-**Both numbers above are 800 because that is a Pro plan's cap; 300 is the platform default and the Hobby cap**, which makes the ticker's handoff period 270s and the relay's swap period 290s instead of 700s and 790s. Both configurations were measured on a real Pro deployment, at zero server ticks lost per handoff either way: six warm swaps of six at 300, and six of six again at 800 over 27 minutes. **On a project with Vercel Authentication turned on, turn it off** (or set `VERCEL_AUTOMATION_BYPASS_SECRET` and send it on the spawn): Deployment Protection guards every request to the deployment including one function calling another, so it answers the relay's own fire-and-forget spawn of the ticker route with an SSO redirect, and because that spawn is caught and discarded by design the only symptom is a room that joins, seeds its roster, and then never ticks.
-
-**One more coupling if you set `standbyMs` yourself.** The standby successor is spawned `standbyLeadMs` (3000) before the cap and polls the lease until it wins or gives up, so `standbyMs` has to comfortably exceed that lead **plus the incumbent's own exit**: the lease is released after the final checkpoint and the release, not at the cap itself. The routes pass 8000 against 3000. It also has to fit *inside* `maxRunMs`, because a standby's poll is spent out of the same lifetime budget the platform is measuring from the moment the request arrived. Leave both alone and the defaults already satisfy this.
 
 **Every server option is reachable from these two factories.** The route option types are `HostTickerOptions`/`HostRelayOptions` intersected with the handful of fields a route genuinely owns, and the bag is *spread* into `runTicker`/`attachRelay` rather than copied field by field. So `init`, `geomKey`, `onGeomMismatch`, `metaPayload`, `metaSeedPayload`, `statsLabels`, `presenceTimeoutMs`, every observability hook and every bound are all just extra keys here. They used to be a hand-picked subset, and a field a type does not name is not an error, it is simply never passed on: twenty options were unreachable that way, with nothing anywhere reporting it.
 
