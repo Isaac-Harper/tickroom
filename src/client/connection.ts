@@ -257,6 +257,15 @@ export interface PredictionOptions<TSnap, TInput> {
    * an ordinary disagreement and exactly wrong for a jump, and the smoother
    * cannot tell the two apart: read this off the snapshot, never off a
    * distance, and never return true per frame.
+   *
+   * IT RUNS AFTER `onSnapshot`, AND SO DOES `ownPose`. A host that detects
+   * the jump by comparing the snapshot against a variable its `onSnapshot`
+   * writes (the seat it holds, whether it is alive) sees no edge, because the
+   * variable already holds the new value: the first consumer on 1.0.0
+   * measured four corrections of a spawn distance, one per respawn, glided
+   * because this never returned true. Keep the previous snapshot's reading in
+   * state only these two hooks touch: record it in `ownPose`, which is called
+   * on every snapshot, and answer here off the last two readings.
    */
   teleported?: ((snap: TSnap) => boolean) | undefined;
   /** Where the prediction starts before the first authoritative pose. The first confirmation replaces it outright. Defaults to the origin. */

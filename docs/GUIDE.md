@@ -563,6 +563,11 @@ const conn = new RoomConnection<Snapshot, string, DefaultInput>({
   // reconcile that confirms a jump you declare. Those three orders are the
   // ones a host got wrong by hand, and there is no call here left to put in
   // the wrong place. The reconciled pose is `frame().own` on the next frame.
+  // One consequence: `ownPose` and `teleported` run AFTER `onSnapshot`, so a
+  // `teleported` that compares the snapshot against a variable `onSnapshot`
+  // writes never sees the edge. Keep the previous snapshot's reading in state
+  // only the two hooks touch (record it in `ownPose`, which runs every
+  // snapshot) and answer off the last two readings.
   predict: {
     // `(pose, input, dt, tick)`. The fourth argument is the tick this call is
     // PRODUCING, which is the record's own `targetTick`: a replay runs several
