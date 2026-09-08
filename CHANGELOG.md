@@ -49,7 +49,9 @@ Each line is a break and its replacement, most likely first.
   `TypeError` naming the option), and `frame().own` as the pose to draw
   (`null` until the first authoritative pose). The connection advances the
   prediction after the counter and the interpolator, reconciles it against
-  every snapshot BEFORE `onSnapshot`, and snaps it before the reconcile when
+  every snapshot AFTER `onSnapshot` has run (so a step reading context the
+  host refreshes from the snapshot replays through this snapshot's context,
+  not the previous one's), and snaps it before the reconcile when
   `predict.teleported(snap)` is true, so none of the three call orders a host
   used to keep by hand exist any more. `conn.own` is the raw prediction (what
   `entity.pose` was) and `conn.ownStats` what `entity.stats` was. Replace

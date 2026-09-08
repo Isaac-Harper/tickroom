@@ -556,10 +556,13 @@ const conn = new RoomConnection<Snapshot, string, DefaultInput>({
   // rate instead of stepping at the tick rate and a counter re-anchor is
   // caught up over a second rather than drawn as a lurch. The connection owns
   // all of it: it advances the prediction inside `frame()` AFTER the counter
-  // and the interpolator, reconciles it against every snapshot BEFORE
-  // `onSnapshot`, and snaps it before the reconcile that confirms a jump you
-  // declare. Those three orders are the ones a host got wrong by hand, and
-  // there is no call here left to put in the wrong place.
+  // and the interpolator, reconciles it against every snapshot AFTER your
+  // `onSnapshot` has run (so a step that reads context you keep from the
+  // snapshot, a grid or a closing ring, replays through THIS snapshot's
+  // context rather than the previous one's), and snaps it before the
+  // reconcile that confirms a jump you declare. Those three orders are the
+  // ones a host got wrong by hand, and there is no call here left to put in
+  // the wrong place. The reconciled pose is `frame().own` on the next frame.
   predict: {
     // `(pose, input, dt, tick)`. The fourth argument is the tick this call is
     // PRODUCING, which is the record's own `targetTick`: a replay runs several

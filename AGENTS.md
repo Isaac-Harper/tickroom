@@ -499,10 +499,15 @@ of what is where, with the load-bearing constants named.
   `FrameView.own` (`null` until `ownConfirmed`, a flag the first reconcile sets
   and `dropHeldPoses` clears, so it is scoped exactly as the held remote poses
   are); `processSnapshot` pushes the frame, calls `interp.teleport(key)` for
-  every key of `interpolate.teleported(snap)`, takes `predict.ownPose(snap)` and
-  when it is not null calls `snapTo` first if `predict.teleported(snap)` and
-  then `reconcile(pose, snap.tick)`, and THEN `onSnapshot`, so a host reads a
-  fully reconciled state from its callback. `conn.own` is the raw prediction and
+  every key of `interpolate.teleported(snap)`, THEN fires `onSnapshot` so the
+  host refreshes whatever context its `step` reads from the snapshot, and only
+  then takes `predict.ownPose(snap)` and, when it is not null, calls `snapTo`
+  first if `predict.teleported(snap)` and then `reconcile(pose, snap.tick)`.
+  THE CALLBACK RUNS BEFORE THE RECONCILE ON PURPOSE: the first cut had the
+  reconcile first so a host could read a reconciled `conn.own` from the
+  callback, and the first consumer's replay then ran every tick through a
+  collision world one snapshot stale. The reconciled pose is a frame away
+  (`frame().own`, `conn.own`). `conn.own` is the raw prediction and
   `conn.ownStats` its diagnostics, both `null` without `predict`.
   `interpolate.into` is OPTIONAL: the connection builds a default
   `SnapshotInterpolator` when it is omitted, held on `this.interp`, the only

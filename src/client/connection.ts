@@ -2132,12 +2132,26 @@ export class RoomConnection<
       }
     }
 
-    // THE OWN ENTITY, BEFORE `onSnapshot`, so a host reads a reconciled
-    // state from its callback rather than the one the previous snapshot left.
-    // A declared teleport SNAPS FIRST and the reconcile is then a fresh
-    // confirmation onto the server's answer; the other way round glides the
-    // server's answer in from the pose before the jump and then snaps to the
-    // host's guess, which is the order a consumer wrote.
+    // `onSnapshot` FIRST, THEN THE OWN ENTITY, and the order is the whole
+    // point. The replay inside `reconcile` runs the host's `step` several
+    // ticks from the SERVER's pose, and a step reads context the host keeps
+    // from the snapshot (a grid, a closing ring, which tiles are solid): the
+    // host refreshes that context in `onSnapshot`. Reconciling before the
+    // callback replays every one of those ticks through the context the
+    // PREVIOUS snapshot left, one snapshot stale on every arrival, which the
+    // first consumer measured as a collision world lagging its own token by a
+    // snapshot. The first cut of this fold had it the other way round so a
+    // host could read a reconciled `conn.own` from the callback; that
+    // convenience is a frame away (`frame().own`, `conn.own`), the stale
+    // replay is not. `runLockstep` runs the same order, so the harness
+    // measures the arrangement that ships. A declared teleport still SNAPS
+    // FIRST and the reconcile is then a fresh confirmation onto the server's
+    // answer; the other way round glides the server's answer in from the pose
+    // before the jump and then snaps to the host's guess, which is the order
+    // a consumer wrote.
+    const snap = decoded;
+    this.emit(() => this.opts.onSnapshot?.(snap));
+
     const predict = this.opts.predict;
     if (predict && this.entity !== null) {
       let pose: Pose | null = null;
@@ -2172,8 +2186,6 @@ export class RoomConnection<
       }
     }
 
-    const snap = decoded;
-    this.emit(() => this.opts.onSnapshot?.(snap));
   }
 
   /**

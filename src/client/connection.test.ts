@@ -4139,11 +4139,15 @@ describe('RoomConnection owns the prediction', () => {
     conn.stop();
   });
 
-  it('reconciles the own entity BEFORE onSnapshot, so the callback reads the state this snapshot produced', async () => {
-    // A host that reads `conn.own` from `onSnapshot` (a camera, a collision
-    // latch) must see the pose this snapshot confirmed and not the one the
-    // previous snapshot left, which is what a hand-wired `reconcile` after the
-    // callback gave it.
+  it('runs onSnapshot BEFORE reconciling the own entity, so the replay reads the context this snapshot carries', async () => {
+    // The replay runs the host's `step` from the server's pose, and a step
+    // reads context the host refreshes from the snapshot in `onSnapshot` (a
+    // grid, a closing ring). Reconciling first replays through the context
+    // the PREVIOUS snapshot left, one snapshot stale on every arrival, which
+    // a consumer measured as its collision world lagging its own token. So
+    // the callback sees the prediction as the previous snapshot left it (the
+    // initial pose before any confirmation; `frame().own` is what is null
+    // then), and the reconciled pose is there on the very next frame.
     useMonotonicFakeTimers();
     const seen: { own: Pose | null; snaps: number }[] = [];
     const { conn, deliver } = predictRoom(
@@ -4153,7 +4157,11 @@ describe('RoomConnection owns the prediction', () => {
     await conn.start();
     live().open();
     deliver({ tick: 100, serverTime: performance.now(), own: { x: 50, y: 50 } });
-    expect(seen).toEqual([{ own: { x: 50, y: 50 }, snaps: 1 }]);
+    expect(seen).toEqual([{ own: { x: 0, y: 0 }, snaps: 0 }]);
+    expect(conn.own).toEqual({ x: 50, y: 50 });
+    expect(conn.ownStats!.snaps).toBe(1);
+    deliver({ tick: 101, serverTime: performance.now(), own: { x: 50, y: 50 } });
+    expect(seen[1]).toEqual({ own: { x: 50, y: 50 }, snaps: 1 });
     conn.stop();
   });
 
