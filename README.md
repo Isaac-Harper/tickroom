@@ -1004,17 +1004,46 @@ traces diverge, so the first cannot pass vacuously.
 
 ## Verification
 
+The suite is 44 files in three tiers, split by what a machine has to be for the
+answer to mean anything.
+
 ```bash
-npm test                       # 1067 tests, no services needed (63 more skip)
+npm run test:unit              # 1098 tests across 32 files, NO services at all
 redis-server --port 6399 --save '' --appendonly no --daemonize yes
-npm run test:integration       # the same architecture against a real Redis
+npm run test:integration       # 1145 across 40, the same architecture on a real Redis
+npm run test:measure           # 16 across 4, wall-clock numbers, quiet machine only
+npm test                       # all three, 1161 across 44
 ```
 
-The integration suite skips cleanly (exit 0) when no Redis is reachable, so the
-default run stays green offline; with one up the same command is **1130 across 43
-files**, all green, and `npx tsc --noEmit` is clean repo-wide including
-`examples/`. (`tests/memory.test.ts` is the one file in there that needs nothing
-and runs either way, which is the claim it exists to check.) Measured on Redis 8.10.1:
+| tier | what it is | needs | where it runs |
+| --- | --- | --- | --- |
+| `unit` | no services, outcome decided by the code | nothing | CI on every push and PR |
+| `integration` | real Redis, outcome still decided by the code: a checkpoint round trips, a lease is refused, a subscriber survives a reconnect | Redis on 6399 | CI, and the **release gate** |
+| `measure` | real Redis and a wall clock: a rate band, a latency bound, a zero-tolerance smoothness claim | Redis on 6399, and a quiet host | nightly, and by hand on a dedicated machine |
+
+`test:measure` runs its four files one at a time rather than in parallel,
+because four files each driving a 60Hz render loop and a real socket are, run
+together, each other's load. `test:unit` must pass with nothing listening
+anywhere, which is the promise
+`createMemoryRedis` makes to a consumer who never stands up a Redis, and
+`tests/memory.test.ts` is the file that checks it. `test:integration` and
+`test:measure` set `TICKROOM_REQUIRE_REDIS=1`, so an unreachable Redis fails
+loudly instead of skipping to a green exit that asserted nothing. `npx tsc
+--noEmit` is clean repo-wide including `examples/`.
+
+**The measurement tier is not on the release gate, on purpose.** Its bounds are
+readings, not tolerances, and a shared CI runner cannot take a reading: the
+v0.3.0 release failed twice on two different timing bounds while the same commit
+was green locally both times. Loosening a bound to survive that throws away the
+measurement to save the release, so the split is the fix instead. Every number
+quoted below and in `AGENTS.md` comes from `npm run test:measure` on a quiet
+machine. A few wall-clock cases still sit inside otherwise deterministic files
+(`tests/ticker.redis.test.ts`, `tests/faults.redis.test.ts`); those are gated on
+a timer-jitter probe (`tests/helpers/jitter.ts`) and **skip loudly**, naming the
+factor they measured, rather than reddening on a bound the host cannot honestly
+meet.
+
+Measured on Redis 8.10.1:
 
 | | measured |
 | --- | --- |
@@ -1457,17 +1486,24 @@ tab hidden for more than five minutes was untested at the time because no
 browser automation in that round could produce one, which the Vercel run has
 since closed.
 
-CI runs the typecheck, the unit tests and the build on every push and PR, plus
-the integration suite against a Redis service container. Releases publish from a
-tag through npm trusted publishing, so no token is stored anywhere, and the
-release workflow now stands up **the same Redis service CI does** and requires
-it. That matters more than it sounds: the real-Redis files skip cleanly when
-nothing is listening, so without the service the publishing build ran `npm test`
-to a green exit having executed zero assertions in the lease, checkpoint,
-handoff, subscriber, smoothness and fault-injection suites. A gate that cannot
+CI runs the typecheck, the build and the unit tier with no services on every
+push and PR, plus the integration tier against a Redis service container.
+Releases publish from a tag through npm trusted publishing, so no token is
+stored anywhere, and the release workflow stands up **the same Redis service CI
+does** and requires it. That matters more than it sounds: the real-Redis files
+skip cleanly when nothing is listening, so without the service the publishing
+build ran to a green exit having executed zero assertions in the lease,
+checkpoint, handoff, subscriber and fault-injection suites. A gate that cannot
 fail is worse than no gate, and this is the one build whose version number is
-burned forever, so the release gate is now at least as strong as CI rather than
+burned forever, so the release gate is at least as strong as CI rather than
 weaker.
+
+The release gate runs the **integration tier**, not the measurement one. A
+publish blocked by a noisy shared runner is a publish blocked by nothing, and
+the pressure it creates is to widen the bound rather than to fix the code. The
+measurement tier runs nightly instead (`.github/workflows/nightly.yml`,
+reporting only, uploading its log as an artifact and blocking nothing) and by
+hand on the quiet machine the numbers above were taken on.
 
 **What is still open**, mirroring the list `AGENTS.md` keeps:
 

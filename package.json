@@ -65,7 +65,9 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:integration": "vitest run tests",
+    "test:unit": "TICKROOM_TIER=unit vitest run",
+    "test:integration": "TICKROOM_TIER=integration TICKROOM_REQUIRE_REDIS=1 vitest run",
+    "test:measure": "TICKROOM_TIER=measure TICKROOM_REQUIRE_REDIS=1 vitest run",
     "example:node": "tsx examples/node-server/server.ts"
   },
   "keywords": [

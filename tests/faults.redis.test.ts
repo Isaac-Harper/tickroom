@@ -61,11 +61,26 @@ import {
   skipReason,
   waitFor,
 } from './helpers/env.js';
+import { TOO_JITTERY, jitterSkipReason } from './helpers/jitter.js';
 
 const REDIS_AVAILABLE = await probeRedisAvailable();
 if (!REDIS_AVAILABLE) console.warn(`[tickroom integration: faults] ${skipReason()}`);
 
+// THREE OF THE FIVE CASES BELOW TIME HOW LONG A FAULT TOOK TO BE NOTICED, and
+// that is a reading of the host's scheduling as much as of the ticker: the two
+// black-hole cases bound the exit against a probe deadline and a lease TTL
+// aging out, and the restart case asserts the loop ran to within 100ms of its
+// configured cap. Those bounds are derived from the shipped constants and
+// cannot be widened without ceasing to discriminate the fault they name from
+// the fault next to it, so on a host too loaded to measure they skip loudly
+// rather than redden: see `helpers/jitter.ts`. The lease-theft and crash-loop
+// cases assert on tick numbers and a counter that Redis holds, which are the
+// same answer on any machine, so they run regardless.
+if (TOO_JITTERY) console.warn(jitterSkipReason('faults'));
+
 const d = REDIS_AVAILABLE ? describe : describe.skip;
+/** For the timed cases only. Redis reachability gates the whole file; this gates the cases the machine's own scheduling decides. */
+const itSteady = it.skipIf(TOO_JITTERY);
 
 /**
  * MIRRORS OF `src/server/ticker.ts`'s OWN MODULE-PRIVATE CONSTANTS, copied
@@ -218,7 +233,7 @@ d('fault injection / real Redis behind a TCP proxy', () => {
     return envelope === null ? -1 : envelope.tick;
   }
 
-  it('A BLACK-HOLED INPUT SUBSCRIBER while the shared client stays healthy: exits input-dead, releases the lease, hands over, and applies none of what it could not see', async () => {
+  itSteady('A BLACK-HOLED INPUT SUBSCRIBER while the shared client stays healthy: exits input-dead, releases the lease, hands over, and applies none of what it could not see', async () => {
     const roomId = freshRoomId('input-dead');
     const keys = roomKeys(roomId, namespace);
 
@@ -309,7 +324,7 @@ d('fault injection / real Redis behind a TCP proxy', () => {
     expect(stored.players).toContain(PID);
   }, CASE_TIMEOUT_MS);
 
-  it('A BLACK-HOLED SHARED CLIENT while the subscriber stays healthy: publishes stop being confirmed, the awaited guard renew times out, and the finally still runs', async () => {
+  itSteady('A BLACK-HOLED SHARED CLIENT while the subscriber stays healthy: publishes stop being confirmed, the awaited guard renew times out, and the finally still runs', async () => {
     const roomId = freshRoomId('bus-dead');
     const keys = roomKeys(roomId, namespace);
 
@@ -497,7 +512,7 @@ d('fault injection / real Redis behind a TCP proxy', () => {
     expect(Math.abs(finalTick - (restoredTick + resultB.ticks))).toBeLessThanOrEqual(2);
   }, CASE_TIMEOUT_MS);
 
-  it('A REDIS RESTART: both connections severed and restored 300ms later, the ticker rides it out, the subscription comes back, and nothing rejects unhandled', async () => {
+  itSteady('A REDIS RESTART: both connections severed and restored 300ms later, the ticker rides it out, the subscription comes back, and nothing rejects unhandled', async () => {
     const roomId = freshRoomId('restart');
     const keys = roomKeys(roomId, namespace);
     const runMs = 6000;

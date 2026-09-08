@@ -31,12 +31,15 @@ trusted-publisher entry did not exist. IT EXISTS NOW, added on 2026-09-07
 (Package tickroom, Settings, Trusted Publisher: `Isaac-Harper/tickroom`,
 workflow `release.yml`, permissions npm publish and npm stage publish). The
 same tag's re-runs also showed the OTHER way the workflow fails: the suite it
-gates on is a wall-clock measurement, and the shared runner fired a timer late
-enough to miss two different bounds on two consecutive re-runs of a commit
+gated on included wall-clock measurements, and the shared runner fired a timer
+late enough to miss two different bounds on two consecutive re-runs of a commit
 that was green locally both times (`example-cursors.redis.test.ts`, two 400ms
 probes coalesced into one tick; `splitbrain.redis.test.ts`, 780ms against a
-740ms theft bound). Both are fixed at the source (see their comments) and
-`vitest.config.ts` retries once when `CI` is set. Both 0.2.0 and 0.3.0 were
+740ms theft bound). Both are fixed at the source (see their comments), and THE
+GATE NO LONGER RUNS EITHER FILE: the suite is tiered now (see Gates), the
+release gates on `test:integration`, and both of those files are in the
+`measure` tier that runs nightly and on a quiet machine. `vitest.config.ts`
+still retries once when `CI` is set, as the second line. Both 0.2.0 and 0.3.0 were
 published from a laptop session (`npm publish --access public` against the
 tagged tree, no OTP prompt) and carry no provenance. v0.3.1 WAS THE WORKFLOW'S
 FIRST OWN PUBLISH, on 2026-09-07: the suite passed on the runner first time,
@@ -2880,33 +2883,81 @@ passed through whole.
 From the repo root:
 
 ```
-npx tsc --noEmit     # typecheck, must be clean
-npx vitest run       # all tests; the tests/ files skip with no Redis reachable
-npm run build        # tsc -p tsconfig.build.json, emits dist/
-npm run test:integration   # tests/ only, needs a real Redis (see below)
+npx tsc --noEmit           # typecheck, must be clean
+npm run build              # tsc -p tsconfig.build.json, emits dist/
+npm run test:unit          # the unit tier, NO services anywhere, must be green offline
+npm run test:integration   # unit + integration tiers, needs a real Redis (see below)
+npm run test:measure       # the measurement tier, real Redis AND a quiet machine
+npm test                   # all 44 files, every tier, what a developer runs
 npm run example:node       # tsx examples/node-server/server.ts, see its README
 ```
 
-`.github/workflows/ci.yml` runs the first three on every push and PR to main, and
-the fourth in a second job against a Redis service container. Note `npm install`
-now runs `prepare`, hence `build`, so a broken build fails at install time. The
-fifth is not a gate, it is the fastest way to drive a real client through a real
-Redis by hand; `tsx` is a devDependency for it, and
-`examples/node-server/README.md` is the operating manual.
+`.github/workflows/ci.yml` runs the typecheck, the build and `test:unit` with no
+services on every push and PR to main, and `test:integration` in a second job
+against a Redis service container. `release.yml` gates on build, typecheck and
+`test:integration`. `nightly.yml` runs `test:measure` on a schedule, uploads its
+log as an artifact, and blocks nothing. Note `npm install` runs `prepare`, hence
+`build`, so a broken build fails at install time. `example:node` is not a gate,
+it is the fastest way to drive a real client through a real Redis by hand; `tsx`
+is a devDependency for it, and `examples/node-server/README.md` is the operating
+manual.
 
-BOTH WORKFLOWS REQUIRE REDIS NOW, AND THE RELEASE GATE IS THE ONE THAT DID NOT.
-`ci.yml`'s integration job has always run `redis:8` on host port 6399 with
+THE SUITE IS TIERED, AND THE TIER IS WHAT DECIDES WHERE A FILE RUNS. Three
+tiers, selected by `TICKROOM_TIER` in `vitest.config.ts` (one env var and one
+list of globs, rather than three config files that are three chances to add a
+new file to two of them):
+
+- `unit`: no services, the outcome decided by the code. 32 files.
+- `integration`: real Redis, the outcome STILL decided by the code (a checkpoint
+  round trips, a lease is refused, a subscriber survives a reconnect, an
+  admission is granted). Includes the unit tier rather than replacing it, so
+  it is 40 files, and it is the release gate.
+- `measure`: real Redis AND a wall clock (a rate band, a latency bound, a
+  zero-tolerance smoothness claim). 4 files. Nightly and by hand on a quiet
+  machine, NEVER on a required check. THIS TIER RUNS ITS FILES ONE AT A TIME
+  (`fileParallelism: false`), which is part of the measurement rather than a
+  convenience: four files each driving a 60Hz render loop and a real socket are,
+  in parallel, each other's load. Measured on the laptop, the cursors example
+  fails on probes a starved timer coalesced when the four race and passes run
+  alone on the same tree in the same minute. It costs the sum rather than the
+  max, about two minutes.
+
+The per-file classification is the table at the end of the Status section, and
+that table is the source of truth: a new file under `tests/` runs under `npm
+test` from the moment it is written (the default include is still the catch-all
+glob) but reaches no gate until it is added to `INTEGRATION` or `MEASUREMENT` in
+`vitest.config.ts` and to that table.
+
+WHY THE MEASUREMENT TIER IS OFF THE RELEASE GATE. It used to be on it, via `npm
+test`, and it cost two release runs: v0.3.0 failed twice on two different timing
+bounds on a shared GitHub runner while the same commit was green locally both
+times. A publish blocked by a noisy runner is a publish blocked by nothing, and
+the pressure that creates is to widen the bound, which throws away the
+measurement to save the release. The tier split is the fix. Last week's
+`retry: 1` when `CI` is set is still in `vitest.config.ts` as the SECOND line,
+covering the wall-clock cases that still ride inside `ticker.redis.test.ts` and
+`faults.redis.test.ts` on a runner; it does not loosen a bound, it asks the host
+to meet it once more, and locally it is 0 so a real regression is red on the
+first run. `JITTER_LIMIT` stays 1.5 and its doc comment now says why raising it
+is the wrong move: it is not a tolerance on the library, it is the point past
+which the host has no instrument, and the fix for a failing measurement on a
+shared runner is the tier, not the constant.
+
+BOTH GATING WORKFLOWS REQUIRE REDIS, AND THE RELEASE GATE IS THE ONE THAT DID
+NOT. `ci.yml`'s integration job has always run `redis:8` on host port 6399 with
 `TICKROOM_REQUIRE_REDIS=1`, which is what stops a misnamed service producing a
 green job that ran no assertions. `release.yml` had neither, and the suite skips
 cleanly with nothing listening, so the PUBLISHING build exited 0 having run zero
-assertions in the lease, checkpoint, handoff, subscriber, smoothness and
-fault-injection files: the one build whose version number is burned forever was
-the one build nobody checked. It now stands up the identical `redis:8` service
-on 6399 and sets `TICKROOM_TEST_REDIS_URL` and `TICKROOM_REQUIRE_REDIS=1` on its
-own `npm test` step, so the release gate is at least as strong as CI rather than
-weaker than it. Both `ci.yml` jobs carry `timeout-minutes: 20` and the release
-job carries 30, because a hung job that never fails is the same shape of
-non-gate as one that cannot fail.
+assertions in the lease, checkpoint, handoff, subscriber and fault-injection
+files: the one build whose version number is burned forever was the one build
+nobody checked. It now stands up the identical `redis:8` service on 6399 and
+sets `TICKROOM_TEST_REDIS_URL` and `TICKROOM_REQUIRE_REDIS=1` on its own test
+step. The require flag is ALSO baked into the `test:integration` and
+`test:measure` scripts, so a run started by hand cannot skip its way to green
+either; the workflows repeat it so each file states the requirement rather than
+inheriting it from a script somebody could edit. Both `ci.yml` jobs carry
+`timeout-minutes: 20`, the release job 30 and the nightly 45, because a hung job
+that never fails is the same shape of non-gate as one that cannot fail.
 
 `build` IS `rm -rf dist && tsc -p tsconfig.build.json`, AND THE `rm -rf` IS LOAD
 BEARING. See the gotcha below. Measured on this tree after a clean build,
@@ -2915,15 +2966,20 @@ Re-measure those three numbers after a build rather than quoting them forward:
 they are the only thing that would have caught what the gotcha describes.
 
 Most tests are unit tests against a fake in-memory Redis written inline in the
-test files, so the default run works offline with no services; `tests/` is the
-real-Redis suite and skips cleanly when there is none.
+test files, so `npm test` works offline with no services; the eleven
+`*.redis.test.ts` files are the real-Redis suite and skip cleanly when there is
+none. `test:unit` is the tier that must be green with nothing listening, and the
+way to prove it is to point `TICKROOM_TEST_REDIS_URL` at an unused port
+(`TICKROOM_TEST_REDIS_URL=redis://127.0.0.1:6499 npm run test:unit`) rather than
+to trust that nothing was running.
 
-`TICKROOM_SPLITBRAIN_REPS=10 npm run test:integration` IS A LONG FORM, NOT A
-GATE. One rep of `tests/splitbrain.redis.test.ts`'s eight cases is what CI runs;
-ten reps (80 passed on fw13) is what a quiet machine runs when anything in
-`lease.ts`, the renew cadence or the lease constants moves, because a margin
-measured once is an anecdote. The rest of the work that takes minutes belongs
-on that machine too, for the reason the Status section gives.
+`TICKROOM_SPLITBRAIN_REPS=10 npm run test:measure` IS A LONG FORM, NOT A GATE,
+and `test:measure` rather than `test:integration` is where split-brain lives
+now. One rep of `tests/splitbrain.redis.test.ts`'s eight cases is what the
+nightly runs; ten reps (80 passed on fw13) is what a quiet machine runs when
+anything in `lease.ts`, the renew cadence or the lease constants moves, because
+a margin measured once is an anecdote. The rest of the work that takes minutes
+belongs on that machine too, for the reason the Status section gives.
 
 `tsconfig.json` sets `noUncheckedIndexedAccess: false` (see the verdict further
 down) and `exactOptionalPropertyTypes: true`, AND THE SECOND ONE IS FOR THE
@@ -2959,12 +3015,15 @@ nothing here saw it.
 
 ## Status
 
-MEASURED ON THIS TREE, not estimated: `npx vitest run` collects 1171 tests
-across 46 files (with a local Redis up on 6399, so the THIRTEEN integration files
-run rather than skip; pointed at an unreachable one with
-`TICKROOM_TEST_REDIS_URL=redis://127.0.0.1:6499` it is 1107 passed and 64
-skipped across 33 files run and 13 skipped, still exit 0, because
-`tests/memory.test.ts` needs nothing and runs either way); the last fw13 run of
+MEASURED ON THIS TREE, not estimated, PER TIER: `npm run test:unit` is 1098
+passed across 32 files with `TICKROOM_TEST_REDIS_URL` pointed at an unused port
+(6499), which is the no-services promise proved rather than assumed;
+`npm run test:integration` is 1145 across 40 with a local Redis on 6399;
+`npm run test:measure` is 16 across 4 on the same Redis and a quiet laptop;
+`npm test` is the sum, 1161 across 44. Forced jittery (JITTER_LIMIT dropped to
+1.0 for the check, then restored) the integration tier is 1139 passed and 6
+skipped and still exit 0, and the measurement tier is 16 skipped and still exit
+0, which is the loud-skip path exercised rather than argued. The last fw13 run of
 the same suite, at the 1130 it collected at 0.2.0 before the 0.3.0 client work,
 `src/testing/lockstep.test.ts` and the relay's fragment cases, was exit 0 with
 a real Redis too; `npx tsc --noEmit` is clean repo-wide including `examples/`;
@@ -2994,13 +3053,18 @@ genuine 2s wall-clock deadline and cannot be anything else, carries a
 calibrated tolerance (`JITTER_SCALE`, capped at 3x); the DOM `WebSocket`
 assignment test guards the global rather than assuming one (Node 20 has none,
 22 and every browser do); and the checkpoint exact-bound spacing case was a
-fake clock racing a real gzip, which has its own gotcha above. THE TWO
-END-TO-END FILES KEEP THEIR TIGHT BARS AND SKIP LOUDLY INSTEAD:
-`smoothness.redis.test.ts` and three fixed-window cases of
-`ticker.redis.test.ts` assert zero backward steps and zero motionless frames,
-there is no honest way to scale a bound of zero, so `tests/helpers/jitter.ts`
-decides whether the host can measure at all and the files say why when it
-cannot.
+fake clock racing a real gzip, which has its own gotcha above. THE FILES THAT
+CANNOT BE FIXED AT THE SOURCE KEEP THEIR TIGHT BARS, MOVE TO THE MEASUREMENT
+TIER, AND SKIP LOUDLY: `smoothness.redis.test.ts`, `splitbrain.redis.test.ts`,
+`example.redis.test.ts` and `example-cursors.redis.test.ts` assert zero backward
+steps, zero motionless frames, a millisecond overlap between two real tickers
+and a snapshot rate inside +-10%, and there is no honest way to scale a bound of
+zero. Three fixed-window cases of `ticker.redis.test.ts` and three timed cases
+of `faults.redis.test.ts` stay inside their otherwise deterministic files and
+carry the same gate per case (`itSteady = it.skipIf(TOO_JITTERY)`), because the
+rest of each file is worth gating a release on. In every one of those places
+`tests/helpers/jitter.ts` decides whether the host can measure at all and the
+file says why when it cannot, with the measured factor in the reason.
 
 PER FILE, which is what a mutation row is measured against: `ticker.test.ts`
 146, `relay.test.ts` 127, `connection.test.ts` 122, `interpolation.test.ts` 64,
@@ -3072,6 +3136,76 @@ for why those counts are lower bounds rather than stale.
   design: the lease, the checkpoint handoff, the playout timeline, the stall
   thresholds and the interpolation rules were all measured there under real load.
   Where a number in a comment is quoted as "measured", that is where it came from.
+
+### The tier of every test file
+
+THE SOURCE OF TRUTH FOR THE SPLIT. `vitest.config.ts` follows this table; if the
+two disagree the config is wrong. A file added under `tests/` runs under `npm
+test` immediately (the default include is still the catch-all glob) and reaches
+NO gate until it appears both here and in `INTEGRATION` or `MEASUREMENT` there.
+
+The three questions the tiers answer are different, which is the whole reason
+for the split: `unit` and `integration` are decided by the CODE and are the same
+answer on any machine, so they gate a release. `measure` is decided by the WALL
+CLOCK and is only an answer on a machine quiet enough to take a reading, so it
+gates nothing and runs nightly and on fw13.
+
+| file | tier | why |
+| --- | --- | --- |
+| `src/adapters/node.test.ts` | unit | no services |
+| `src/adapters/vercel.test.ts` | unit | no services |
+| `src/client/bundling.test.ts` | unit | no services |
+| `src/client/clientTick.test.ts` | unit | no services |
+| `src/client/connection.test.ts` | unit | no services; its reconnect ladder steps timer to timer rather than over wall time |
+| `src/client/errorOffset.test.ts` | unit | no services |
+| `src/client/interpolation.test.ts` | unit | no services |
+| `src/client/netPolicy.test.ts` | unit | no services |
+| `src/client/predictedEntity.test.ts` | unit | no services |
+| `src/codec/bytes.test.ts` | unit | no services |
+| `src/codec/quantize.test.ts` | unit | no services |
+| `src/codec/snapshot.test.ts` | unit | no services |
+| `src/core/backpressure.test.ts` | unit | no services |
+| `src/core/checkpoint.test.ts` | unit | no services |
+| `src/core/ids.test.ts` | unit | no services |
+| `src/core/lease.test.ts` | unit | no services; the pure clock functions and a fake Redis |
+| `src/core/metrics.test.ts` | unit | no services |
+| `src/core/playout.test.ts` | unit | no services |
+| `src/core/rateLimit.test.ts` | unit | no services |
+| `src/core/starvation.test.ts` | unit | no services |
+| `src/server/admission.test.ts` | unit | no services |
+| `src/server/balancer.test.ts` | unit | no services |
+| `src/server/checkpoint.test.ts` | unit | no services |
+| `src/server/redis.test.ts` | unit | no services; pins the OPTIONS the factory passes, not what they do |
+| `src/server/relay.test.ts` | unit | no services; its throttled-interval liveness pair runs on fake timers |
+| `src/server/session.test.ts` | unit | no services |
+| `src/server/ticker.test.ts` | unit | no services; ends on a SAMPLE COUNT rather than a fixed wall-clock window |
+| `src/testing/lockstep.test.ts` | unit | no services |
+| `examples/cursors/sim.test.ts` | unit | no services, pure simulation |
+| `examples/pong/codec.test.ts` | unit | no services, pure codec |
+| `examples/pong/sim.test.ts` | unit | no services, pure simulation |
+| `tests/memory.test.ts` | unit | THE ONE FILE UNDER `tests/` THAT NEEDS NOTHING, which is the claim it exists to check: `createMemoryRedis` is the bus. It drives a real `ws` socket over four seconds, but its bounds are presence claims (a frame drew the paddle, a step was exactly one tick of `PADDLE_SPEED`) and 0.5x-generous counts, not a rate band |
+| `tests/checkpoint.redis.test.ts` | integration | real Redis; gzip round trips or it does not. Its TTL bounds are the server's own, with seconds of slack |
+| `tests/e2e.redis.test.ts` | integration | real Redis and a real socket; admission decisions and "a snapshot arrived", all polled to a condition |
+| `tests/faults.redis.test.ts` | integration, 3 of 5 cases gated | real Redis behind a proxy. Lease theft and the crash loop assert on tick numbers and a counter Redis holds: same answer anywhere. The two black-hole cases and the restart case TIME the exit against a probe deadline, a lease TTL and a run cap, so they are `itSteady` (`it.skipIf(TOO_JITTERY)`) |
+| `tests/lease.redis.test.ts` | integration | real Redis; N concurrent SET NX, the Lua owner checks, a TTL expiring on the server clock. The one timing bound is a 5000 to 8000ms window on a TTL |
+| `tests/pubsub.redis.test.ts` | integration | real Redis; fan-out cost and subscribe-mode locking, both counted rather than timed |
+| `tests/redisLike.test.ts` | integration | real Redis; every `RedisLike` method against real ioredis. No timing at all |
+| `tests/subscriber.redis.test.ts` | integration | real Redis and two child processes; the control DIES and the fixed one SURVIVES, which is a binary outcome, not a duration |
+| `tests/ticker.redis.test.ts` | integration, 3 of 5 cases gated | real Redis. The stats-TTL and handoff cases are polled to a condition. The rate case's +-25% band and the two geometry cases' interlocking floor/ceiling on a 200Hz loop are wall-clock counts, so they are `itSteady` |
+| `tests/example-cursors.redis.test.ts` | measurement | real Redis, real socket, real client on a 16ms timer. Snapshot rate inside +-10% of 20Hz and a move-to-snapshot latency bound built from a send period plus a round trip plus a tick |
+| `tests/example.redis.test.ts` | measurement | same rig around `examples/pong`. Snapshot rate inside +-10%, zero frames that failed to draw, and a paddle step that is EXACTLY one tick of `PADDLE_SPEED` on every unsaturated step |
+| `tests/smoothness.redis.test.ts` | measurement | a real 60Hz render loop over a real socket, asserting zero backward steps, zero motionless frames, zero blank frames. Already carried the jitter gate |
+| `tests/splitbrain.redis.test.ts` | measurement | two real tickers racing one Redis; the overlap is in milliseconds and the lapse assertions carry no slack term at all by design |
+
+TWO FILES ARE MIXED AND STAY WHERE THEY ARE. `ticker.redis.test.ts` and
+`faults.redis.test.ts` each carry a few wall-clock cases inside a mostly
+deterministic file, and the deterministic majority (the handoff, the stats TTL,
+the lease theft, the crash counter) is exactly what a release gate is for. So
+the measurement cases are gated PER CASE inside the file rather than the file
+being moved out of the gate, which is the smaller loss: on a quiet host they run
+everywhere the file runs, and on a loaded one they skip loudly and the rest of
+the file still gates.
+
 
 ### Verified by mutation, not just observed green
 
@@ -5589,10 +5723,13 @@ its reasoning and everything unstruck is open today.
   LOOP rather than the target is what governs a one-tick cushion, and sweeping
   the target would mean exposing the constant as an option, which was a
   deliberate no.
-- ~~No CI.~~ LANDED: `.github/workflows/ci.yml`, two jobs. `check` runs
-  typecheck, unit tests and build with no services (the `tests/` files skip).
+- ~~No CI.~~ LANDED: `.github/workflows/ci.yml`, two jobs. `unit` runs
+  typecheck, `npm run test:unit` and build with NO services anywhere, which is
+  the no-services promise proved rather than assumed.
   `integration` runs `npm run test:integration` against a `redis:8` service
-  container on host port 6399, the same port the local instructions use. There is
+  container on host port 6399, the same port the local instructions use. A third
+  workflow, `nightly.yml`, runs `npm run test:measure` on a schedule and blocks
+  nothing; the tier table in Status says which file is which. There is
   still no `lint` script, so CI runs no linter; add the script before adding the
   step. THE INTEGRATION JOB CANNOT PASS VACUOUSLY: the suite's skip-when-
   unreachable behaviour is right on a laptop and exactly wrong in the job whose

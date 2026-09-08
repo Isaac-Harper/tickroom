@@ -1,0 +1,106 @@
+# WHICH TIER THIS RUNS, AND WHY: `measure`, and only `measure`.
+#
+# The measurement tier is the four files whose assertions are about the wall
+# clock rather than about the code: `smoothness.redis.test.ts` (zero backward
+# steps, zero motionless frames, over a real 60Hz render loop),
+# `splitbrain.redis.test.ts` (an overlap in milliseconds between two real
+# tickers), `example.redis.test.ts` and `example-cursors.redis.test.ts` (a
+# snapshot rate inside +-10% and a move-to-snapshot latency). Those are the
+# library's headline numbers, and they are only numbers on a machine quiet
+# enough to take a reading.
+#
+# THIS WORKFLOW BLOCKS NOTHING, AND THAT IS THE POINT. It is not a required
+# check, the test step carries `continue-on-error`, and the artifact is
+# uploaded whatever happened. A shared GitHub runner is a noisy machine: the
+# v0.3.0 release failed twice on two different timing bounds while the same
+# commit was green locally both times, which is a fact about the runner and
+# was, for two runs, treated as a fact about the library. So this job REPORTS
+# and CI decides nothing from it. What it catches is a drift big enough to
+# survive the noise, and the jitter gate in `tests/helpers/jitter.ts` marks the
+# runs where the host could not measure at all: those show as loud skips with
+# the measured factor in the reason rather than as red.
+#
+# The numbers quoted in README.md and AGENTS.md do NOT come from here. They
+# come from `npm run test:measure` on the fw13 machine, quiet and dedicated,
+# which is the only place a reading is worth writing down.
+name: nightly measurements
+
+on:
+  schedule:
+    # 04:20 UTC, off the hour: GitHub's shared scheduler is busiest exactly on
+    # it, and this is the one workflow whose whole subject is a quiet runner.
+    - cron: '20 4 * * *'
+  workflow_dispatch:
+
+# Not cancel-in-progress: two overlapping measurement runs are two readings,
+# and killing the older one throws away the earlier of the pair for no reason.
+concurrency:
+  group: nightly-measure
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    name: measurement tier (real Redis, reporting only)
+    runs-on: ubuntu-latest
+    # Longer than CI's 20: this tier is minutes of real wall time by
+    # construction (a 30 second smoothness run per scenario, eight split-brain
+    # scenarios each waiting out a lease TTL), and a hung job that never fails
+    # is the same shape of non-gate as one that cannot fail.
+    timeout-minutes: 45
+
+    services:
+      redis:
+        image: redis:8
+        ports:
+          # The same host port CI and a laptop use, so one URL is correct
+          # everywhere. See tests/helpers/env.ts.
+          - 6399:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Measurement tier
+        id: measure
+        # Reporting, never blocking: a red here is as likely to be the runner as
+        # the library, and the workflow exists to produce the log rather than to
+        # pass judgement on the commit.
+        continue-on-error: true
+        env:
+          TICKROOM_TEST_REDIS_URL: redis://127.0.0.1:6399
+          # Same reason as CI: this job's entire purpose is the real-Redis
+          # files, so an unreachable Redis must fail loudly rather than skip to
+          # a green exit that measured nothing.
+          TICKROOM_REQUIRE_REDIS: '1'
+        # `set -o pipefail` so the step's own outcome still reflects vitest
+        # rather than tee's, even though nothing downstream blocks on it.
+        # Every measurement this suite takes is printed to stdout by the files
+        # themselves (the `[measured]` lines), so the log IS the result.
+        run: |
+          set -o pipefail
+          npm run test:measure 2>&1 | tee measure.log
+
+      - name: Upload the measurement log
+        # Always, including after a failed or skipped run: a run where the host
+        # was too jittery to measure is exactly the run worth reading, and the
+        # skip reason with its measured factor is in this file.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: measure-log-${{ github.run_id }}
+          path: measure.log
+          if-no-files-found: warn
+          retention-days: 30

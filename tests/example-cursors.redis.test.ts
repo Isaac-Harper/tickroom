@@ -56,11 +56,23 @@ import { attachNodeRelay } from '../src/adapters/node.js';
 import { cursorsRuntime, type CursorsEvent, type CursorsState } from '../examples/cursors/sim.js';
 import { createCursorsClient, type CursorsSnapshot } from '../examples/cursors/client.js';
 import { TEST_REDIS_URL, probeRedisAvailable, newNamespace, flushNamespace, skipReason, waitFor } from './helpers/env.js';
+import { TOO_JITTERY, jitterSkipReason } from './helpers/jitter.js';
 
 const REDIS_AVAILABLE = await probeRedisAvailable();
 if (!REDIS_AVAILABLE) console.warn(`[tickroom integration: example-cursors] ${skipReason()}`);
 
-const d = REDIS_AVAILABLE ? describe : describe.skip;
+// THE ONE CASE IN THIS FILE IS A WALL-CLOCK MEASUREMENT, which is why the file
+// is in the `measure` tier (`vitest.config.ts`) rather than on the release
+// gate. Its headline number is the one this example's shape makes askable at
+// all, move-to-snapshot latency, bounded at `ARRIVAL_BOUND_MS`, and the bound
+// is built from a send period plus a round trip plus a tick rather than from a
+// margin: a host that cannot hold the 16ms render timer or the 10Hz send loop
+// inflates it for reasons that are nothing to do with the on-arrival path. The
+// snapshot rate is pinned inside +-10% of 20Hz for the same reason. It skips on
+// such a host, loudly: see `helpers/jitter.ts`.
+if (TOO_JITTERY) console.warn(jitterSkipReason('example-cursors'));
+
+const d = REDIS_AVAILABLE && !TOO_JITTERY ? describe : describe.skip;
 
 /** The example's own rate, read off the runtime rather than restated, so a change to cursors moves this with it. */
 const TICK_HZ = cursorsRuntime.tickHz;
