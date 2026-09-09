@@ -297,7 +297,7 @@ describe('PredictedEntity', () => {
   });
 
   it('a small disagreement is continuous (the next draw is within one frame of glide of the last) and converges inside a second', () => {
-    const { entity, tick } = seated(100);
+    const { entity } = seated(100);
     const before = entity.advance({ dir: 0 }, FRAME);
     expect(before.y).toBe(60);
 

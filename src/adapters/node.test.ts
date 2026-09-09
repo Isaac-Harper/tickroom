@@ -36,44 +36,13 @@ vi.mock('../server/index.js', async (importOriginal) => {
 
 /* eslint-disable import/first */
 import { CLOSE_CODES, SERVER_FRAMES, roomKeys } from '../core/index.js';
-import { makeToken, type RelaySocket } from '../server/index.js';
-import { FakeRedis } from '../server/testFakeRedis.js';
+import { makeToken } from '../server/index.js';
+import { MemoryRedis as FakeRedis } from '../server/memoryRedis.js';
 import { attachNodeRelay, runNodeTicker, type NodeRelayServerOptions } from './node.js';
+import { MockSocket } from '../../tests/helpers/mockSocket.js';
 /* eslint-enable import/first */
 
 const SECRET = 'test-secret';
-
-/** A minimal `RelaySocket` double, the same shape `relay.test.ts` uses. */
-class MockSocket implements RelaySocket {
-  readyState = 1;
-  bufferedAmount = 0;
-  sent: (string | Uint8Array | Buffer)[] = [];
-  closed: number[] = [];
-  terminated = 0;
-  pings = 0;
-  private handlers = new Map<string, Array<(...args: unknown[]) => void>>();
-
-  send(data: string | Uint8Array | Buffer): void {
-    this.sent.push(data);
-  }
-  close(code?: number): void {
-    this.closed.push(code ?? 0);
-  }
-  terminate(): void {
-    this.terminated++;
-  }
-  ping(): void {
-    this.pings++;
-  }
-  on(ev: string, cb: (...args: unknown[]) => void): void {
-    const list = this.handlers.get(ev) ?? [];
-    list.push(cb);
-    this.handlers.set(ev, list);
-  }
-  fire(ev: string, ...args: unknown[]): void {
-    for (const cb of this.handlers.get(ev) ?? []) cb(...args);
-  }
-}
 
 /**
  * Stands in for a `ws` `WebSocketServer`. `attachNodeRelay` takes `wss`

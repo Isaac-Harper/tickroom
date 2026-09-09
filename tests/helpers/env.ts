@@ -121,3 +121,6 @@ export async function waitFor(check: () => boolean | Promise<boolean>, deadlineM
     await new Promise((resolve) => setTimeout(resolve, pollMs));
   }
 }
+
+/** A fixed-duration wait, for the few cases that need one instead of `waitFor`. */
+export const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));

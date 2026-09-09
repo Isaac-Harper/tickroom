@@ -179,10 +179,6 @@ export interface LockstepSweepResult {
   report: LockstepReport;
 }
 
-function distance(a: Pose, b: Pose): number {
-  return Math.hypot(a.x - b.x, a.y - b.y);
-}
-
 function moved(a: Pose, b: Pose): boolean {
   return a.x !== b.x || a.y !== b.y;
 }

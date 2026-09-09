@@ -5,15 +5,11 @@
 // database do. It implements exactly the `RedisLike` surface plus the pub/sub
 // extras `Subscriber` adds, and nothing wider.
 //
-// THIS FILE SHIPS. It used to live in `testFakeRedis.ts`, excluded from
-// `tsconfig.build.json`, and the only thing that made it test-only was where
-// it lived: every host that runs ONE process and does not want a Redis beside
-// it needs precisely this object, and a library that keeps its own working
-// implementation out of the package leaves that host to rewrite it. It is
-// still the in-memory client every unit test in this package runs against,
-// from this one file rather than a copy, so what a consumer gets is what the
-// suite exercises thousands of times a run. See `createMemoryRedis` for what
-// a single process gives up by using it.
+// THIS FILE SHIPS, and it is also the in-memory client every unit test in this
+// package runs against: every host that runs ONE process and does not want a
+// Redis beside it needs precisely this object, and what a consumer gets is
+// what the suite exercises thousands of times a run rather than a copy. See
+// `createMemoryRedis` for what a single process gives up by using it.
 
 import type { RedisLike } from '../core/index.js';
 import type { Subscriber } from './redis.js';

@@ -53,7 +53,6 @@ import {
   makeToken,
   verifySpawnToken,
   verifyToken,
-  type RelaySocket,
   type TokenClaims,
 } from '../server/index.js';
 import { encodeInputWindow } from '../codec/index.js';
@@ -61,7 +60,7 @@ import { encodeInputWindow } from '../codec/index.js';
 // and should not: it is a coupling between two files, not part of the hosting
 // API. See the case that pins it against `SPAWN_ACK_MS`.
 import { EXIT_SPAWN_WAIT_MS } from '../server/ticker.js';
-import { FakeRedis } from '../server/testFakeRedis.js';
+import { MemoryRedis as FakeRedis } from '../server/memoryRedis.js';
 import {
   MIN_RELAY_LIFETIME_MS,
   MIN_TICKER_RUN_MS,
@@ -82,6 +81,7 @@ import {
   type VercelRoomOptions,
   type VercelTickerRouteOptions,
 } from './vercel.js';
+import { MockSocket } from '../../tests/helpers/mockSocket.js';
 /* eslint-enable import/first */
 
 const SECRET = 'test-secret';
@@ -514,38 +514,6 @@ describe('createTickerRoute', () => {
 // ---------------------------------------------------------------------------
 // The relay route.
 // ---------------------------------------------------------------------------
-
-/** A minimal `RelaySocket` double, the same shape `relay.test.ts` uses. */
-class MockSocket implements RelaySocket {
-  readyState = 1;
-  bufferedAmount = 0;
-  sent: (string | Uint8Array | Buffer)[] = [];
-  closed: number[] = [];
-  terminated = 0;
-  pings = 0;
-  private handlers = new Map<string, Array<(...args: unknown[]) => void>>();
-
-  send(data: string | Uint8Array | Buffer): void {
-    this.sent.push(data);
-  }
-  close(code?: number): void {
-    this.closed.push(code ?? 0);
-  }
-  terminate(): void {
-    this.terminated++;
-  }
-  ping(): void {
-    this.pings++;
-  }
-  on(ev: string, cb: (...args: unknown[]) => void): void {
-    const list = this.handlers.get(ev) ?? [];
-    list.push(cb);
-    this.handlers.set(ev, list);
-  }
-  fire(ev: string, ...args: unknown[]): void {
-    for (const cb of this.handlers.get(ev) ?? []) cb(...args);
-  }
-}
 
 function relayRouteWith(
   socket: MockSocket,

@@ -94,6 +94,7 @@ import {
   flushNamespace,
   skipReason,
   waitFor,
+  sleep,
 } from './helpers/env.js';
 
 const REDIS_AVAILABLE = await probeRedisAvailable();
@@ -312,8 +313,6 @@ interface Measurement {
 }
 
 const measurements: Measurement[] = [];
-
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 d('split brain / how long a predecessor publishes past a legitimate successor', () => {
   const namespace = newNamespace('splitbrain');

@@ -438,7 +438,7 @@ describe('TR-10b: renewConfirmed paces from the ATTEMPT, never from the confirma
   }
 
   /** The pre-fix body of `renewConfirmed`, kept only so the contrast below is measured rather than described. */
-  const reAnchorPacingClock = (clock: OwnershipClock, now: number): OwnershipClock => ({
+  const reAnchorPacingClock = (_clock: OwnershipClock, now: number): OwnershipClock => ({
     lastRenewAt: now,
     lastOwnedAt: now,
   });

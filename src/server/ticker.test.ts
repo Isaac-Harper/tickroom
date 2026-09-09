@@ -14,7 +14,7 @@ import {
 } from '../core/index.js';
 import { decodeCheckpoint, readCheckpoint } from './checkpoint.js';
 import type { Subscriber } from './redis.js';
-import { FakeRedis } from './testFakeRedis.js';
+import { MemoryRedis as FakeRedis } from './memoryRedis.js';
 import {
   runTicker,
   publishCustom,

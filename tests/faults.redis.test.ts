@@ -3,7 +3,7 @@
 // a fake asked politely to return an error.
 //
 // WHY IT CANNOT BE A UNIT TEST, WHICH IS THE WHOLE JUSTIFICATION FOR THE COST
-// OF THIS FILE. `src/server/testFakeRedis.ts` can make a command fail
+// OF THIS FILE. `src/server/memoryRedis.ts` can make a command fail
 // (`.break(method)`), and `src/server/ticker.test.ts` uses that to pin what the
 // ticker DOES with a failure. It cannot produce the failures below, because
 // every one of them is a property of the SOCKET rather than of the Redis

@@ -16,7 +16,7 @@
 
 import { describe, it, expect } from 'vitest';
 import type { ClientInput } from '../../src/core/index.js';
-import { pongRuntime, stepPaddleY, FIELD_W, FIELD_H, type PongState, type PongEvent } from './sim.js';
+import { pongRuntime, stepPaddleY, FIELD_H, type PongState, type PongEvent } from './sim.js';
 
 const DT = 1 / pongRuntime.tickHz;
 

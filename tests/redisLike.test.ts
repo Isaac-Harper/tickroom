@@ -2,7 +2,7 @@
 // itself satisfies RedisLike structurally with zero adapter code ... a
 // plain `new Redis(url)` already type-checks against this interface
 // wherever tickroom asks for one." That claim has, until now, only ever
-// been checked against src/server/testFakeRedis.ts, a hand-written object
+// been checked against src/server/memoryRedis.ts, a hand-written object
 // literal shaped to look like ioredis. A fake built to satisfy an interface
 // proves nothing about whether the REAL library actually does; it only
 // proves the person who wrote the fake read the interface correctly. This

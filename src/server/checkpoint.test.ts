@@ -14,7 +14,7 @@ import {
 import { graceMsFromCheckpoint, packCheckpoint, unpackCheckpoint } from '../core/checkpoint.js';
 // The owner-checked write needs a fake that actually runs the script, which is
 // the directory's shared one rather than the two-method stub below.
-import { FakeRedis as HubFakeRedis } from './testFakeRedis.js';
+import { MemoryRedis as HubFakeRedis } from './memoryRedis.js';
 import type { RedisLike } from '../core/redisLike.js';
 import type { CheckpointEnvelope } from '../core/types.js';
 

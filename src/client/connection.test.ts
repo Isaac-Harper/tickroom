@@ -13,7 +13,7 @@ import {
   type RoomConnectionOptions,
   type PredictionOptions,
 } from './connection.js';
-import { SnapshotInterpolator, RESUME_GLIDE_MAX_MS } from './interpolation.js';
+import { SnapshotInterpolator } from './interpolation.js';
 import type { Pose } from './predictedEntity.js';
 import { PING_INTERVAL_MS, PLAYOUT_MAX_AHEAD } from '../core/index.js';
 import { REANCHOR_MIN_INTERVAL_MS } from './netPolicy.js';
@@ -3150,7 +3150,7 @@ describe('RoomConnection reconnect ladder', () => {
    * to the next scheduled timer lands on exactly the same instants, since the
    * only thing that can advance `Date.now()` here is a timer firing.
    */
-  async function ladderDelays(conn: RoomConnection<DecodedSnapshotLike, string>, steps: number): Promise<number[]> {
+  async function ladderDelays(steps: number): Promise<number[]> {
     const out: number[] = [];
     for (let i = 0; i < steps; i++) {
       const before = FakeSocket.instances.length;
@@ -3189,7 +3189,7 @@ describe('RoomConnection reconnect ladder', () => {
         socketUrl: () => 'ws://x',
       });
       await conn.start();
-      const [delay] = await ladderDelays(conn, 1);
+      const [delay] = await ladderDelays(1);
       conn.stop();
       return delay!;
     };
@@ -3216,7 +3216,7 @@ describe('RoomConnection reconnect ladder', () => {
     });
     await conn.start();
 
-    const delays = await ladderDelays(conn, 10);
+    const delays = await ladderDelays(10);
     for (let i = 0; i < delays.length; i++) {
       const capped = Math.min(5000, RECONNECT_BASE_MS * RECONNECT_FACTOR ** i);
       expect(delays[i]!).toBeGreaterThanOrEqual(Math.floor(capped * RECONNECT_JITTER_MIN));

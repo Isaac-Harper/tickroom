@@ -35,7 +35,7 @@ import {
   type WebSocketConstructor,
   type WebSocketLike,
 } from '../../src/client/index.js';
-import { TEST_REDIS_URL, waitFor } from './env.js';
+import { TEST_REDIS_URL, waitFor, sleep } from './env.js';
 
 /** Units per second the bot travels. Constant on the server, so every deviation a client renders belongs to the network path. */
 export const SPEED = 100;
@@ -662,7 +662,6 @@ export async function runSmoothness(opts: SmoothnessOptions): Promise<Smoothness
   await Promise.all(rigs.map((r) => r.conn.start()));
   log(`[client] started ${rigs.map((r) => r.pid).join(',')} owd=${owdMs} jitter=${jitterMs}`);
 
-  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   const controls: SmoothnessClientControl[] = rigs.map((r) => ({
     pid: r.pid,
     conn: r.conn,

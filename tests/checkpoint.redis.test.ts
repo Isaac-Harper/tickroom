@@ -1,7 +1,7 @@
 // Proves the gzip checkpoint path (src/server/checkpoint.ts) against a real
 // server, and in particular the trap its own comments warn about: reading a
 // possibly-gzipped value with `get` instead of `getBuffer` silently destroys
-// it via a lossy UTF-8 decode. The in-memory fake in src/server/testFakeRedis.ts
+// it via a lossy UTF-8 decode. The in-memory fake in src/server/memoryRedis.ts
 // cannot demonstrate this at all, because a fake built on JS strings/Buffers in
 // one process has no "wire" to be lossy across.
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
@@ -135,7 +135,7 @@ d('checkpoint / real Redis', () => {
   });
 
   // THE OWNER-CHECKED WRITE IS A LUA SCRIPT, AND A FAKE CANNOT PROVE A SCRIPT
-  // RUNS. `testFakeRedis` recognises this one by a substring of its text and
+  // RUNS. `MemoryRedis` recognises this one by a substring of its text and
   // then re-implements its semantics in TypeScript, so every unit test of it
   // is really a test of that re-implementation: whether the script itself
   // parses, whether `KEYS[2]` is the key it thinks it is, and whether a Buffer

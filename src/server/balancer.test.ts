@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { roomKeys, roomIdFor } from '../core/index.js';
-import { FakeRedis } from './testFakeRedis.js';
+import { MemoryRedis as FakeRedis } from './memoryRedis.js';
 import { assignRoom } from './balancer.js';
 
 async function setPlayers(redis: FakeRedis, roomId: string, players: number): Promise<void> {

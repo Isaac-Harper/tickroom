@@ -8,35 +8,13 @@
 // counts.
 import { describe, it, expect, vi } from 'vitest';
 import { CLOSE_CODES, SERVER_FRAMES, roomKeys, type RoomEnvelope } from '../core/index.js';
-import { FakeRedis } from './testFakeRedis.js';
+import { MemoryRedis as FakeRedis } from './memoryRedis.js';
 import { admitSocket, refuseSocket, registerConnection, CONN_KEY_TTL_S, CONN_TOUCH_MS } from './admission.js';
-import { DEFAULT_CONN_STALE_MS, type RelaySocket } from './relay.js';
+import { DEFAULT_CONN_STALE_MS } from './relay.js';
+import { MockSocket } from '../../tests/helpers/mockSocket.js';
 
 const NS = 'test';
 const CONN_KEY = `${NS}:conns:d.abc`;
-
-/** The same minimal `RelaySocket` double `relay.test.ts` uses, kept local so neither file's assertions can drift the other's. */
-class MockSocket implements RelaySocket {
-  readyState = 1;
-  sent: (string | Uint8Array | Buffer)[] = [];
-  closed: number[] = [];
-  private handlers = new Map<string, Array<(...args: unknown[]) => void>>();
-
-  send(data: string | Uint8Array | Buffer): void {
-    this.sent.push(data);
-  }
-  close(code?: number): void {
-    this.closed.push(code ?? 0);
-  }
-  on(ev: string, cb: (...args: unknown[]) => void): void {
-    const list = this.handlers.get(ev) ?? [];
-    list.push(cb);
-    this.handlers.set(ev, list);
-  }
-  fire(ev: string, ...args: unknown[]): void {
-    for (const cb of this.handlers.get(ev) ?? []) cb(...args);
-  }
-}
 
 function baseOptions(redis: FakeRedis, socket: MockSocket, overrides: Record<string, unknown> = {}) {
   return {
