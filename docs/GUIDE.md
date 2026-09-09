@@ -15,8 +15,8 @@ still in it.
 
 Beside it: [`ARCHITECTURE.md`](ARCHITECTURE.md) for why any of this is shaped
 the way it is, [`OPERATIONS.md`](OPERATIONS.md) for the cost model, the platform
-limits and the release procedure, and [`VERIFICATION.md`](VERIFICATION.md) for
-the measurements.
+limits and the release procedure, [`API.md`](API.md) for which exports are
+supported, and [`VERIFICATION.md`](VERIFICATION.md) for the measurements.
 
 ---
 

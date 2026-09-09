@@ -10,7 +10,9 @@ architecture updates the file map, the status and the gotchas in the same commit
 - [`README.md`](README.md) is the pitch and the quickstart,
   [`docs/GUIDE.md`](docs/GUIDE.md) the full walk-through,
   [`docs/OPERATIONS.md`](docs/OPERATIONS.md) the cost model, the platform
-  limits and the release procedure, and
+  limits and the release procedure,
+  [`docs/API.md`](docs/API.md) the supported export surface (a name not on it
+  is reachable but internal, and a 2.0 prunes it from the barrels), and
   [`docs/VERIFICATION.md`](docs/VERIFICATION.md) the measurements.
 
 ## What this is
@@ -1219,6 +1221,7 @@ From the repo root:
 
 ```
 npx tsc --noEmit           # typecheck, must be clean
+npm run lint               # eslint over src, tests, examples, must be clean
 npm run build              # rm -rf dist && tsc -p tsconfig.build.json
 npm run test:unit          # the unit tier, NO services anywhere, green offline
 npm run test:integration   # unit + integration tiers, needs a real Redis
@@ -1351,7 +1354,7 @@ no-services promise proved rather than assumed; `npm run test:integration` is
 across 4** on the same Redis and a quiet laptop; `npm test` is the sum, **1213
 across 47**. `npx tsc --noEmit` is clean repo-wide including `examples/`, and
 `npm run build` emits `dist/` cleanly. Roughly 18,700 lines of source and 28,700
-of tests. `README.md`, `AGENTS.md` and the four files under `docs/` are the whole
+of tests. `README.md`, `AGENTS.md` and the five files under `docs/` are the whole
 of the prose.
 
 Forced jittery (`JITTER_LIMIT` dropped to 1.0 for the check, then restored) the
@@ -1504,4 +1507,3 @@ measurement that paid for it. What is genuinely open:
   (a `setInterval` heartbeat gap ring), because a blocked event loop stops the
   `message` handler too and cannot be told apart from inside it. `socket` means
   "not only the render loop", never "the network".
-- **No lint script**, so CI runs no linter. Add the script before adding the step.

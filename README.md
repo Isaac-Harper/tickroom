@@ -260,6 +260,7 @@ illustrated.
 | --- | --- |
 | [`docs/GUIDE.md`](docs/GUIDE.md) | The full walk-through: install, the four routes, the browser client, testing your step, and the things that cost real production time to learn. |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Why any of this is shaped the way it is, decision by decision. |
+| [`docs/API.md`](docs/API.md) | The supported surface: which exports semver applies to, and which are reachable but internal. |
 | [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | The cost model, the platform limits, the Redis requirements, and how a release is cut. |
 | [`docs/VERIFICATION.md`](docs/VERIFICATION.md) | Every measured claim, with the machine it was taken on. |
 | [`AGENTS.md`](AGENTS.md) | The operating manual for anyone changing this code. |

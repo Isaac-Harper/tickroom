@@ -5,6 +5,30 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-09-09
+
+A cleanup release. Nothing on the wire or in the contract moved.
+
+### Added
+
+- `docs/API.md` states the supported export surface per subpath. The barrels
+  export more than it lists; a name not on it is reachable but internal and
+  may change in a minor.
+- `npm run lint` (typescript-eslint's recommended set, deliberately minimal)
+  and a CI step running it. `noUnusedLocals` and `noUnusedParameters` are on
+  in `tsconfig.json`.
+
+### Changed
+
+- Removed a dead `distance` helper from `tickroom/testing`'s lockstep harness.
+  No exported name changed.
+- The tracked `tickroom-0.1.0.tgz`, the `testFakeRedis.ts` alias file and four
+  copies of the same test socket double are gone from the repo. None of them
+  shipped.
+- `docs/LEDGER.md`, the dated audit history, is deleted; it lives in the git
+  history. `AGENTS.md` and the remaining docs were cut to what is current, and
+  the per-tier test counts are stated in `AGENTS.md` only.
+
 ## [1.0.0] - 2026-09-08
 
 The release that makes the client half one object and the server half one call.
