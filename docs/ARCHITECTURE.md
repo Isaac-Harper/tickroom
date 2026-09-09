@@ -4,7 +4,7 @@ Why every load-bearing decision in tickroom is what it is, and what breaks when 
 
 Everything here was learned in production, most of it the expensive way. If you are about to change something in this library and it looks gratuitously complicated, the odds are good that it is documented below as the fix for a specific failure.
 
-Beside it: [`GUIDE.md`](GUIDE.md) is the walk-through, [`OPERATIONS.md`](OPERATIONS.md) the cost model and the platform limits, [`VERIFICATION.md`](VERIFICATION.md) the measurements, [`LEDGER.md`](LEDGER.md) the dated history, and [`AGENTS.md`](../AGENTS.md) the operating manual for changing this code.
+Beside it: [`GUIDE.md`](GUIDE.md) is the walk-through, [`OPERATIONS.md`](OPERATIONS.md) the cost model and the platform limits, [`VERIFICATION.md`](VERIFICATION.md) the measurements, and [`AGENTS.md`](../AGENTS.md) the operating manual for changing this code.
 
 ---
 

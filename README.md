@@ -227,18 +227,17 @@ handoff budgets, is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 ## Verification
 
 ```bash
-npm run test:unit          # 1149 tests across 34 files, NO services at all
-npm run test:integration   # 1197 across 43, the same architecture on a real Redis
-npm run test:measure       # 16 across 4, wall-clock numbers, quiet machine only
-npm test                   # all three, 1213 across 47
+npm run test:unit          # NO services at all
+npm run test:integration   # the same architecture on a real Redis
+npm run test:measure       # wall-clock numbers, quiet machine only
+npm test                   # all three
 ```
 
 Beyond green, every guard is checked by **mutation**: broken on purpose, with the
 suite required to notice. The measured claims (a planned handoff costing zero
 server ticks on a real Vercel deployment, zero backward steps and zero blank
 frames across 73 client-minutes, both shipped examples driven through a real
-socket in CI) are in [`docs/VERIFICATION.md`](docs/VERIFICATION.md), and the
-dated runs behind them in [`docs/LEDGER.md`](docs/LEDGER.md).
+socket in CI) are in [`docs/VERIFICATION.md`](docs/VERIFICATION.md).
 
 ---
 
@@ -263,7 +262,6 @@ illustrated.
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Why any of this is shaped the way it is, decision by decision. |
 | [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | The cost model, the platform limits, the Redis requirements, and how a release is cut. |
 | [`docs/VERIFICATION.md`](docs/VERIFICATION.md) | Every measured claim, with the machine it was taken on. |
-| [`docs/LEDGER.md`](docs/LEDGER.md) | The dated history: mutation matrices, audit rounds, platform runs. |
 | [`AGENTS.md`](AGENTS.md) | The operating manual for anyone changing this code. |
 
 ---

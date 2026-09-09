@@ -3,7 +3,7 @@
 Every measured claim in this repository, with the machine and the date it was
 taken on. The [README](../README.md) quotes the headline numbers and links here;
 the dated write-ups, the mutation matrices and the audit rounds finding by
-finding are in [`LEDGER.md`](LEDGER.md).
+finding are in the repository history.
 
 - [The tiers, and why the measurement one gates nothing](#the-suite)
 - [Measured against a real Redis](#measured-against-a-real-redis)
@@ -17,15 +17,16 @@ finding are in [`LEDGER.md`](LEDGER.md).
 
 ## The suite
 
-The suite is 47 files in three tiers, split by what a machine has to be for the
-answer to mean anything.
+The suite is three tiers, split by what a machine has to be for the answer to
+mean anything. The per-tier counts on the current tree are in
+[`AGENTS.md`](../AGENTS.md#status).
 
 ```bash
-npm run test:unit              # 1149 tests across 34 files, NO services at all
+npm run test:unit              # NO services at all
 redis-server --port 6399 --save '' --appendonly no --daemonize yes
-npm run test:integration       # 1197 across 43, the same architecture on a real Redis
-npm run test:measure           # 16 across 4, wall-clock numbers, quiet machine only
-npm test                       # all three, 1213 across 47
+npm run test:integration       # the same architecture on a real Redis
+npm run test:measure           # wall-clock numbers, quiet machine only
+npm test                       # all three
 ```
 
 | tier | what it is | needs | where it runs |
@@ -45,11 +46,10 @@ loudly instead of skipping to a green exit that asserted nothing. `npx tsc
 --noEmit` is clean repo-wide including `examples/`.
 
 **The measurement tier is not on the release gate, on purpose.** Its bounds are
-readings, not tolerances, and a shared CI runner cannot take a reading: the
-v0.3.0 release failed twice on two different timing bounds while the same commit
-was green locally both times. Loosening a bound to survive that throws away the
-measurement to save the release, so the split is the fix instead. Every number
-quoted below comes from `npm run test:measure` on a quiet machine. A few wall-clock cases still sit inside otherwise deterministic files
+readings, not tolerances, and a shared CI runner cannot take a reading (why, and
+what it cost, is in [`OPERATIONS.md`](OPERATIONS.md#cutting-a-release)). Every
+number quoted below comes from `npm run test:measure` on a quiet machine. A few
+wall-clock cases still sit inside otherwise deterministic files
 (`tests/ticker.redis.test.ts`, `tests/faults.redis.test.ts`); those are gated on
 a timer-jitter probe (`tests/helpers/jitter.ts`) and **skip loudly**, naming the
 factor they measured, rather than reddening on a bound the host cannot honestly
@@ -182,11 +182,12 @@ enough to break that, it is the planned handoff genuinely failing rather than a
 flake, and the bound should not be widened to make the run green.
 
 Beyond green, the guards are checked by **mutation**: each one is broken on
-purpose and the suite has to notice. [`LEDGER.md`](LEDGER.md) carries the whole matrix, one
-table per file, with the tree each was measured on. It is worth reading before
-changing anything in `lease.ts`, `ticker.ts` or `interpolation.ts`, because a
-green test over a guard that cannot fail is the exact trap this library has
-fallen into more than once.
+purpose and the suite has to notice. The whole matrix, one table per file, was
+kept in the repository's history rather than carried forward, since a count in
+it is a statement about the tree it was measured on. It is worth reading
+before changing anything in `lease.ts`, `ticker.ts` or `interpolation.ts`,
+because a green test over a guard that cannot fail is the exact trap this
+library has fallen into more than once.
 
 ## The shipped example, through a real socket
 
@@ -258,7 +259,9 @@ difference between the two paths.
 Everything above is loopback: a `ws` server in the test process, a Redis on
 127.0.0.1, and a simulated one-way delay standing in for a network. **On
 2026-09-03 the same analysis ran against a real deployment**, which is the half
-a test suite cannot reach. A single room on `tickroom-bench.vercel.app`, a
+a test suite cannot reach. A single room on `tickroom-bench.vercel.app` (a
+deployment since removed; the numbers stand as measured, and the measurement
+page now lives at `https://tickroom-demo.vercel.app/bench`), a
 personal team on the **Pro** plan, Fluid compute, Node 24, both long-lived
 routes exporting `maxDuration = 300` against `maxDurationS: 300` (a
 configuration, and the platform's own default; the run at the Pro cap of 800 is
@@ -428,121 +431,22 @@ loop", never "the network".
 
 Published to npm, and **measured on a real Vercel deployment on 2026-09-03**,
 then again at the Pro plan's 800s cap on 2026-09-05, rather than only on
-loopback. The architecture's production evidence is still
-the game it was extracted from, where the lease, the checkpoint handoff, the
-playout timeline, the stall thresholds and the interpolation rules were all
-measured under real load. This repo proves the extraction is faithful, that the
-mechanisms work against a real Redis and a real socket, and that the platform
-half holds where it used to be reasoned about rather than observed: the duration
-cap, the standby's head start, the relay's warm swap, a cold start's cost and
-the connection count per player are all in the verification section above with
-numbers on them. What it has still not done is serve a player.
+loopback. The architecture's production evidence is still the game it was
+extracted from, where the lease, the checkpoint handoff, the playout timeline,
+the stall thresholds and the interpolation rules were all measured under real
+load. This repo proves the extraction is faithful, that the mechanisms work
+against a real Redis and a real socket, and that the platform half holds where
+it used to be reasoned about rather than observed. What it has still not done is
+serve a player.
 
-**An exhaustive audit landed on 2026-09-02**: nine finder lenses over the whole
-library, 69 findings, most of them measured with a scratch harness rather than
-reasoned about. It is where the standby successor, the relay warm swap, the
-measured round trip, the owner-checked checkpoint, the input-subscription
-liveness probe, the crash counter, `core/wire.ts` and `server/admission.ts` all
-come from, and it is written up finding by finding in [`LEDGER.md`](LEDGER.md). Two things it
-found are **documented rather than fixed**, both above: the 5 to 7 second
-unplanned-death budget, and roughly one second of two interleaved authorities
-after a Redis restart with no persistence (bounded, self-correcting, and now
-logged). The audit changed public API in several places, so the next release is a
-minor bump: `TerminalReason` gained members and renamed one, `conn.stats()` has a
-new shape, `RoomStats` gained five fields, `TickerResult.reason` gained
-`'input-dead'`, and the unreachable `adapters/index.ts` barrel is gone.
+The audit rounds that produced most of the guards above, the two regressions
+they introduced and then caught, and the vacuity sweep that asked which guards
+had tests that could not fail are written up finding by finding in the
+repository history. Three things they measured and left alone are
+documented rather than fixed, all above: the 5 to 7 second unplanned-death
+budget, the per-sender inbox quota being a backstop rather than a flood
+control, and the snapshot backlog drop being memory safety rather than
+staleness control.
 
-**That audit was then attacked**, which is the only reason to trust any of it.
-Three adversarial passes went at the ticker, the client connection and the
-relay and adapters with a brief to refute rather than confirm, and the
-end-to-end harness whose numbers are in the verification section above measured
-what a client actually renders. The lease and checkpoint invariants held under
-every profile, the standby handoff held at tick 161 to 162 with no interleaving
-of any kind, and steady-state rendering held at zero frames of 1600 outside
-+-10% of true speed. What it found was mostly ordering and lifetime: a
-successor that restarted the server timeline instead of continuing it,
-overlapping checkpoint writes landing in compression order, a capacity refusal
-that closed both of a swapping player's sockets, and several leaks on paths
-nothing exercises. **Two of them were regressions the audit itself had
-introduced**, and both are written up by name in [`LEDGER.md`](LEDGER.md) rather than
-quietly folded in, because an audit that hides its own mistakes is worth
-nothing: a `commandTimeout` on the Redis *subscriber*, which turns a slow
-resubscribe into a process exit, and a terminal-callback ordering that closed
-the socket the restart recipe in step 3 above had just opened.
-
-**And then a completeness round went looking for what both of those had
-missed**, which is where the numbers in the verification section above come
-from. Second-round verifiers re-attacked the client, the ticker and the relay; a
-137-mutation vacuity sweep asked which guards had tests that could not fail; the
-end-to-end harness became a permanent test file; and the library was run for the
-first time in a real headless Chromium, installed from its own packed tarball
-into fresh Vite and Next projects, loaded with twenty clients one of which was
-flooding, and fuzzed at 50,000 frames. What it found was mostly coverage rather
-than behaviour: a fake Redis that applied the lease's owner semantics itself
-regardless of what the shipped Lua said, so three lease cases were vacuous; a
-handful of guards asserted in prose and pinned by nothing. What it found in
-behaviour was a relay whose subscriber could be black-holed after a successful
-subscribe with nothing anywhere noticing, a `room-full` on the roster channel
-latching every client in the room, a snapshot-plausibility escape hatch that
-never re-armed, and a resume glide whose clamp read motion state the caller had
-just been told to destroy. All fixed and pinned. Three things it measured and
-left alone are documented rather than fixed, all above: the per-sender inbox
-quota is a backstop against a producer that reaches the bus without a relay
-rather than something a socket-borne flooder can reach, the snapshot backlog
-drop is memory safety against a wedged socket rather than staleness control
-(a modern kernel absorbs a stalled reader into its own send buffer first), and a
-tab hidden for more than five minutes was untested at the time because no
-browser automation in that round could produce one, which the Vercel run has
-since closed.
-
-CI runs the typecheck, the build and the unit tier with no services on every
-push and PR, plus the integration tier against a Redis service container.
-Releases publish from a tag through npm trusted publishing, so no token is
-stored anywhere, and the release workflow stands up **the same Redis service CI
-does** and requires it. That matters more than it sounds: the real-Redis files
-skip cleanly when nothing is listening, so without the service the publishing
-build ran to a green exit having executed zero assertions in the lease,
-checkpoint, handoff, subscriber and fault-injection suites. A gate that cannot
-fail is worse than no gate, and this is the one build whose version number is
-burned forever, so the release gate is at least as strong as CI rather than
-weaker.
-
-The release gate runs the **integration tier**, not the measurement one. A
-publish blocked by a noisy shared runner is a publish blocked by nothing, and
-the pressure it creates is to widen the bound rather than to fix the code. The
-measurement tier runs nightly instead (`.github/workflows/nightly.yml`,
-reporting only, uploading its log as an artifact and blocking nothing) and by
-hand on the quiet machine the numbers above were taken on.
-
-**What is still open** is the list [`AGENTS.md`](../AGENTS.md) keeps, and it is
-the same list:
-
-- **A Safari read without the per-sample switch, and mobile.** Safari ran on
-  2026-09-05 and throttles far less than Chromium, but WebDriver would not
-  report a background tab's state while another tab sat in front of it, so the
-  harness switched to the measured tab for each 30s sample and back. That is a
-  tab hidden thirty seconds at a time, not one hidden straight through. Reading
-  it without the switch needs a `BroadcastChannel` to a visible helper tab, or
-  the page posting its own state to the server. Mobile is untouched.
-- **The relay swap's failure path.** A successful swap is message-driven and
-  rides through a hidden tab's throttle; a failed one falls back to the
-  reconnect ladder, which is a timer the throttle does reach, so that outage
-  can still stretch toward a minute. Untested.
-- **Nothing drives an example through the Vercel adapter in process.** Both
-  shipped examples now go through a real socket in CI, pong on the stamped path
-  and cursors on the unstamped one. The bench deployment *is* the drive through
-  the Vercel adapter, so what is missing here is a test rather than a
-  measurement.
-- **The depth loop's two-tick target is a reasoned default, not a swept
-  one.** The headroom beside it is swept (100, 150 and 200ms on a real
-  deployment) and the band was measured; the target itself would need the
-  constant exposed as an option, which was a deliberate no.
-- **The arrival band is attributed now, and what is left of it is narrow.** A
-  socket `message`-timestamp ring confirmed every frame-inferred gap over 250ms
-  at the socket itself, so the band is the WebSocket path rather than the
-  renderer, the ticker, the bus or the relay. Still owed: the same run from a
-  quiet machine on a residential link rather than a loaded container, and a
-  whole-process stall detector in the page, since a blocked event loop stops the
-  message handler too and cannot be told apart from inside it.
-- **No lint script**, so CI runs no linter.
-
+CI and the release gate are described in [`OPERATIONS.md`](OPERATIONS.md#cutting-a-release).
+What is still open is the "Still owed" list in [`AGENTS.md`](../AGENTS.md#still-owed).

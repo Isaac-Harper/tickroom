@@ -15,8 +15,8 @@ still in it.
 
 Beside it: [`ARCHITECTURE.md`](ARCHITECTURE.md) for why any of this is shaped
 the way it is, [`OPERATIONS.md`](OPERATIONS.md) for the cost model, the platform
-limits and the release procedure, [`VERIFICATION.md`](VERIFICATION.md) for the
-measurements, and [`LEDGER.md`](LEDGER.md) for the dated history.
+limits and the release procedure, and [`VERIFICATION.md`](VERIFICATION.md) for
+the measurements.
 
 ---
 
@@ -25,12 +25,6 @@ measurements, and [`LEDGER.md`](LEDGER.md) for the dated history.
 ```bash
 npm install tickroom ioredis
 ```
-
-**This document describes 1.0.0**, which is what `package.json` says and what
-the tag publishes. `CHANGELOG.md` has the whole entry, and its "Migrating
-from 0.3" list is the break-by-break guide: `conn.frame(now, input)`, the
-`predict` option in place of a hand-held `PredictedEntity`, the binary input
-wire, and `DecodedSnapshotLike.inputLead` gone.
 
 `ioredis` is an **optional** peer dependency, and it is needed only by `tickroom/server` and the two adapters, which is where the bus lives. A browser-only consumer of `tickroom/client`, `tickroom/core` and `tickroom/codec` installs `tickroom` alone:
 

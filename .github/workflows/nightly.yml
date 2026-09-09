@@ -1,28 +1,15 @@
-# WHICH TIER THIS RUNS, AND WHY: `measure`, and only `measure`.
-#
-# The measurement tier is the four files whose assertions are about the wall
-# clock rather than about the code: `smoothness.redis.test.ts` (zero backward
-# steps, zero motionless frames, over a real 60Hz render loop),
-# `splitbrain.redis.test.ts` (an overlap in milliseconds between two real
-# tickers), `example.redis.test.ts` and `example-cursors.redis.test.ts` (a
-# snapshot rate inside +-10% and a move-to-snapshot latency). Those are the
-# library's headline numbers, and they are only numbers on a machine quiet
-# enough to take a reading.
+# Runs the `measure` tier, and only that: the four files whose assertions are
+# about the wall clock (see `vitest.config.ts`).
 #
 # THIS WORKFLOW BLOCKS NOTHING, AND THAT IS THE POINT. It is not a required
 # check, the test step carries `continue-on-error`, and the artifact is
-# uploaded whatever happened. A shared GitHub runner is a noisy machine: the
-# v0.3.0 release failed twice on two different timing bounds while the same
-# commit was green locally both times, which is a fact about the runner and
-# was, for two runs, treated as a fact about the library. So this job REPORTS
-# and CI decides nothing from it. What it catches is a drift big enough to
-# survive the noise, and the jitter gate in `tests/helpers/jitter.ts` marks the
-# runs where the host could not measure at all: those show as loud skips with
-# the measured factor in the reason rather than as red.
+# uploaded whatever happened. A shared runner is a noisy machine, so this job
+# REPORTS and CI decides nothing from it. What it catches is a drift big enough
+# to survive the noise; the jitter gate in `tests/helpers/jitter.ts` marks the
+# runs where the host could not measure at all as loud skips rather than red.
 #
-# The numbers quoted in README.md and AGENTS.md do NOT come from here. They
-# come from `npm run test:measure` on the fw13 machine, quiet and dedicated,
-# which is the only place a reading is worth writing down.
+# The numbers quoted in the docs do NOT come from here. They come from
+# `npm run test:measure` on a quiet, dedicated machine.
 name: nightly measurements
 
 on:

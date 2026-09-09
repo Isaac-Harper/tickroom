@@ -1,8 +1,7 @@
 # Operations
 
 What running this costs, what the platform underneath it will and will not let
-you do, and how a release gets cut. The numbers here are measured; where a
-figure came from a dated run, [`LEDGER.md`](LEDGER.md) has the run.
+you do, and how a release gets cut. The numbers here are measured.
 
 - [Cost model](#cost-model)
 - [Platform limits](#platform-limits)
@@ -24,10 +23,6 @@ Measured on the game this came from, at 20Hz with a full 20-player room:
 Three things the audit added cost essentially nothing on that budget, which is why they are on by default. **The client's round-trip ping never touches Redis at all**: the relay answers it directly, which is both what makes the number a true round trip and what makes it free. **The ticker's own liveness probe is one `PUBLISH` per second per room**, on a channel it is already subscribed to, which is under half a percent of the per-room figure above and is the only thing that can detect a subscriber whose TCP path has been black-holed. **The relay's own probe is the same mechanism on the other side of the bus, at one `PUBLISH` per socket per second**, on a channel private to that socket, which is roughly 5% of the per-player figure above. Per connection rather than per room on purpose: a shared probe channel is quadratic in room size and, worse, lets a healthy subscriber answer for a dead one, which is the one signal built to catch this becoming the thing that hides it.
 
 **Fan-out is free in commands and expensive in bandwidth.** One `PUBLISH` reaches every subscriber for one command, so command count does not scale with population. Bytes do: every player socket holds its own subscriber, so a snapshot crosses the wire once per player. `RoomStats.bytesDelivered` measures exactly that.
-
-Pick a **flat-rate** Redis plan. Per-command billing on this traffic shape is roughly two orders of magnitude more expensive than flat-rate, and the same room that costs about $30/month flat costs thousands metered.
-
-**The first ceiling you hit is concurrent connections, not commands.** Every socket needs its own subscriber (a connection in subscribe mode cannot run ordinary commands). That is why the relay enforces a per-user socket cap: without it, one client opening sockets can exhaust the connection ceiling and take the room's own ticker subscriber down with it, which is a total outage rather than a nuisance.
 
 If bandwidth ever becomes the bill, the lever is not a bigger plan, it is ending the per-socket fan-out: one subscriber per room per relay instance, or the ticker off serverless entirely.
 
@@ -127,12 +122,11 @@ that does not report it rather than print the zero.
 `npm version <level>` plus a pushed tag is the whole procedure.
 `.github/workflows/release.yml` publishes from the tag through **npm trusted
 publishing (OIDC)**, so there is no stored npm token anywhere and the package
-carries a signed provenance statement. That workflow's header is the operating
-manual; the trusted-publisher entry lives on npmjs.com under the package's
-Settings, naming this repository and `release.yml`.
+carries a signed provenance statement. The trusted-publisher entry lives on
+npmjs.com under the package's Settings, naming this repository and
+`release.yml`; the workflow header has the exact one-time setup.
 
-Two rules the failed attempts left behind, both of which the workflow now
-encodes:
+Two rules the workflow encodes, both learned the hard way:
 
 - **The release gate runs the integration tier, never the measurement one.** Its
   bounds are readings rather than tolerances, and a shared runner cannot take a

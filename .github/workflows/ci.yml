@@ -1,37 +1,12 @@
-# WHICH TIER THIS RUNS, AND WHY: `unit` and `integration`, never `measure`.
+# Runs the `unit` and `integration` tiers, never `measure`: the split and the
+# reason for it are in `vitest.config.ts`, and the measurement tier runs in
+# `nightly.yml`, blocking nothing.
 #
-# The suite is split three ways in `vitest.config.ts` and the split is about
-# what a shared runner can honestly answer. `unit` and `integration` are
-# decided by the code: a checkpoint round trips or it does not, a lease is
-# refused or it is not, a subscriber survives a reconnect or it dies. Those are
-# the same answer on any machine, so they belong on a required check.
-# `measure` is decided by the wall clock, and a GitHub runner is a shared,
-# noisy, unpredictable machine: the v0.3.0 release failed twice on two
-# different timing bounds while the same commit was green locally both times.
-# So the measurement tier runs in `nightly.yml`, on a schedule, blocking
-# nothing, and this workflow does not run it at all.
-#
-# Two jobs, split by what they need rather than by what they are.
-#
-# `unit` runs `test:unit` with NO services anywhere, which is the claim the
-# library makes to a consumer who never stands up a Redis: `createMemoryRedis`
-# is the bus and `tests/memory.test.ts` is the file that checks it. It is also
-# the fast half, so a typo reddens in a minute rather than in ten.
-#
-# `integration` is the job the library actually owes. It is the only place
-# `ioredis` meets a real server, a real TTL expires on the server's own clock,
-# a lease is contested by concurrent clients, and the handoff claim that is the
-# headline of this library is executed rather than asserted. The tier INCLUDES
-# the unit files rather than replacing them, so this job is a superset of the
-# first: the first exists for its no-services promise and its speed, not to
-# cover something this one misses.
-#
-# A few wall-clock cases still ride along inside `ticker.redis.test.ts` and
-# `faults.redis.test.ts`, because the rest of each file is deterministic and
-# worth gating on. Those cases are gated on `TOO_JITTERY` inside the file, so a
-# loaded runner skips them loudly with the measured number in the reason rather
-# than reddening on a bound it has no instrument for. See
-# `tests/helpers/jitter.ts`.
+# Two jobs, split by what they need. `unit` runs with NO services anywhere,
+# which is the claim the library makes to a consumer who never stands up a
+# Redis (`tests/memory.test.ts` checks it), and is the fast half. `integration`
+# is a superset of it against a real Redis, and is the same gate `release.yml`
+# runs.
 name: CI
 
 on:
