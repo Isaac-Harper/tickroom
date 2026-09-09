@@ -351,7 +351,6 @@ d('split brain / how long a predecessor publishes past a legitimate successor', 
         `${String(m.issuedAfterDeath).padStart(5)} ${num(m.predLastIssue)} ${num(m.issueOverlap)} ${num(m.busOverlap)} ` +
         `${String(m.predAfterSucc).padStart(5)} ${String(m.restoredTick).padStart(5)} ${String(m.dupTicks).padStart(4)}  ${m.bound}`
     );
-    // eslint-disable-next-line no-console
     console.log(
       [
         `[measured] split brain, ${REPS} rep(s) per case, lease ${SHORT_LEASE_MS}/${SHORT_RENEW_MS}, tick ${TICK_MS}ms, ` +
@@ -588,7 +587,6 @@ d('split brain / how long a predecessor publishes past a legitimate successor', 
       bound,
     };
     measurements.push(measurement);
-    // eslint-disable-next-line no-console
     console.log(
       `[measured] ${label}: predecessor exited '${resultP.reason}' (finder '${finder}'), successor '${resultS.reason}'; ` +
         `key left the predecessor ${measurement.lapse ?? '-'}ms after the death and was the successor's at ` +

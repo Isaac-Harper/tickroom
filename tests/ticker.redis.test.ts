@@ -105,7 +105,6 @@ d('ticker / real Redis', () => {
       expect(result.reason).toBe('duration');
 
       const measuredHz = (result.ticks / result.uptimeMs) * 1000;
-      // eslint-disable-next-line no-console
       console.log(
         `[measured] tick rate: ${result.ticks} ticks over ${result.uptimeMs}ms = ${measuredHz.toFixed(2)}Hz (target ${tickHz}Hz)`
       );
@@ -270,7 +269,6 @@ d('ticker / real Redis', () => {
     for (let i = 1; i < arrivalTimes.length; i++) {
       handoffMs = Math.max(handoffMs, arrivalTimes[i] - arrivalTimes[i - 1]);
     }
-    // eslint-disable-next-line no-console
     console.log(
       `[measured] handoff: predecessor died at tick ${tickAtKill}, successor restored at tick ${restoredTick}, ` +
         `longest gap in the snapshot stream across the handoff: ${handoffMs}ms (${arrivalTimes.length} snapshots observed)`

@@ -1467,8 +1467,7 @@ describe('RoomConnection attempt generation', () => {
     // connect would pass against the old code too.
     vi.useFakeTimers();
     let stopOnConnecting = false;
-    let conn!: RoomConnection<DecodedSnapshotLike, string>;
-    conn = new RoomConnection<DecodedSnapshotLike, string>({
+    const conn: RoomConnection<DecodedSnapshotLike, string> = new RoomConnection<DecodedSnapshotLike, string>({
       tickHz: 20,
       mint: vi.fn().mockResolvedValue(makeSession()),
       decodeSnapshot: () => null,
@@ -1752,8 +1751,7 @@ describe('RoomConnection restart after a terminal', () => {
     vi.useFakeTimers();
     let mintCount = 0;
     let tries = 0;
-    let conn!: RoomConnection<DecodedSnapshotLike, string>;
-    conn = new RoomConnection<DecodedSnapshotLike, string>({
+    const conn: RoomConnection<DecodedSnapshotLike, string> = new RoomConnection<DecodedSnapshotLike, string>({
       tickHz: 20,
       mint: async () => {
         mintCount++;
@@ -2101,8 +2099,7 @@ describe('RoomConnection terminal ordering', () => {
     // while the identical restart driven by the bare 4002 close code survived.
     vi.useFakeTimers();
     let restarts = 0;
-    let conn!: RoomConnection<DecodedSnapshotLike, string>;
-    conn = new RoomConnection<DecodedSnapshotLike, string>({
+    const conn: RoomConnection<DecodedSnapshotLike, string> = new RoomConnection<DecodedSnapshotLike, string>({
       tickHz: 20,
       mint: vi.fn().mockResolvedValue(makeSession()),
       decodeSnapshot: () => null,
@@ -2337,8 +2334,7 @@ describe('RoomConnection restart from a terminal', () => {
     const seen: string[] = [];
     let good = true;
     let restart: Promise<void> | null = null;
-    let conn!: RoomConnection<DecodedSnapshotLike, string>;
-    conn = new RoomConnection<DecodedSnapshotLike, string>({
+    const conn: RoomConnection<DecodedSnapshotLike, string> = new RoomConnection<DecodedSnapshotLike, string>({
       tickHz: 20,
       mint: async () => (good ? makeSession() : ({ error: 'nope' } as unknown as SessionInfo)),
       decodeSnapshot: () => null,
@@ -2416,8 +2412,7 @@ describe('RoomConnection host callbacks cannot break it', () => {
     // closed, the retry it is about to ask about has already been booked.
     vi.useFakeTimers();
     let reconnectsAtClose = -1;
-    let conn!: RoomConnection<DecodedSnapshotLike, string>;
-    conn = new RoomConnection<DecodedSnapshotLike, string>({
+    const conn: RoomConnection<DecodedSnapshotLike, string> = new RoomConnection<DecodedSnapshotLike, string>({
       tickHz: 20,
       mint: vi.fn().mockResolvedValue(makeSession()),
       decodeSnapshot: () => null,

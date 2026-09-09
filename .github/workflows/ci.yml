@@ -45,9 +45,8 @@ jobs:
       - name: Typecheck
         run: npx tsc --noEmit
 
-      # No lint script exists in package.json. Deliberately not invented here:
-      # a linter added by CI rather than by the repo is a config nobody can run
-      # locally. Add `"lint"` to package.json first, then a step here.
+      - name: Lint
+        run: npm run lint
 
       # NO REDIS SERVICE ON THIS JOB, ON PURPOSE. The unit tier must pass with
       # nothing listening anywhere, and the only way to keep that true is to run

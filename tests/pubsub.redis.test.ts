@@ -108,7 +108,6 @@ d('pub/sub / real Redis fan-out', () => {
       // per-subscriber repetition) corroborated on our own connection, not
       // an inference from a shared counter.
       expect(publishCommandsSent).toBe(publishCount);
-      // eslint-disable-next-line no-console
       console.log(`[measured] ${publishCount} publish() calls issued exactly ${publishCommandsSent} PUBLISH commands on this connection, fanned out to 5 subscribers`);
     } finally {
       subs.forEach((s) => s.disconnect());

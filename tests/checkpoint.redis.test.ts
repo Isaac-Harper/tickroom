@@ -196,7 +196,6 @@ d('checkpoint / real Redis', () => {
     // should land comfortably above 2x or something is wrong with the
     // measurement itself, not with gzip.
     expect(ratio).toBeGreaterThan(2);
-    // eslint-disable-next-line no-console
     console.log(
       `[measured] checkpoint compression: ${raw_bytes}B -> ${compressed.length}B (${ratio.toFixed(2)}x)`
     );

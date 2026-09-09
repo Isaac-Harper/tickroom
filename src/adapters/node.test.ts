@@ -34,13 +34,11 @@ vi.mock('../server/index.js', async (importOriginal) => {
   };
 });
 
-/* eslint-disable import/first */
 import { CLOSE_CODES, SERVER_FRAMES, roomKeys } from '../core/index.js';
 import { makeToken } from '../server/index.js';
 import { MemoryRedis as FakeRedis } from '../server/memoryRedis.js';
 import { attachNodeRelay, runNodeTicker, type NodeRelayServerOptions } from './node.js';
 import { MockSocket } from '../../tests/helpers/mockSocket.js';
-/* eslint-enable import/first */
 
 const SECRET = 'test-secret';
 

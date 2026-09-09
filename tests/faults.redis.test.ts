@@ -293,7 +293,6 @@ d('fault injection / real Redis behind a TCP proxy', () => {
 
     expect(result.reason).toBe('input-dead');
     expect(logs.some((ev) => ev.kind === 'ticker.input-dead')).toBe(true);
-    // eslint-disable-next-line no-console
     console.log(
       `[measured] black-holed input subscriber: exited '${result.reason}' ${noticedMs}ms after the fault ` +
         `(deadline is PROBE_DEAD_MS ${PROBE_DEAD_MS}ms counted from the last ANSWERED probe, which is up to ` +
@@ -381,7 +380,6 @@ d('fault injection / real Redis behind a TCP proxy', () => {
     expect(leaseLost).toBeDefined();
     const finder = (leaseLost?.meta as { finder?: string } | undefined)?.finder;
     expect(['guard', 'renew']).toContain(finder);
-    // eslint-disable-next-line no-console
     console.log(
       `[measured] black-holed shared client: exited '${result.reason}' (finder '${finder}') ${exitedMs}ms after ` +
         `the fault, which is the lease TTL (${SHORT_LEASE_MS}ms) aging out plus the shared client's own ` +
@@ -502,7 +500,6 @@ d('fault injection / real Redis behind a TCP proxy', () => {
     // possibly have written; the checkpoint left behind is past that, and lands
     // on the successor's own final tick.
     const finalTick = await storedTick(shared, keys.state);
-    // eslint-disable-next-line no-console
     console.log(
       `[measured] lease theft: predecessor exited '${resultA.reason}' (finder '${finder}') at tick ` +
         `${resultA.ticks}, successor restored at ${restoredTick} and ran ${resultB.ticks} more; stored ` +
@@ -595,7 +592,6 @@ d('fault injection / real Redis behind a TCP proxy', () => {
       expect(resubscribed).toBe(true);
 
       const result = await run;
-      // eslint-disable-next-line no-console
       console.log(
         `[measured] 300ms Redis outage: ticker exited '${result.reason}' after ${result.uptimeMs}ms of a ` +
           `${runMs}ms budget; snapshots resumed ~${resumedMs}ms after the sever; ${rejections.length} unhandled rejections`
@@ -677,7 +673,6 @@ d('fault injection / real Redis behind a TCP proxy', () => {
       });
     }
 
-    // eslint-disable-next-line no-console
     console.log(
       `[measured] crash loop: ${runs
         .map((r, i) => `run ${i + 1} '${r.reason}' after ${r.ticks} ticks (crashes=${r.crashesAfter})`)

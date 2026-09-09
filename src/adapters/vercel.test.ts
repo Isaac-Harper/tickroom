@@ -46,7 +46,6 @@ vi.mock('../server/index.js', async (importOriginal) => {
   };
 });
 
-/* eslint-disable import/first */
 import { CLOSE_CODES, MAX_TICKER_MS, RELAY_EXPIRY_LEAD_MS, SERVER_FRAMES, roomKeys } from '../core/index.js';
 import {
   makeSpawnToken,
@@ -82,7 +81,6 @@ import {
   type VercelTickerRouteOptions,
 } from './vercel.js';
 import { MockSocket } from '../../tests/helpers/mockSocket.js';
-/* eslint-enable import/first */
 
 const SECRET = 'test-secret';
 

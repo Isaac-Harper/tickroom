@@ -18,7 +18,11 @@
     "resolveJsonModule": true,
     "declaration": true,
     "noEmit": true,
-    "types": ["node"]
+    "types": ["node"],
+    // Six dead bindings were found by hand at 1.0.0; these keep the tree that
+    // clean going forward instead of relying on someone noticing again.
+    "noUnusedLocals": true,
+    "noUnusedParameters": true
   },
   "include": ["src/**/*", "tests/**/*", "examples/**/*"]
 }
