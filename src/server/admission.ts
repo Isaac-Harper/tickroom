@@ -49,14 +49,16 @@ const WS_OPEN = 1; // the WebSocket standard's OPEN readyState; both browsers an
  *
  * Skip any of this and `maxSocketsPerSubject` enforces nothing: `zcard` would
  * forever read zero, because nothing ever put a member in the set it counts.
- * That is worse than a soft cap quietly not working, because every socket
- * the relay holds keeps its OWN Redis subscriber connection open for as long
- * as the socket lives (see the module comment in `server/redis.ts`). One
- * client opening sockets without limit does not just multiply its own
- * rate-limit allowance, it can exhaust a managed Redis plan's concurrent
- * connection ceiling and take the room's own ticker subscriber down with it:
- * a total outage for everyone in the room, not a personal inconvenience for
- * whoever caused it.
+ * A client opening sockets without limit multiplies its own rate-limit
+ * allowance, holds a join and a playout buffer per socket, and is still the
+ * cheapest way to make a room expensive for everyone in it. It used to be
+ * worse than that: before 1.1.0 every socket the relay held kept its OWN Redis
+ * subscriber connection open for as long as the socket lived, so enough sockets
+ * from one client could exhaust a managed plan's concurrent connection ceiling
+ * and take the room's own ticker subscriber down with it. The relay shares one
+ * subscriber per room per process now (see `sharedSubscriber` in
+ * `server/relay.ts`), so that particular total outage is off the table and the
+ * cap is back to being about what a socket costs.
  *
  * The touch cadence (10s) is deliberately well under `checkAdmission`'s own
  * staleness window (`connStaleMs`, default 30s): a live socket's score is

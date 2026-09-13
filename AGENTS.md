@@ -185,7 +185,7 @@ values, and the invariants below for the rules.
 - `src/core/backpressure.ts` - `Inbox<T>` with a per-sender quota (the fairness
   property, see the gotcha). `src/core/rateLimit.ts` - `TokenBucket`.
   `src/core/metrics.ts` - `percentiles`, `RollingHistogram`, `Counters`.
-- `src/server/redis.ts` - ioredis helpers: shared publisher, per-socket subscriber
+- `src/server/redis.ts` - ioredis helpers: shared publisher, dedicated subscribers
   (a connection in subscribe mode cannot run ordinary commands), an `onError` hook
   with a rate-limited console default. THE TWO FACTORIES DEFAULT DIFFERENTLY ON
   PURPOSE: the shared client carries `commandTimeout: 2000` merged UNDER the
@@ -227,7 +227,9 @@ values, and the invariants below for the rules.
   `messageBuffer` listener for both channels, resolves ONE close code for both
   halves so `onClose` and the wire cannot disagree, stamps its connection id `c`
   on every join and leave, and probes its own subscription on a THIRD channel,
-  `{ns}:{roomId}:relay:{conn}`. It exports `DEFAULT_CONN_STALE_MS` (which
+  `{ns}:{roomId}:relay:{conn}`. ITS SUBSCRIBER IS THE ROOM'S, NOT THE SOCKET'S:
+  see `src/server/roomSubscriber.ts` below and `sharedSubscriber`. It exports
+  `DEFAULT_CONN_STALE_MS` (which
   `admission.ts` asserts against) and `DEFAULT_LIVENESS_TIMEOUT_MS`. A TRUST
   BOUNDARY on input: a `ping` is recognised by the literal prefix `{"t":"ping"`
   before anything is decoded, on the STRING and buffer arms alike, and
@@ -243,6 +245,20 @@ values, and the invariants below for the rules.
   `relay.subscriber-dead`, `relay.misaddressed-frame`, `relay.room-full`, and
   `relay.gaps` (`busGapMax`, `busGapOver150`, `sendLagMax`, live via
   `RelayHandle.gapsSample()`).
+- `src/server/roomSubscriber.ts` - ONE SUBSCRIBER PER ROOM PER PROCESS, reference
+  counted, which is what `attachRelay` joins instead of opening a connection of
+  its own. It owns exactly three things: delivery (the `messageBuffer` listener
+  and the single JSON parse of a roster frame, fanned out to every member in
+  process), the shared SUBSCRIBE acknowledgement a socket attaching mid-subscribe
+  waits on, and the self-probe, which is now one per room rather than one per
+  socket and drops EVERY socket it serves when it goes unanswered. Everything
+  per-socket stays in `relay.ts`: the backlog drop, the join heartbeat, the depth
+  frame, the rate limit, liveness, lifetime. THE REGISTRY IS KEYED ON THE
+  `createSubscriber` REFERENCE as well as the room, because the factory is the
+  only thing that says which Redis a subscription points at; a host passing a
+  fresh closure per socket degrades to a subscriber per socket (the pre-1.1
+  behaviour) rather than to the wrong bus. `sharedSubscriber: false` is the
+  escape hatch.
 - `src/server/memoryRedis.ts` - THE IN-MEMORY REDIS, AND IT SHIPS.
   `createMemoryRedis()` returns `{ redis, createSubscriber }`, exactly the pair the
   Redis factories hand out, and is the client every unit test runs against, from

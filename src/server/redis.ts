@@ -29,17 +29,23 @@ import type { RedisLike } from '../core/index.js';
  *    for ordinary command traffic; they can still be used for anything that
  *    only ever calls `getRedis()`, just not for `createSubscriber()`.
  *
- * THE WALL THIS ARCHITECTURE HITS FIRST. Every player socket the relay holds
- * keeps its own subscriber connection open for the lifetime of that socket,
- * so N concurrently connected players is N concurrent TCP connections to
- * Redis, not one. A managed Redis plan's CONCURRENT CONNECTION ceiling, not
- * its command-per-second quota, is therefore usually the first limit this
- * design runs into. It is also why a per-subject socket cap matters beyond
- * fairness: without one, a single client opening many sockets (deliberately
- * or from a reconnect bug) can burn through the connection ceiling and take
- * down every OTHER subscriber sharing it, including the room's own ticker,
- * which turns one misbehaving client into a total outage for the room rather
- * than a personal inconvenience.
+ * THE WALL THIS ARCHITECTURE USED TO HIT FIRST, AND WHERE IT IS NOW. Every
+ * player socket the relay held used to keep its own subscriber connection open
+ * for the lifetime of that socket, so N concurrently connected players was N
+ * concurrent TCP connections to Redis: a managed plan's CONCURRENT CONNECTION
+ * ceiling, not its command-per-second quota, was the first limit the design ran
+ * into, and a hundred-seat room spent a hundred connections and 283MB of egress
+ * a minute on one arena.
+ *
+ * Since 1.1.0 the relay shares ONE subscriber per room per process
+ * (`server/roomSubscriber.ts`), so the count is rooms rather than sockets and
+ * each snapshot crosses the bus once per process. Nothing in THIS file changed
+ * for it: `createSubscriber` still hands out a brand new connection every time
+ * it is called, because the two constraints above are properties of Redis
+ * itself; what changed is how often the relay calls it. A per-subject socket
+ * cap still matters, for what a socket costs on every other axis, and it is
+ * still what stops one client's reconnect bug from taking down every OTHER
+ * subscriber sharing the plan, including the room's own ticker.
  */
 export interface RedisFactoryOptions {
   /** Defaults to `process.env.REDIS_URL`. */

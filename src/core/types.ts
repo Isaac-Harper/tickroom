@@ -483,9 +483,21 @@ export interface RoomStats {
   /** Bytes of CONFIRMED publishes only, on the same counted-on-success rule as `publishes`: bytes that never left the process are not bandwidth. */
   bytesPublished: number;
   /**
-   * `bytesPublished * players`. Every client socket holds its own Redis
-   * subscriber, so one published snapshot crosses the wire once PER PLAYER.
-   * That fan-out, not command count, is what a managed Redis plan bills.
+   * `bytesPublished * players`: the fan-out a room would cost with a Redis
+   * subscriber per socket, which is what this library did before 1.1.0 and what
+   * a managed plan billed for.
+   *
+   * IT IS AN UPPER BOUND NOW, NOT A MEASUREMENT, and the gap is the point of
+   * `sharedSubscriber` (see `server/relay.ts`). The relay shares ONE subscriber
+   * per room per process, so a snapshot crosses Redis once per PROCESS holding
+   * sockets for that room, not once per player, and the ticker cannot see how
+   * many processes that is: the bus tells a publisher how many subscribers
+   * received a message, but the ticker's own publish reply is not routed here
+   * and would be a different number every tick anyway. Read this as the
+   * unshared ceiling, and read Redis's own `INFO stats total_net_output_bytes`
+   * for what actually crossed the wire. On one relay instance holding every
+   * socket of a room the real figure is `bytesPublished`, i.e. this divided by
+   * the population.
    */
   bytesDelivered: number;
   /**

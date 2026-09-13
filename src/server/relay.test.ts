@@ -2246,13 +2246,21 @@ describe('attachRelay', () => {
       handle.close();
     });
 
-    it('keeps each socket probe on its own channel, so one healthy subscriber cannot answer for a dead one', async () => {
-      // A shared channel would fan every socket's probe out to every other
-      // socket in the room (quadratic in the room size, on the axis managed
-      // Redis bills) AND let any one healthy subscriber answer for all of
-      // them, which is the signal hiding the very failure it exists to
-      // catch. The channel name is derived from the connection id the join
-      // envelope already carries, which is what makes it addressable at all.
+    it('keeps each SUBSCRIBER probe on its own channel, so one healthy subscriber cannot answer for a dead one', async () => {
+      // A channel shared between subscribers would fan every probe out to
+      // every other one (quadratic in the count, on the axis managed Redis
+      // bills) AND let any one healthy subscriber answer for all of them,
+      // which is the signal hiding the very failure it exists to catch. The
+      // channel name is derived from the connection id the join envelope
+      // already carries, which is what makes it addressable at all.
+      //
+      // TWO SUBSCRIBERS HERE BECAUSE THE FACTORY IS BUILT PER SOCKET, which is
+      // itself the property being pinned: the 1.1.0 sharing registry is keyed
+      // on the `createSubscriber` reference, so a host writing a fresh closure
+      // inside its connection handler degrades to a connection per socket (the
+      // old behaviour) rather than to the wrong bus. One factory between them
+      // is one subscriber and one channel; see `one subscriber per room per
+      // process` above for that half.
       const redis = new FakeRedis();
       const joins = joinEnvelopesOn(redis, roomKeys('r1', NS).in);
       const handles = ['pA', 'pB'].map((pid) =>
@@ -2289,6 +2297,258 @@ describe('attachRelay', () => {
       // Each relay published on ITS OWN channel; a shared one would show a
       // single name here however many sockets were attached.
       expect(new Set(hits)).toEqual(new Set(channels));
+    });
+  });
+
+  // ONE SUBSCRIBER PER ROOM PER PROCESS, which is the 1.1.0 change. The
+  // measurement behind it: a hundred-seat room published 2.9MB over 63 seconds
+  // and Redis delivered 283MB of it, because every socket held a subscriber of
+  // its own and every one of them was handed byte-identical payloads. The
+  // assertions below are the four properties that buys and the two it must not
+  // cost, and `FakeRedis.publish` returns the number of subscribers that
+  // actually received the message, which is the fan-out itself rather than a
+  // proxy for it.
+  describe('one subscriber per room per process', () => {
+    /**
+     * A room whose sockets all share ONE `createSubscriber` reference, the way
+     * both shipped adapters do. `baseOptions` builds a fresh closure per call
+     * on purpose (every test that uses it wants a subscriber of its own), and a
+     * fresh closure is exactly what turns the sharing off, so this helper keeps
+     * one.
+     */
+    function process(redis: FakeRedis, shared?: boolean) {
+      const forks: FakeRedis[] = [];
+      const createSubscriber = (): FakeRedis => {
+        const fork = redis.fork();
+        forks.push(fork);
+        return fork;
+      };
+      const attach = (pid: string, roomId = 'r1', over: Record<string, unknown> = {}) => {
+        const socket = new MockSocket();
+        const handle = attachRelay({
+          socket,
+          redis,
+          createSubscriber,
+          roomId,
+          pid,
+          namespace: NS,
+          decodeInput: () => [],
+          spawnTicker: vi.fn().mockResolvedValue(undefined),
+          heartbeatMs: 20,
+          tickerCheckMs: 10_000,
+          tickerCheckJitterMs: 0,
+          livenessTimeoutMs: 10_000,
+          ...(shared === undefined ? {} : { sharedSubscriber: shared }),
+          ...over,
+        });
+        return { socket, handle };
+      };
+      return { forks, attach, createSubscriber };
+    }
+
+    it('builds ONE subscriber for two sockets on the same room, and Redis delivers each snapshot once', async () => {
+      const redis = new FakeRedis();
+      const room = process(redis);
+      const a = room.attach('pA');
+      const b = room.attach('pB');
+      await new Promise((r) => setTimeout(r, 15));
+
+      expect(room.forks).toHaveLength(1);
+
+      a.socket.sent.length = 0;
+      b.socket.sent.length = 0;
+      const snapshot = Buffer.from([9, 8, 7]);
+      // THE FAN-OUT, COUNTED AT THE BUS. One subscriber received it, and two
+      // sockets were written to: that difference IS the change.
+      const delivered = await redis.publish(roomKeys('r1', NS).out, snapshot);
+      expect(delivered).toBe(1);
+      expect(a.socket.sent).toContainEqual(snapshot);
+      expect(b.socket.sent).toContainEqual(snapshot);
+
+      a.handle.close();
+      b.handle.close();
+    });
+
+    it('builds one per ROOM, not one per process: two rooms are two subscribers', async () => {
+      const redis = new FakeRedis();
+      const room = process(redis);
+      const a = room.attach('pA', 'r1');
+      const b = room.attach('pB', 'r2');
+      await new Promise((r) => setTimeout(r, 15));
+
+      expect(room.forks).toHaveLength(2);
+
+      const first = Buffer.from([1]);
+      expect(await redis.publish(roomKeys('r1', NS).out, first)).toBe(1);
+      expect(a.socket.sent).toContainEqual(first);
+      expect(b.socket.sent).not.toContainEqual(first);
+
+      a.handle.close();
+      b.handle.close();
+    });
+
+    it('holds the subscriber until the LAST socket closes, then builds a fresh one for the next attach', async () => {
+      const redis = new FakeRedis();
+      const room = process(redis);
+      const a = room.attach('pA');
+      const b = room.attach('pB');
+      await new Promise((r) => setTimeout(r, 15));
+      expect(room.forks).toHaveLength(1);
+
+      // The first socket out must not take the room's subscription with it:
+      // that is the reference count, and getting it wrong deafens everybody
+      // else in the process the moment one player leaves.
+      a.handle.close();
+      await new Promise((r) => setTimeout(r, 5));
+      const stillLive = Buffer.from([4]);
+      expect(await redis.publish(roomKeys('r1', NS).out, stillLive)).toBe(1);
+      expect(b.socket.sent).toContainEqual(stillLive);
+
+      b.handle.close();
+      await new Promise((r) => setTimeout(r, 5));
+      // Released: nothing in this process is subscribed to the room any more.
+      expect(await redis.publish(roomKeys('r1', NS).out, Buffer.from([5]))).toBe(0);
+
+      const c = room.attach('pC');
+      await new Promise((r) => setTimeout(r, 15));
+      expect(room.forks).toHaveLength(2);
+      const again = Buffer.from([6]);
+      expect(await redis.publish(roomKeys('r1', NS).out, again)).toBe(1);
+      expect(c.socket.sent).toContainEqual(again);
+      c.handle.close();
+    });
+
+    it('drops a backed-up socket\'s snapshot without touching its neighbour', async () => {
+      // The backlog cap is the one per-socket decision in the forward, and
+      // sharing the DELIVERY must not share the DECISION: a paused tab is not a
+      // reason to drop the room's snapshot for everyone else in the process.
+      const log = vi.fn();
+      const redis = new FakeRedis();
+      const room = process(redis);
+      const slow = room.attach('pSlow', 'r1', { snapshotBacklogBytes: 100, log });
+      const fast = room.attach('pFast', 'r1', { snapshotBacklogBytes: 100, log });
+      await new Promise((r) => setTimeout(r, 15));
+
+      slow.socket.bufferedAmount = 100_000;
+      slow.socket.sent.length = 0;
+      fast.socket.sent.length = 0;
+      const snapshot = Buffer.from([2, 2, 2]);
+      for (let i = 0; i < 3; i++) await redis.publish(roomKeys('r1', NS).out, snapshot);
+
+      expect(slow.socket.sent).toHaveLength(0);
+      expect(fast.socket.sent).toHaveLength(3);
+
+      // And the drop is reported against the socket that made it, not the room.
+      await new Promise((r) => setTimeout(r, 40));
+      const drops = log.mock.calls.filter((c) => c[0]?.kind === 'relay.backlog-drop');
+      expect(drops.length).toBeGreaterThan(0);
+      expect(new Set(drops.map((c) => c[0].pid))).toEqual(new Set(['pSlow']));
+
+      slow.handle.close();
+      fast.handle.close();
+    });
+
+    it('drops EVERY socket it serves when the shared subscription stops delivering', async () => {
+      // A dead private subscription dropped its one socket; a dead shared one
+      // has to drop all of them, or the sockets it no longer serves sit open
+      // receiving nothing with every other signal reading healthy. One probe
+      // for the room, one `relay.subscriber-dead` line per socket.
+      const log = vi.fn();
+      const redis = new FakeRedis();
+      const sub = redis.fork();
+      let deliver = true;
+      const original = sub.on.bind(sub);
+      (sub as unknown as { on: (ev: string, cb: (...args: unknown[]) => void) => void }).on = (ev, cb) => {
+        if (ev === 'messageBuffer') original(ev, (...args: unknown[]) => (deliver ? cb(...args) : undefined));
+        else original(ev, cb);
+      };
+      const createSubscriber = (): FakeRedis => sub;
+      const sockets = ['pA', 'pB'].map((pid) => {
+        const socket = new MockSocket();
+        attachRelay({
+          socket,
+          redis,
+          createSubscriber,
+          roomId: 'r1',
+          pid,
+          namespace: NS,
+          decodeInput: () => [],
+          spawnTicker: vi.fn().mockResolvedValue(undefined),
+          heartbeatMs: 20,
+          tickerCheckMs: 10_000,
+          tickerCheckJitterMs: 0,
+          livenessTimeoutMs: 10_000,
+          log,
+        });
+        return socket;
+      });
+      await new Promise((r) => setTimeout(r, 10));
+      deliver = false;
+
+      await new Promise((r) => setTimeout(r, 300));
+      expect(sockets.map((s) => s.terminated)).toEqual([1, 1]);
+      const lines = log.mock.calls.filter((c) => c[0]?.kind === 'relay.subscriber-dead');
+      expect(lines).toHaveLength(2); // one per socket, once each
+      expect(new Set(lines.map((c) => c[0].pid))).toEqual(new Set(['pA', 'pB']));
+    });
+
+    it('the escape hatch restores one subscriber per socket, and one probe channel each', async () => {
+      const redis = new FakeRedis();
+      const joins = joinEnvelopesOn(redis, roomKeys('r1', NS).in);
+      const room = process(redis, false);
+      const a = room.attach('pA');
+      const b = room.attach('pB');
+      await new Promise((r) => setTimeout(r, 15));
+
+      expect(room.forks).toHaveLength(2);
+      const snapshot = Buffer.from([3]);
+      // TWO deliveries for one publish: the fan-out this release exists to
+      // remove, still available to a host that wants a socket's subscription to
+      // fail alone.
+      expect(await redis.publish(roomKeys('r1', NS).out, snapshot)).toBe(2);
+      expect(a.socket.sent).toContainEqual(snapshot);
+      expect(b.socket.sent).toContainEqual(snapshot);
+
+      const conns = [...new Set(joins.filter((e) => e.t === 'join').map((e) => (e as { c?: string }).c))];
+      expect(conns).toHaveLength(2);
+      const hits: string[] = [];
+      const watcher = redis.fork();
+      watcher.on('message', (ch: unknown) => {
+        if (typeof ch === 'string') hits.push(ch);
+      });
+      await watcher.subscribe(...conns.map((c) => `${NS}:r1:relay:${c}`));
+      await new Promise((r) => setTimeout(r, 80));
+      expect(new Set(hits).size).toBe(2); // a probe per subscriber, and there are two
+
+      a.handle.close();
+      b.handle.close();
+    });
+
+    it('SHARED, the two sockets probe ONE channel between them', async () => {
+      // The channel is still per SUBSCRIBER, which is what makes the answer
+      // mean anything (one healthy subscriber answering for a dead one is the
+      // signal hiding the failure). There is simply one subscriber now, so
+      // there is one channel, named after whichever socket created it.
+      const redis = new FakeRedis();
+      const joins = joinEnvelopesOn(redis, roomKeys('r1', NS).in);
+      const room = process(redis);
+      const a = room.attach('pA');
+      const b = room.attach('pB');
+      await new Promise((r) => setTimeout(r, 15));
+
+      const conns = [...new Set(joins.filter((e) => e.t === 'join').map((e) => (e as { c?: string }).c))];
+      expect(conns).toHaveLength(2); // two sockets, two identities, as always
+      const hits: string[] = [];
+      const watcher = redis.fork();
+      watcher.on('message', (ch: unknown) => {
+        if (typeof ch === 'string') hits.push(ch);
+      });
+      await watcher.subscribe(...conns.map((c) => `${NS}:r1:relay:${c}`));
+      await new Promise((r) => setTimeout(r, 80));
+      expect(new Set(hits).size).toBe(1);
+
+      a.handle.close();
+      b.handle.close();
     });
   });
 
@@ -2568,16 +2828,23 @@ describe('attachRelay', () => {
 
       socket.readyState = 1;
       socket.fire('open');
+      const afterFirst = armed.mock.calls.length;
       socket.fire('open'); // a transport that repeats it, or a reconnect that re-emits
-      const heartbeats = armed.mock.calls.length;
+      const afterSecond = armed.mock.calls.length;
       armed.mockRestore();
 
       // Both halves matter and they fail differently. A second join is a
-      // duplicate the ticker absorbs; a second heartbeat is a timer nobody
-      // holds a handle to, so it survives `cleanup`, keeps republishing this
-      // player's join, and keeps a departed player in the room for good.
+      // duplicate the ticker absorbs; a second timer is one nobody holds a
+      // handle to, so it survives `cleanup`, keeps republishing this player's
+      // join, and keeps a departed player in the room for good.
+      //
+      // TWO TIMERS A SESSION, NOT ONE, SINCE 1.1.0: the heartbeat, and the
+      // subscription's own probe (`roomSubscriber.ts`). Counted as a DELTA
+      // rather than as a literal, because the assertion is that a repeated
+      // 'open' arms nothing, not that the session happens to own two things.
       expect(joins.filter((e) => e.t === 'join')).toHaveLength(1);
-      expect(heartbeats).toBe(1);
+      expect(afterFirst).toBe(2);
+      expect(afterSecond).toBe(afterFirst);
       handle.close();
     });
   });

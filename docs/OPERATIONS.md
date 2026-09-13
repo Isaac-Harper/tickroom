@@ -20,11 +20,11 @@ Measured on the game this came from, at 20Hz with a full 20-player room:
 | Per room, regardless of population | ~23 commands |
 | A full 20-player room | ~463 commands |
 
-Three things the audit added cost essentially nothing on that budget, which is why they are on by default. **The client's round-trip ping never touches Redis at all**: the relay answers it directly, which is both what makes the number a true round trip and what makes it free. **The ticker's own liveness probe is one `PUBLISH` per second per room**, on a channel it is already subscribed to, which is under half a percent of the per-room figure above and is the only thing that can detect a subscriber whose TCP path has been black-holed. **The relay's own probe is the same mechanism on the other side of the bus, at one `PUBLISH` per socket per second**, on a channel private to that socket, which is roughly 5% of the per-player figure above. Per connection rather than per room on purpose: a shared probe channel is quadratic in room size and, worse, lets a healthy subscriber answer for a dead one, which is the one signal built to catch this becoming the thing that hides it.
+Three things the audit added cost essentially nothing on that budget, which is why they are on by default. **The client's round-trip ping never touches Redis at all**: the relay answers it directly, which is both what makes the number a true round trip and what makes it free. **The ticker's own liveness probe is one `PUBLISH` per second per room**, on a channel it is already subscribed to, which is under half a percent of the per-room figure above and is the only thing that can detect a subscriber whose TCP path has been black-holed. **The relay's own probe is the same mechanism on the other side of the bus, at one `PUBLISH` per subscriber per second**, on a channel private to that subscriber, which since 1.1.0 is one per room per relay instance rather than one per socket. Per subscriber rather than per room on purpose: a probe channel shared between subscribers is quadratic in their count and, worse, lets a healthy subscriber answer for a dead one, which is the one signal built to catch this becoming the thing that hides it.
 
-**Fan-out is free in commands and expensive in bandwidth.** One `PUBLISH` reaches every subscriber for one command, so command count does not scale with population. Bytes do: every player socket holds its own subscriber, so a snapshot crosses the wire once per player. `RoomStats.bytesDelivered` measures exactly that.
+**Fan-out is free in commands and expensive in bandwidth.** One `PUBLISH` reaches every subscriber for one command, so command count does not scale with population. Bytes used to: before 1.1.0 every player socket held its own subscriber, so a snapshot crossed the wire once per player, and `RoomStats.bytesDelivered` is still that figure.
 
-If bandwidth ever becomes the bill, the lever is not a bigger plan, it is ending the per-socket fan-out: one subscriber per room per relay instance, or the ticker off serverless entirely.
+That lever has been pulled. `sharedSubscriber` (default on) gives a room ONE subscriber per relay instance, so a snapshot crosses Redis once per process holding sockets for the room rather than once per player; `bytesDelivered` is now the unshared UPPER BOUND rather than a measurement, and Redis's own `INFO stats total_net_output_bytes` is what to read against it. Measured on a hundred-seat room over 63 seconds: 293.1MB of Redis egress and a peak of 103 client connections before, 60.6MB and 4 after, against 2.0MB of snapshots published either way. What is left is the INPUT path, which is linear in the population and crosses the bus once per client whatever the relay does. What is left if bandwidth is still the bill is the snapshot itself, or the ticker off serverless entirely.
 
 
 ---
@@ -78,13 +78,15 @@ because a standby's poll is spent out of the same lifetime budget the platform
 measures from the moment the request arrived. The routes pass 8000 against 3000.
 Leave both alone and the defaults already satisfy this.
 
-**The first ceiling you hit is concurrent connections, not commands.** Every
-socket needs its own subscriber, because a connection in subscribe mode cannot
-run ordinary commands. That is why the relay enforces a per-user socket cap:
-without it, one client opening sockets can exhaust the connection ceiling and
-take the room's own ticker subscriber down with it, which is a total outage
-rather than a nuisance. A real deployment measured a peak of 8 Redis connections
-for three players plus the ticker and the harness, roughly two per player.
+**Concurrent connections were the first ceiling, and 1.1.0 moved it.** A
+connection in subscribe mode cannot run ordinary commands, so a subscription
+needs a connection of its own; what changed is how many subscriptions a room
+needs. Before 1.1.0 it was one per socket, so a hundred-seat room was a hundred
+connections. With `sharedSubscriber` (default on) it is one per room per relay
+instance. The per-user socket cap still matters for the same reason at a smaller
+scale (sockets cost memory, join traffic and a rate-limit allowance each), and it
+is still what stops one client from exhausting a plan and taking the room's own
+ticker subscriber down with it.
 
 ## Redis
 

@@ -5,6 +5,62 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-09-12
+
+One subscriber per room per process instead of one per socket. Nothing on the
+wire moved and no host code has to change.
+
+### Added
+
+- `RelayOptions.sharedSubscriber` (default `true`). Every socket in a process
+  attached to the same room shares ONE Redis subscriber connection, reference
+  counted, and the fan-out to sockets happens in process. Redis delivers each
+  snapshot once per process rather than once per player, and the connection
+  count per process falls from sockets to rooms.
+
+  MEASURED ON A HUNDRED-SEAT ROOM, 60 seconds of real play against a local
+  Redis, reading `INFO stats total_net_output_bytes` and `CLIENT LIST` rather
+  than the library's own accounting: 293.1MB of Redis egress and a peak of 103
+  concurrent client connections before, 60.6MB and 4 after, with 2.0MB of
+  snapshots published either way and every other row of the harness unchanged
+  (19.55 snapshots a second per client, zero stalls, zero reconnects, cadence
+  p50 50.0ms). The old snapshot fan-out was quadratic in the room's population,
+  because the frame itself is linear in it. WHAT IS LEFT IS THE INPUT PATH,
+  which this does not touch and should not: a hundred clients each publish a
+  window per stamped tick onto `keys.in`, and every one of those crosses the
+  bus once to reach the ticker's single subscriber whatever the relay does.
+
+  Set it `false` for the pre-1.1 arrangement byte for byte. The reason to want
+  it is failure isolation: shared, a black-holed subscriber drops every socket
+  of that room in that process at once instead of one of them.
+
+  IT NEEDS A STABLE `createSubscriber` REFERENCE, which both shipped adapters
+  already pass. The registry is keyed on the factory as well as the room,
+  because the factory is the only thing that says which Redis a subscription
+  points at; a host that builds a fresh closure inside its own connection
+  handler gets a subscriber per socket, i.e. the old behaviour, rather than the
+  wrong bus.
+
+- `src/server/roomSubscriber.ts`, which owns the registry, the reference count
+  and the probe. Internal: nothing new is exported from `tickroom/server`.
+
+### Changed
+
+- The relay's self-probe is per SUBSCRIBER rather than per socket, on the same
+  `{ns}:{roomId}:relay:{conn}` channel shape, named after the socket that
+  created the subscription. An unanswered probe logs `relay.subscriber-dead`
+  and drops every socket that subscription serves, which is the same conclusion
+  the per-socket version reached about its one socket. No new log kind, no new
+  close code.
+- `RoomStats.bytesDelivered` (`bytesPublished * players`) is now an UPPER
+  BOUND, the cost a subscriber per socket would have carried, rather than a
+  measurement. The ticker cannot see how many processes hold sockets for its
+  room. Read Redis's own `INFO stats total_net_output_bytes` against it.
+- Nothing else about a socket is shared: the snapshot backlog drop, the join
+  heartbeat, the playout depth frame, the inbound rate limit, the ticker check,
+  the liveness deadline and `lifetimeMs` are all per socket exactly as before, so
+  a slow socket still drops its own snapshots and never stalls its neighbours.
+
 ## [1.0.1] - 2026-09-09
 
 A cleanup release. Nothing on the wire or in the contract moved.

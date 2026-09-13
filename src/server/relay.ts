@@ -20,6 +20,12 @@ import {
   depthFor,
 } from '../core/index.js';
 import type { Subscriber } from './redis.js';
+import {
+  acquireRoomSubscription,
+  type MetaFrame,
+  type RoomSubscriberMember,
+  type RoomSubscriptionHandle,
+} from './roomSubscriber.js';
 
 /**
  * The relay: one of these per socket, dumb by design. It knows nothing
@@ -65,17 +71,6 @@ const SEND_FAILURE_LIMIT = 3;
  */
 const LIBRARY_FRAMES = new Set<string>(Object.values(SERVER_FRAMES));
 const BROADCAST_FRAMES = new Set<string>([SERVER_FRAMES.meta]);
-
-/**
- * How many probes may go unanswered before the subscriber is declared dead.
- * Three, so a single dropped delivery (or a probe published into a
- * momentarily unreachable Redis) is never enough on its own, and paced by the
- * HEARTBEAT rather than by a knob of its own: the heartbeat is already the
- * one cadence in this file the client cannot influence, and giving liveness a
- * second, independent period is how `ticker.ts` ended up with a deadline
- * derived from a metrics setting.
- */
-const PROBE_MISS_LIMIT = 3;
 
 /**
  * The bus-arrival gap, and the arrival-to-send lag, that are worth ONE line a
@@ -263,6 +258,45 @@ export interface RelayOptions {
    * fresh relay with a fresh subscriber.
    */
   subscribeTimeoutMs?: number | undefined;
+  /**
+   * Share ONE Redis subscriber connection between every socket in this process
+   * attached to the same room. Default true.
+   *
+   * WHY IT IS THE DEFAULT, MEASURED. A socket used to hold its own subscriber,
+   * so a room's snapshot crossed Redis once per PLAYER: measured on a
+   * hundred-seat room over 63 seconds, 2.9MB published came back as 283MB of
+   * Redis egress and 103 concurrent connections, i.e. 16GB an hour for one
+   * room. Every one of those sockets was subscribed to the same two channels
+   * and handed byte-identical payloads, so the duplication bought nothing: the
+   * only per-socket decision in the forward is whether THIS transport is backed
+   * up, and that is made here, after delivery. Shared, Redis delivers each
+   * snapshot once per process and the connection count per process falls from
+   * sockets to rooms. On a long-lived host that is the whole fleet; on Vercel
+   * fluid compute, where many concurrent `/api/ws` invocations share one
+   * instance, it is every socket of a room that landed on the same instance.
+   *
+   * WHAT DOES NOT CHANGE. The snapshot backlog (`snapshotBacklogBytes`), the
+   * join heartbeat, the playout depth frame, the rate limit, the ticker check,
+   * the liveness deadline and the lifetime all stay per socket, so a slow socket
+   * still drops its own snapshots and never stalls its neighbours. The probe is
+   * the one thing that becomes one-per-room: it asks whether the SUBSCRIBER
+   * still delivers, and a shared subscription that stops delivering drops every
+   * socket it serves exactly as a private one dropped its single socket.
+   *
+   * IT NEEDS A STABLE `createSubscriber` REFERENCE. The registry is keyed on
+   * the factory as well as on the room, because the factory is the only thing
+   * that says which Redis a subscription is pointed at (see
+   * `server/roomSubscriber.ts`). Both shipped adapters pass a stable one; a
+   * host that builds a fresh closure per socket gets one subscriber per socket,
+   * i.e. the old behaviour, rather than the wrong bus.
+   *
+   * SET IT FALSE to go back to a connection per socket, byte for byte. The
+   * reason to do so is a host that wants one socket's subscription to fail
+   * alone: shared, a black-holed subscriber takes down every socket of that
+   * room in that process at once instead of one of them, and they all reconnect
+   * together.
+   */
+  sharedSubscriber?: boolean | undefined;
   /**
    * Drop a snapshot when the socket has more than this many bytes already
    * queued in the transport. Default 32768.
@@ -556,6 +590,7 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
     spawnHoldoffMs = 5000,
     livenessTimeoutMs = DEFAULT_LIVENESS_TIMEOUT_MS,
     subscribeTimeoutMs = 5000,
+    sharedSubscriber = true,
     snapshotBacklogBytes = 32_768,
     lifetimeMs,
     inboundCapacity = 100,
@@ -592,27 +627,25 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
   let lifetimeTimer: ReturnType<typeof setTimeout> | null = null;
   let openDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
   let spawnHoldoffUntil = 0;
-  let sub: Subscriber | null = null;
-
-  // THE SELF-PROBE. See the heartbeat for the failure it exists for and
-  // `probeChannel` for why it gets a channel of its own. Counted as the
-  // NEWEST `n` seen rather than as a tally, so a probe lost on the way out
-  // and a probe lost on the way back are the same fact, exactly as in
-  // `ticker.ts`.
-  let probesSent = 0;
-  let probesAnswered = 0;
+  let subscription: RoomSubscriptionHandle | null = null;
 
   /**
-   * This relay's own probe channel, one per CONNECTION rather than per room.
+   * This socket's own probe channel, one per SUBSCRIBER rather than per room.
    *
-   * Per connection is what makes the cost bounded and the answer meaningful.
-   * A shared channel would fan every socket's probe out to every other socket
-   * in the room (N publishes delivered N times each, quadratic in the room
+   * Per subscriber is what makes the cost bounded and the answer meaningful. A
+   * channel shared by every subscriber in a room would fan every probe out to
+   * every other one (N publishes delivered N times each, quadratic in the room
    * size, on the axis managed Redis actually bills), and worse, one healthy
-   * subscriber would answer for all of them: the signal that exists to catch
-   * a single dead subscription would be the one thing hiding it. Keyed like
-   * every other room key so a namespace sweep still finds it, with `conn` as
-   * the last segment because that is the identity being tested.
+   * subscriber would answer for all of them: the signal that exists to catch a
+   * single dead subscription would be the one thing hiding it. Keyed like every
+   * other room key so a namespace sweep still finds it, with `conn` as the last
+   * segment because that is the identity being tested.
+   *
+   * UNDER `sharedSubscriber` THE SUBSCRIBER IS THE ROOM'S, so this is the
+   * channel only if this socket is the one that CREATED it; a socket joining an
+   * existing subscription probes on the channel already in use. The shape is
+   * unchanged either way, and it is still named after a `conn` the join
+   * envelope carried, which is what keeps it addressable at all.
    */
   const probeChannel = `${namespace ?? DEFAULT_NAMESPACE}:${roomId}:relay:${conn}`;
 
@@ -958,9 +991,14 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
     if (joinPublished) {
       redis.publish(keys.in, JSON.stringify({ t: 'leave', pid, c: conn } satisfies RoomEnvelope)).catch(() => {});
     }
-    if (sub) {
+    // THE SUBSCRIPTION IS RELEASED, NOT DISCONNECTED, because this socket may
+    // not be the only one holding it. The reference count in
+    // `roomSubscriber.ts` disconnects when the last socket for this room in
+    // this process goes, with the same discipline this line always had: a
+    // teardown that throws must never escape into a socket's own close.
+    if (subscription) {
       try {
-        sub.disconnect();
+        subscription.release();
       } catch {
         // best-effort teardown only
       }
@@ -1027,66 +1065,14 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
     });
   }
 
-  sub = createSubscriber();
-
-  // --- pub/sub forwarding ---
-  //
-  // ONE listener, on the buffer-preserving event, for BOTH channels.
-  // Snapshots (keys.out) must never be decoded to a JS string: a binary
-  // codec run through ioredis's string-decoding `message` event is
-  // corrupted by the lossy round trip. Roster and control traffic
-  // (keys.metaout) is always JSON text this library itself publishes, so it
-  // is decoded here, and forwarding it as a string is what makes the client
-  // receive it as a TEXT frame rather than a binary one, matching the
-  // "binary snapshots, text control messages" convention.
-  //
-  // The two used to be two listeners, one per event, and that was measurably
-  // expensive: ioredis emits BOTH events for every delivery as soon as any
-  // 'message' listener exists, so every binary snapshot was utf8-decoded
-  // once per socket per tick purely to be thrown away by a channel check.
-  // Branching on the channel buffer pays the decode only for the channel
-  // that is actually text.
-  sub.on('messageBuffer', (channelBuf: unknown, messageBuf: unknown) => {
-    if (closed) return;
-    if (!Buffer.isBuffer(messageBuf)) return;
-    const channel = Buffer.isBuffer(channelBuf) ? channelBuf.toString('utf8') : String(channelBuf);
-    if (channel === keys.out) {
-      forwardSnapshot(messageBuf);
-      return;
-    }
-    if (channel === probeChannel) {
-      // THIS RELAY'S OWN PROBE, COMING BACK. It is never forwarded to the
-      // socket and never counted as traffic: it is not a frame, it is the
-      // answer to "does my subscription still deliver anything at all".
-      // Recorded as the newest `n` rather than as a count, so one lost probe
-      // cannot be papered over by the next one arriving.
-      try {
-        const answer = JSON.parse(messageBuf.toString('utf8')) as { n?: unknown };
-        // BOUNDED BY WHAT WAS ACTUALLY SENT, not merely monotonic. The
-        // channel name contains `conn`, which this relay publishes in the
-        // clear on every join envelope, so anyone who can write to the bus
-        // can address this socket's probe channel: a single forged
-        // `{ t: 'probe', n: 1e15 }` against an unbounded `n > probesAnswered`
-        // check disables the watchdog for the rest of the socket's life
-        // (measured: the control terminated with one dead line, the poisoned
-        // one never terminated across ten seconds of heartbeats). An answer
-        // for a probe that was never sent is not an answer, and `<=
-        // probesSent` caps the damage of a forgery at the current beat.
-        // `isInteger` refuses the `1e999`/`NaN` shapes a hand-built frame can
-        // carry, exactly like the pong echo's own validation.
-        const n = answer.n;
-        if (typeof n === 'number' && Number.isInteger(n) && n > probesAnswered && n <= probesSent) {
-          probesAnswered = n;
-        }
-      } catch {
-        // Nothing else publishes here, so a frame that does not parse is not
-        // an answer; the deadline treats it as the silence it is.
-      }
-      return;
-    }
-    if (channel !== keys.metaout) return;
-
-    const text = messageBuf.toString('utf8');
+  /**
+   * A control frame off the roster channel, for THIS socket. The bytes and the
+   * one JSON parse are the subscription's (see `roomSubscriber.ts`); every
+   * decision below is per socket, which is why none of it moved: which frames
+   * may reach a client, which pid a `room-reject` names, and whose buffer depth
+   * a `depth` frame is carrying.
+   */
+  function handleMeta(text: string, frame: MetaFrame | null): void {
     // THE ROSTER CHANNEL IS A BROADCAST, SO WHAT MAY LEAVE IT FOR A SOCKET IS
     // AN ALLOWLIST. Every frame published here reaches every relay in the
     // room, while five of the six frames in `SERVER_FRAMES` are PER SOCKET
@@ -1101,14 +1087,6 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
     // library does not define, and anything that is not JSON at all) is
     // forwarded untouched, because the roster channel is the seam this
     // library gives a host for exactly that.
-    let frame: { t?: unknown; pid?: unknown; c?: unknown } | null = null;
-    try {
-      const parsed: unknown = JSON.parse(text);
-      if (typeof parsed === 'object' && parsed !== null) frame = parsed as { t?: unknown; pid?: unknown; c?: unknown };
-    } catch {
-      // Not JSON at all, so it is not a frame this library owns; forwarded
-      // verbatim below, exactly as before.
-    }
     const frameType = frame?.t;
     // ROOM-REJECT IS CONSUMED HERE, NOT FORWARDED. The ticker publishes it
     // when the simulation's own `isFull` refuses a new player. Forwarding it
@@ -1183,29 +1161,90 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
       return;
     }
     sendControl(text);
-  });
+  }
 
-  // A SUBSCRIBER THAT DIES IS NOT A SUBSCRIBER THAT ERRORS LOUDLY. Both
-  // events below arrive on a connection the client can never see, and a
-  // relay that ignores them keeps an open socket that will never receive
-  // another snapshot: the client's own stall detector eventually shows the
-  // player a banner, which is a far worse answer than closing and letting
-  // the reconnect ladder land on a fresh relay. The 'error' events are
-  // COUNTED rather than logged per event, because a flapping connection
-  // emits them at whatever rate it likes.
-  sub.on('error', (err: unknown) => {
-    subscriberErrors++;
-    lastSubscriberError = String(err);
-  });
-  sub.on('end', () => {
-    if (closed) return;
-    log({ lvl: 'error', kind: 'relay.subscriber-dead', room: roomId, pid });
-    cleanup(CLOSE_CODES.relayUnavailable);
-    try {
-      socket.close(CLOSE_CODES.relayUnavailable);
-    } catch {
-      // cleanup already ran; a socket that cannot be closed is gone anyway
-    }
+  /**
+   * THIS SOCKET'S HALF OF THE ROOM'S SUBSCRIPTION. Every method is called
+   * synchronously from a Redis delivery or from the probe timer, and each one
+   * guards on `closed` for the same reason the old inline listener did: a
+   * shared subscriber outlives any one socket, so a frame can arrive for a
+   * relay that has already torn down.
+   */
+  const member: RoomSubscriberMember = {
+    onSnapshot(payload: Buffer): void {
+      if (closed) return;
+      forwardSnapshot(payload);
+    },
+    onMeta(text: string, frame: MetaFrame | null): void {
+      if (closed) return;
+      handleMeta(text, frame);
+    },
+    // A SUBSCRIBER THAT DIES IS NOT A SUBSCRIBER THAT ERRORS LOUDLY. Both of
+    // the next two arrive on a connection the client can never see, and a relay
+    // that ignores them keeps an open socket that will never receive another
+    // snapshot: the client's own stall detector eventually shows the player a
+    // banner, which is a far worse answer than closing and letting the
+    // reconnect ladder land on a fresh relay. The 'error' events are COUNTED
+    // rather than logged per event, because a flapping connection emits them at
+    // whatever rate it likes.
+    onSubscriberError(err: unknown): void {
+      subscriberErrors++;
+      lastSubscriberError = String(err);
+    },
+    onSubscriberEnd(): void {
+      if (closed) return;
+      log({ lvl: 'error', kind: 'relay.subscriber-dead', room: roomId, pid });
+      cleanup(CLOSE_CODES.relayUnavailable);
+      try {
+        socket.close(CLOSE_CODES.relayUnavailable);
+      } catch {
+        // cleanup already ran; a socket that cannot be closed is gone anyway
+      }
+    },
+    // THE PROBE FAILED FOR THE WHOLE SUBSCRIPTION, so every socket it serves is
+    // dropped, one line each. Shared or not, this is the same conclusion the
+    // per-socket version reached about its one socket: the snapshot stream has
+    // stopped and nothing on either end would otherwise say so.
+    onSubscriptionDead(sent: number, answered: number): void {
+      if (closed) return;
+      log({
+        lvl: 'error',
+        kind: 'relay.subscriber-dead',
+        room: roomId,
+        pid,
+        msg: 'the snapshot subscription stopped delivering: closing so the client reconnects onto a fresh relay',
+        meta: { sent, answered },
+      });
+      // `terminate`, not a graceful close, for the same reason the liveness
+      // path uses it: the client's reconnect ladder treats every non-terminal
+      // close alike, so waiting on a closing handshake buys nothing here and
+      // delays the reconnect that is the whole point.
+      try {
+        if (socket.terminate) socket.terminate();
+        else socket.close(CLOSE_CODES.relayUnavailable);
+      } catch {
+        // a socket that cannot be closed is gone, which is the conclusion
+      }
+      cleanup(CLOSE_CODES.relayUnavailable);
+    },
+  };
+
+  // --- pub/sub forwarding ---
+  //
+  // ONE SUBSCRIBER PER ROOM PER PROCESS by default, joined here and reference
+  // counted there; see `sharedSubscriber` above for the 283MB of Redis egress
+  // per hundred-seat minute that made it the default, and `roomSubscriber.ts`
+  // for what it does and does not share. With `sharedSubscriber: false` this is
+  // a connection of this socket's own, which is the pre-1.1 arrangement byte
+  // for byte.
+  subscription = acquireRoomSubscription({
+    createSubscriber,
+    redis,
+    outChannel: keys.out,
+    metaChannel: keys.metaout,
+    probeChannel,
+    shared: sharedSubscriber,
+    member,
   });
 
   /**
@@ -1320,51 +1359,18 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
         cleanup(1006);
         return;
       }
-      // THE SUBSCRIPTION PROBES ITSELF, because nothing else in this file can
-      // see it die. A subscriber connection that is BLACK-HOLED (a dropped
-      // NAT mapping, a firewall that discards packets with no FIN and no RST)
-      // stays OPEN as far as both ends are concerned: ioredis never
-      // reconnects, so `'end'` never fires and the resubscribe never happens,
-      // and the liveness check above measures only what the CLIENT sends, so
-      // a perfectly healthy, chatty player keeps the socket alive forever
-      // while receiving nothing. Measured against real ioredis behind a
-      // black-holing proxy: zero frames after two seconds, no log line, no
-      // close, bounded only by `lifetimeMs` where a host sets one and by
-      // nothing at all on the node adapter. The only way to learn that a
-      // channel still delivers is to send something down it and watch for it
-      // coming back, which is exactly what `ticker.ts` does for its own input
-      // subscription; this is the same mechanism on the other side of the bus.
-      //
-      // Checked BEFORE the next probe is published, so the deadline is three
-      // unanswered probes plus the beat that notices. Fire-and-forget with a
-      // bare `.catch`, because a probe that could not even be PUBLISHED is an
-      // unanswered probe, which is the correct reading rather than a special
-      // case: the relay cannot serve this socket either way.
-      if (probesSent - probesAnswered >= PROBE_MISS_LIMIT) {
-        log({
-          lvl: 'error',
-          kind: 'relay.subscriber-dead',
-          room: roomId,
-          pid,
-          msg: 'the snapshot subscription stopped delivering: closing so the client reconnects onto a fresh relay',
-          meta: { sent: probesSent, answered: probesAnswered },
-        });
-        // `terminate`, not a graceful close, for the same reason the liveness
-        // path uses it: the client's reconnect ladder treats every
-        // non-terminal close alike, so waiting on a closing handshake buys
-        // nothing here and delays the reconnect that is the whole point.
-        try {
-          if (socket.terminate) socket.terminate();
-          else socket.close(CLOSE_CODES.relayUnavailable);
-        } catch {
-          // a socket that cannot be closed is gone, which is the conclusion
-        }
-        cleanup(CLOSE_CODES.relayUnavailable);
-        return;
-      }
-      probesSent++;
-      redis.publish(probeChannel, JSON.stringify({ t: 'probe', n: probesSent })).catch(() => {});
     }, heartbeatMs);
+
+    // AND THE FIFTH JOB IS NOT THIS TIMER'S ANY MORE. The subscription probes
+    // ITSELF, on a timer it owns, because there is one subscriber per room per
+    // process and there are many sockets: a probe per socket would be the
+    // quadratic publish the channel comment above rules out, and one healthy
+    // socket's probe answering for the room is exactly the signal hiding the
+    // failure. Started here rather than at attach so the cadence still begins
+    // when the first socket's SESSION does, which is what a socket still
+    // CONNECTING depends on; idempotent, so a second socket joining an existing
+    // subscription finds it already running.
+    subscription?.startProbing(heartbeatMs);
 
     startLifetimeTimers();
   }
@@ -1453,7 +1459,7 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
       subscribeTimeoutMs
     );
   });
-  void Promise.race([sub.subscribe(keys.out, keys.metaout, probeChannel), subscribeTimeout])
+  void Promise.race([subscription.ready(), subscribeTimeout])
     .then(() => {
       if (subscribeTimeoutTimer) clearTimeout(subscribeTimeoutTimer);
       subscribeTimeoutTimer = null;
