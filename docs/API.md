@@ -27,21 +27,31 @@ Three rules, stated once so the lists can stay short:
   open an issue: either it should be on this list or there is a missing
   option.
 
+## `tickroom`
+
+The root barrel: `export * from './core/index.js'` and `export * from
+'./codec/index.js'`, nothing else. `server` reaches `ioredis` and
+`node:zlib` and each adapter targets one host, so neither is hoisted into the
+one import graph that has to stay browser-safe; see `src/index.ts`. Supported
+exactly as far as `tickroom/core` and `tickroom/codec` are below. Prefer the
+subpath imports in real code; this one exists for discovery.
+
 ## `tickroom/core`
 
 The contract a simulation implements, and the pure mechanisms a host can drive
 directly.
 
-- Types: `RoomRuntime`, `ClientInput`, `RoomStats`, `Counters`, `Percentiles`,
+- Types: `RoomRuntime`, `ClientInput`, `RoomStats`, `Percentiles`,
   `Logger`, `LogEvent`, `LogKind`, `RedisLike`, `CheckpointEnvelope`,
-  `RoomEnvelope`, `SnapshotPayload`.
+  `RoomEnvelope`, `SnapshotPayload`, `OwnershipClock`.
 - Values: `LOG_KINDS`, `CLOSE_CODES`, `SERVER_FRAMES`, `CLIENT_FRAMES`,
   `roomKeys`, `normalizeRoomId`, `normalizeBase`, `roomIdFor`,
-  `acquireLease`, `renewLease`, `releaseLease`, `OwnershipClock`,
+  `DEFAULT_NAMESPACE`,
+  `acquireLease`, `renewLease`, `releaseLease`,
   `CHECKPOINT_VERSION`, `packCheckpoint`, `unpackCheckpoint`,
   `inspectCheckpoint`, `graceMsFromCheckpoint`, `PlayoutBuffer`,
   `StarveTracker`, `decayOnStarve`, `mayPublish`, `TokenBucket`,
-  `RollingHistogram`, `percentiles`.
+  `RollingHistogram`, `percentiles`, `Counters`.
 - Contract constants (value included): `CLOSE_CODES` (4001 to 4004),
   `RELAY_EXPIRY_LEAD_MS`, `PING_INTERVAL_MS`, `DEPTH_INTERVAL_MS`,
   `JOIN_HEARTBEAT_MS`, `PRESENCE_TIMEOUT_HEARTBEATS`, `MAX_TICKER_MS`,

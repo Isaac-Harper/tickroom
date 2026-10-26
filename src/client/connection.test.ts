@@ -1019,6 +1019,31 @@ describe('RoomConnection server clock', () => {
     conn.stop();
   });
 
+  it('a clock step that begins at performance.now() === 0 is timed from 0, not from the next sample', async () => {
+    // 0 is a real `performance.now()` reading, and it was also the "no step
+    // under way" sentinel: a step whose first sample landed at 0 was taken for
+    // no step at all, restarted its clock on the next sample, and the escape
+    // fired one sample late.
+    let fakeNow = 0;
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => fakeNow);
+    const { conn, deliver } = clockRoom();
+    await conn.start();
+    live().open();
+
+    deliver({ tick: 100, serverTime: 0 });
+    deliver({ tick: 101, serverTime: 600 });
+    for (let k = 1; k <= 13; k++) {
+      fakeNow = 50 * k;
+      deliver({ tick: 101 + k, serverTime: fakeNow + 600 });
+    }
+    // 650ms since the step began, past `SERVER_CLOCK_STEP_MS`, with fourteen
+    // stepped samples: adopted on this sample.
+    expect(conn.serverNow() - fakeNow).toBeCloseTo(600, 6);
+
+    conn.stop();
+    clock.mockRestore();
+  });
+
   it('a backwards localNow yields no slew rather than an inverted one', async () => {
     // `performance.now()` is monotonic by contract and the clamp is what keeps
     // that a guard rather than an assumption. `elapsed` is a subtraction of two
@@ -1394,6 +1419,24 @@ describe('RoomConnection server-depth feedback', () => {
     const leadAfter = conn.desiredTick() - conn.estimateServerTick();
     expect(leadAfter).toBeLessThan(leadBefore);
     expect(leadAfter).toBeCloseTo(0, 5); // clamped at -leadTicks, so the floor is zero lead
+    conn.stop();
+  });
+
+  it('above about 133Hz the feedback ceiling is floored at zero, so a starving buffer never CUTS the lead', async () => {
+    // At 200Hz the default 150ms lead is 30 ticks, more than half the playout
+    // bound on its own, and the ceiling `PLAYOUT_MAX_AHEAD / 2 - leadTicks`
+    // went negative: every feedback step, the upward one a starving buffer
+    // asks for included, clamped the lead DOWN to it.
+    useMonotonicFakeTimers();
+    const { conn, deliver } = clockRoom({ tickHz: 200 });
+    await conn.start();
+    live().open();
+
+    let tick = await feed(deliver, conn, 4, 100, 0);
+    const leadBefore = conn.desiredTick() - conn.estimateServerTick();
+    expect(leadBefore).toBeCloseTo(30, 5);
+    tick = await feed(deliver, conn, 60, tick, 0);
+    expect(conn.desiredTick() - conn.estimateServerTick()).toBeGreaterThanOrEqual(leadBefore - 1e-9);
     conn.stop();
   });
 
@@ -1879,6 +1922,92 @@ describe('RoomConnection version skew', () => {
     expect(onTerminal).toHaveBeenCalledWith('version-skew');
     expect(sock.readyState).toBe(3);
     conn.stop();
+  });
+
+  it('reloads only when the reload marker was written, so a denied sessionStorage cannot loop reloads forever', async () => {
+    // The marker is the only thing the reloaded page can read to know it
+    // already tried once. With the write denied (private browsing, quota) the
+    // page reloaded anyway, came back with no marker, and reloaded again.
+    class ProtocolVersionError extends Error {
+      override name = 'ProtocolVersionError';
+    }
+    async function skew(setItem: (key: string, value: string) => void) {
+      const reload = vi.fn();
+      vi.stubGlobal('sessionStorage', { getItem: () => null, setItem });
+      vi.stubGlobal('location', { reload });
+      const onTerminal = vi.fn();
+      const conn = new RoomConnection({
+        tickHz: 20,
+        mint: vi.fn().mockResolvedValue(makeSession()),
+        WebSocketImpl: IMPL,
+        socketUrl: () => 'ws://x',
+        decodeSnapshot: () => {
+          throw new ProtocolVersionError('wire 3, this bundle speaks 2');
+        },
+        onTerminal,
+      });
+      try {
+        await conn.start();
+        live().open();
+        live().message(new ArrayBuffer(4));
+        conn.stop();
+      } finally {
+        vi.unstubAllGlobals();
+      }
+      return { reload, onTerminal };
+    }
+
+    const denied = await skew(() => {
+      throw new Error('QuotaExceededError');
+    });
+    expect(denied.reload).not.toHaveBeenCalled();
+    expect(denied.onTerminal).toHaveBeenCalledWith('version-skew');
+
+    // CONTROL: with the marker written, the one reload goes ahead.
+    const written = await skew(() => undefined);
+    expect(written.reload).toHaveBeenCalledTimes(1);
+    expect(written.onTerminal).not.toHaveBeenCalledWith('version-skew');
+  });
+
+  it('a sessionStorage getter that throws (sandboxed iframe, blocked site data) latches version-skew rather than escaping onmessage', async () => {
+    // `typeof sessionStorage` still resolves the global, and a browser that
+    // blocks storage access throws a SecurityError right there, before any
+    // try/catch around a `.getItem` call ever runs. The old code read that
+    // typeof unguarded, so the throw escaped `onmessage` on every skewed
+    // snapshot and version-skew never latched at all.
+    class ProtocolVersionError extends Error {
+      override name = 'ProtocolVersionError';
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'sessionStorage');
+    Object.defineProperty(globalThis, 'sessionStorage', {
+      configurable: true,
+      get(): never {
+        throw new DOMException('blocked', 'SecurityError');
+      },
+    });
+    const onTerminal = vi.fn();
+    try {
+      const conn = new RoomConnection({
+        tickHz: 20,
+        mint: vi.fn().mockResolvedValue(makeSession()),
+        WebSocketImpl: IMPL,
+        socketUrl: () => 'ws://x',
+        decodeSnapshot: () => {
+          throw new ProtocolVersionError('wire 3, this bundle speaks 2');
+        },
+        onTerminal,
+      });
+      await conn.start();
+      const sock = live();
+      sock.open();
+      expect(() => sock.message(new ArrayBuffer(4))).not.toThrow();
+      conn.stop();
+    } finally {
+      if (descriptor) Object.defineProperty(globalThis, 'sessionStorage', descriptor);
+      else delete (globalThis as { sessionStorage?: unknown }).sessionStorage;
+    }
+
+    expect(onTerminal).toHaveBeenCalledWith('version-skew');
   });
 
   it('any OTHER decoder throw is still swallowed as one dropped frame', async () => {
@@ -2371,6 +2500,36 @@ describe('RoomConnection restart from a terminal', () => {
       socketUrl: () => 'ws://x',
     });
     await expect(conn.start()).rejects.toThrow(/unusable session/);
+  });
+
+  it('a first, awaited start() that throws on an unusable session keeps its contract, and no stall banner follows the throw', async () => {
+    // The abandoned attempt's start time used to stay set, which `pollStall`
+    // reads as a connect that has been silent ever since: the stall banner
+    // came up eight seconds after the host had already been handed the error.
+    useMonotonicFakeTimers();
+    const onTerminal = vi.fn();
+    const onStallChange = vi.fn();
+    const conn = new RoomConnection({
+      tickHz: 20,
+      mint: vi.fn().mockResolvedValue({ error: 'unauthorized' } as unknown as SessionInfo),
+      decodeSnapshot: () => null,
+      WebSocketImpl: IMPL,
+      socketUrl: () => 'ws://x',
+      onTerminal,
+      onStallChange,
+    });
+    // Off zero first: a start time of 0 is the stall rule's own "never tried".
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(conn.start()).rejects.toThrow(/unusable session/);
+    expect(conn.status).toBe('idle');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(conn.frame(performance.now()).stalled).toBe(false);
+    expect(onStallChange).not.toHaveBeenCalled();
+    expect(onTerminal).not.toHaveBeenCalled();
+    // A later start() is still a first start: it throws again.
+    await expect(conn.start()).rejects.toThrow(/unusable session/);
+    expect(onTerminal).not.toHaveBeenCalled();
+    expect(conn.status).toBe('idle');
   });
 });
 
@@ -4134,6 +4293,36 @@ describe('RoomConnection owns the prediction', () => {
     conn.stop();
   });
 
+  it('a non-finite own pose confirms nothing: own stays null until a pose the reconcile accepts', async () => {
+    useMonotonicFakeTimers();
+    const { conn, deliver } = predictRoom();
+    await conn.start();
+    live().open();
+    deliver({ tick: 100, serverTime: performance.now(), own: { x: Number.NaN, y: 0 } });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(conn.frame(performance.now(), STILL).own).toBeNull();
+    expect(conn.ownStats!.invalid).toBe(1);
+
+    deliver({ tick: 101, serverTime: performance.now(), own: { x: 5, y: 5 } });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(conn.frame(performance.now(), STILL).own).toEqual({ x: 5, y: 5 });
+    conn.stop();
+  });
+
+  it('a stop() from inside onSnapshot is not followed by a reconcile or a confirmation on the stopped connection', async () => {
+    useMonotonicFakeTimers();
+    const holder: { conn: RoomConnection<OwnSnap, string, DefaultInput> | null } = { conn: null };
+    const { conn, deliver } = predictRoom({}, { onSnapshot: () => holder.conn?.stop() });
+    holder.conn = conn;
+    await conn.start();
+    live().open();
+    deliver({ tick: 100, serverTime: performance.now(), own: { x: 50, y: 50 } });
+    expect(conn.status).toBe('idle');
+    expect(conn.ownStats!.snaps).toBe(0);
+    expect(conn.own).toEqual({ x: 0, y: 0 });
+    expect(conn.frame(performance.now(), STILL).own).toBeNull();
+  });
+
   it('runs onSnapshot BEFORE reconciling the own entity, so the replay reads the context this snapshot carries', async () => {
     // The replay runs the host's `step` from the server's pose, and a step
     // reads context the host refreshes from the snapshot in `onSnapshot` (a
@@ -4197,6 +4386,57 @@ describe('RoomConnection owns the prediction', () => {
     expect(control.snaps).toBe(0);
     expect(control.lastError).toBe(20);
     expect(control.drawn.x).toBeLessThan(10); // still gliding across
+  });
+
+  it('a re-assign into another room stamps nothing until that room anchors the counter, so no record carries the old room tick', async () => {
+    // `markUnanchored` leaves the counter running on the old room's count,
+    // and every frame between the new socket opening and the new room's first
+    // snapshot stamped records at those ticks. The relay forwards them, and the
+    // new room's playout buffer keeps them as entries thousands of ticks in
+    // its future.
+    useMonotonicFakeTimers();
+    let mints = 0;
+    const holder: { conn: RoomConnection<OwnSnap, string, DefaultInput> | null } = { conn: null };
+    const made = predictRoom(
+      {},
+      {
+        mint: async () => makeSession({ room: `r${++mints}` }),
+        onTerminal: (reason) => {
+          if (reason === 'capacity') void holder.conn?.start({ remint: true });
+        },
+      },
+    );
+    const conn = made.conn;
+    holder.conn = conn;
+    await conn.start();
+    live().open();
+    made.deliver({ tick: 5000, serverTime: performance.now(), own: { x: 0, y: 0 } });
+    for (let i = 0; i < 4; i++) {
+      await vi.advanceTimersByTimeAsync(50);
+      conn.frame(performance.now(), HELD);
+    }
+    expect(inputFrames(live()).length).toBeGreaterThan(0);
+
+    live().remoteClose(4002);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mints).toBe(2);
+    const second = live();
+    second.open();
+    for (let i = 0; i < 10; i++) {
+      await vi.advanceTimersByTimeAsync(50);
+      conn.frame(performance.now(), HELD);
+    }
+    expect(inputFrames(second)).toEqual([]);
+
+    made.deliver({ tick: 10, serverTime: performance.now(), own: { x: 0, y: 0 } });
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(50);
+      conn.frame(performance.now(), HELD);
+    }
+    const frames = inputFrames(second);
+    expect(frames.length).toBeGreaterThan(0);
+    for (const f of frames) for (const r of decodeInputAuto(f)) expect(r.targetTick).toBeLessThan(100);
+    conn.stop();
   });
 
   it('constructs the interpolator itself when `into` is omitted', async () => {

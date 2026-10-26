@@ -6,8 +6,18 @@
 // on a platform that kills your process every few minutes.
 import type { Logger, RedisLike } from '../core/index.js';
 import { CLOSE_CODES, normalizeRoomId } from '../core/index.js';
-import type { HostTickerOptions, RelaySocket, Subscriber, TokenClaims } from '../server/index.js';
-import { admitSocket, createSubscriber, getRedis, runTicker, verifyToken } from '../server/index.js';
+// FROM THE MODULES, NOT THE `server/index.js` BARREL, because the barrel
+// re-exports `server/redis.ts`, which imports `ioredis` at module top. ioredis
+// is an OPTIONAL peer dependency, and the host this adapter's injected clients
+// exist for (one process on `createMemoryRedis()`) is the host that never
+// installs it: through the barrel, that host failed at load, before any option
+// it passed could say it wanted no Redis. The default clients are loaded on
+// demand instead; see `resolveClients`.
+import { admitSocket } from '../server/admission.js';
+import type { Subscriber } from '../server/redis.js';
+import type { RelaySocket } from '../server/relay.js';
+import { verifyToken, type TokenClaims } from '../server/session.js';
+import { runTicker, type HostTickerOptions } from '../server/ticker.js';
 import type { VercelRelayRouteOptions } from './vercel.js';
 
 /** Longest raw `room` value a log line will carry. A refused id is untrusted input; it is evidence, not a payload. */
@@ -43,6 +53,36 @@ function logRoomNormalised(log: Logger | undefined, raw: string | null, room: st
   } catch {
     // never throw out of a logger
   }
+}
+
+/**
+ * Refuses a HALF pair of injected clients. They used to default independently,
+ * so passing one left a command client and a subscriber pointed at different
+ * stores, which this library's pub/sub path fails on in perfect silence.
+ */
+function requireBothOrNeither(caller: string, redis: RedisLike | undefined, createSubscriber: (() => Subscriber) | undefined): void {
+  if ((redis === undefined) === (createSubscriber === undefined)) return;
+  throw new Error(
+    `${caller}: pass redis and createSubscriber both or neither. ` +
+      `Given ${redis === undefined ? 'only createSubscriber' : 'only redis'}, the other would default to an ioredis connection on REDIS_URL, ` +
+      `so commands and subscriptions would reach two different stores and nothing published would ever be delivered.`
+  );
+}
+
+/**
+ * The injected pair, or the library's own ioredis pair, IMPORTED ON DEMAND so a
+ * host that injected its clients never loads `ioredis` at all. The dynamic
+ * import is cached by the module system, so the default `createSubscriber` is
+ * the same function object on every call, which is what the relay's shared
+ * subscriber registry is keyed on.
+ */
+async function resolveClients(
+  redis: RedisLike | undefined,
+  createSubscriber: (() => Subscriber) | undefined
+): Promise<{ redis: RedisLike; createSubscriber: () => Subscriber }> {
+  if (redis !== undefined && createSubscriber !== undefined) return { redis, createSubscriber };
+  const defaults = await import('../server/redis.js');
+  return { redis: defaults.getRedis(), createSubscriber: defaults.createSubscriber };
 }
 
 /**
@@ -89,11 +129,12 @@ export type NodeRelayServerOptions = Omit<
    * store, with no service to stand up and no URL to configure. Read that
    * function's comment for what the trade actually is; it is not free.
    *
-   * PASS BOTH OR NEITHER. They default independently, so supplying only one
-   * leaves a command client and a subscriber pointed at DIFFERENT stores,
-   * which is the failure this library's pub/sub path fails silently on: every
-   * command lands, nothing is ever delivered, and the socket, the lease and
-   * the room's stats key all keep reading healthy.
+   * PASS BOTH OR NEITHER, and supplying only one THROWS when the adapter is
+   * called. Defaulted independently, a single one left a command client and a
+   * subscriber pointed at DIFFERENT stores, which is the failure this
+   * library's pub/sub path fails silently on: every command lands, nothing is
+   * ever delivered, and the socket, the lease and the room's stats key all
+   * keep reading healthy.
    */
   redis?: RedisLike | undefined;
   createSubscriber?: (() => Subscriber) | undefined;
@@ -135,6 +176,7 @@ export function attachNodeRelay(wss: any, opts: NodeRelayServerOptions): void { 
     createSubscriber: hostCreateSubscriber,
     ...relay
   } = opts;
+  requireBothOrNeither('attachNodeRelay', hostRedis, hostCreateSubscriber);
 
   wss.on('connection', async (ws: any, req: any) => { // eslint-disable-line @typescript-eslint/no-explicit-any
     try {
@@ -180,14 +222,16 @@ export function attachNodeRelay(wss: any, opts: NodeRelayServerOptions): void { 
       //
       // A `null` return means refused; there is nothing further for this host
       // to do about it, so it is not branched on.
+      //
+      // The default clients stay LAZY here, inside the connection handler, not
+      // resolved once at attach time: `getRedis()` throws when `REDIS_URL` is
+      // unset, and a host that injected its own pair must never pay for a
+      // default it did not ask for, nor load the module that provides it.
+      const clients = await resolveClients(hostRedis, hostCreateSubscriber);
       await admitSocket({
         socket: ws as RelaySocket,
-        // `getRedis()` stays LAZY here, inside the connection handler, not
-        // resolved once at attach time: it throws when `REDIS_URL` is unset,
-        // and a host that injected its own pair must never pay for a default
-        // it did not ask for.
-        redis: hostRedis ?? getRedis(),
-        createSubscriber: hostCreateSubscriber ?? createSubscriber,
+        redis: clients.redis,
+        createSubscriber: clients.createSubscriber,
         roomId,
         pid: claims.pid,
         subject: claims.sub,
@@ -241,7 +285,8 @@ export type NodeTickerLoopOptions<TState, TEvent> = HostTickerOptions<TState, TE
   /**
    * The two clients, injected, on exactly the terms
    * `NodeRelayServerOptions` states: omitted they are `getRedis()` and
-   * `createSubscriber`, and a host running one process with no Redis passes
+   * `createSubscriber`, one without the other throws, and a host running one
+   * process with no Redis passes
    * `createMemoryRedis()`'s pair here and the SAME pair to
    * `attachNodeRelay`. Two calls to `createMemoryRedis` are two disjoint
    * stores, so a ticker on one and a relay on the other is a room whose
@@ -279,16 +324,16 @@ export async function runNodeTicker<TState, TEvent>(opts: NodeTickerLoopOptions<
     createSubscriber: hostCreateSubscriber,
     ...ticker
   } = opts;
+  requireBothOrNeither('runNodeTicker', hostRedis, hostCreateSubscriber);
   // `getRedis()` only when nothing was injected: it throws with no
   // `REDIS_URL`, and a no-Redis host has none to set.
-  const redis = hostRedis ?? getRedis();
-  const subscriberFactory = hostCreateSubscriber ?? createSubscriber;
+  const { redis, createSubscriber } = await resolveClients(hostRedis, hostCreateSubscriber);
 
   for (;;) {
     const result = await runTicker<TState, TEvent>({
       ...ticker,
       redis,
-      createSubscriber: subscriberFactory,
+      createSubscriber,
       roomId,
       spawnSuccessor: async (_targetRoomId: string, _spawnOpts: { standby: boolean }) => {
         // On a long-lived host the loop below IS the successor: looping back

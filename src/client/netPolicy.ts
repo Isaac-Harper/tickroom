@@ -38,8 +38,8 @@ export interface StallInputs {
   now: number;
   /** Local-clock timestamp of the most recent snapshot, or 0 if none has ever arrived. */
   lastSnapAt: number;
-  /** Local-clock timestamp this connection attempt started, or 0 if none is in flight. */
-  connectStartedAt: number;
+  /** Local-clock timestamp this connection attempt started, or `null` if none is in flight. `performance.now()` can legitimately read 0, so a numeric sentinel for "not yet" is not safe here; see `PlayoutBuffer.aheadBase` for the same trap elsewhere. */
+  connectStartedAt: number | null;
   status: NetStatus;
   /** Has at least one snapshot been decoded since the current connection epoch began? */
   epochDelivered: boolean;
@@ -74,8 +74,8 @@ export function stallDecision(s: StallInputs): StallDecision {
   // open), a joiner landing in a room that is ALREADY hung (every new joiner,
   // once a room hangs), and a reconnect loop that never resumes (the "started
   // trying" timestamp keeps advancing silentMs the whole time it fails).
-  const evidenceAt = Math.max(s.lastSnapAt, s.connectStartedAt);
-  const silentMs = s.connectStartedAt > 0 ? s.now - evidenceAt : 0;
+  const evidenceAt = s.connectStartedAt === null ? s.lastSnapAt : Math.max(s.lastSnapAt, s.connectStartedAt);
+  const silentMs = s.connectStartedAt === null ? 0 : s.now - evidenceAt;
 
   // HYSTERESIS, and it is load-bearing rather than a nicety: once the banner
   // is up, the TIGHT limit stays in force regardless of which regime a naive
@@ -92,7 +92,7 @@ export function stallDecision(s: StallInputs): StallDecision {
       ? STALL_MS
       : STALL_COLD_MS;
 
-  const stalled = !s.terminal && s.connectStartedAt > 0 && silentMs >= thresholdMs;
+  const stalled = !s.terminal && s.connectStartedAt !== null && silentMs >= thresholdMs;
 
   return { stalled, silentMs, thresholdMs };
 }

@@ -1881,8 +1881,11 @@ describe('attachRelay', () => {
       attachRelay({ ...opts, onClose });
       await new Promise((r) => setTimeout(r, 80));
 
-      expect(onClose).toHaveBeenCalledWith(1006);
-      expect(socket.closed).toContain(1006);
+      // `relayUnavailable`, not 1006: a real transport throws on a caller
+      // sending 1006, so the old code passed here only because this double does
+      // not validate. See the strict-socket group below.
+      expect(onClose).toHaveBeenCalledWith(CLOSE_CODES.relayUnavailable);
+      expect(socket.closed).toContain(CLOSE_CODES.relayUnavailable);
       expect(seen).toHaveLength(0); // it never joined, so it has nothing to retract either
       expect(log.mock.calls.filter((c) => c[0]?.kind === 'relay.open-timeout')).toHaveLength(1);
     });
@@ -2218,7 +2221,10 @@ describe('attachRelay', () => {
 
       await new Promise((r) => setTimeout(r, 250));
       expect(socket.terminated).toBe(1);
-      expect(onClose).toHaveBeenCalledWith(CLOSE_CODES.relayUnavailable);
+      // `onClose` must agree with the wire: `terminate()` reports 1006 to the
+      // peer, not the `relayUnavailable` code the old, unrouted cleanup call
+      // hardcoded regardless of which path actually closed the socket.
+      expect(onClose).toHaveBeenCalledWith(1006);
       const lines = log.mock.calls.filter((c) => c[0]?.kind === 'relay.subscriber-dead');
       expect(lines).toHaveLength(1); // once, not once per beat
       expect(lines[0][0].meta.sent).toBeGreaterThanOrEqual(3);
@@ -2463,6 +2469,7 @@ describe('attachRelay', () => {
         else original(ev, cb);
       };
       const createSubscriber = (): FakeRedis => sub;
+      const onCloseCodes: number[] = [];
       const sockets = ['pA', 'pB'].map((pid) => {
         const socket = new MockSocket();
         attachRelay({
@@ -2479,6 +2486,7 @@ describe('attachRelay', () => {
           tickerCheckJitterMs: 0,
           livenessTimeoutMs: 10_000,
           log,
+          onClose: (code) => onCloseCodes.push(code),
         });
         return socket;
       });
@@ -2490,6 +2498,12 @@ describe('attachRelay', () => {
       const lines = log.mock.calls.filter((c) => c[0]?.kind === 'relay.subscriber-dead');
       expect(lines).toHaveLength(2); // one per socket, once each
       expect(new Set(lines.map((c) => c[0].pid))).toEqual(new Set(['pA', 'pB']));
+      // `onSubscriptionDead` used to report `CLOSE_CODES.relayUnavailable`
+      // (4004) unconditionally while actually terminating the socket, which
+      // the peer sees as 1006: `onClose` and the wire disagreed. Routed
+      // through `dropSocket()`, both report the code the transport's own
+      // `terminate()` produces.
+      expect(onCloseCodes).toEqual([1006, 1006]);
     });
 
     it('the escape hatch restores one subscriber per socket, and one probe channel each', async () => {
@@ -3023,6 +3037,318 @@ describe('attachRelay', () => {
       expect(log.mock.calls.filter((c) => c[0]?.kind === 'relay.no-ping')).toHaveLength(0);
       expect(handle.transportPings).toBe(true);
       handle.close();
+    });
+  });
+
+  // 1006 IS A CODE THE TRANSPORT REPORTS, NEVER ONE A CALLER MAY SEND. Both
+  // `ws` and a browser's `close()` THROW on it, so every path that fell back to
+  // `close(1006)` on a transport with no `terminate()` either never closed the
+  // socket (behind a try/catch) or, in the liveness check, threw out of a
+  // `setInterval` and took the process down.
+  describe('a transport with no terminate() is closed with a code it accepts', () => {
+    /** No `terminate()`, and a `close()` that validates its code the way `ws` and a browser do. */
+    function strictSocket(): MockSocket {
+      const socket = new MockSocket();
+      (socket as { terminate?: unknown }).terminate = undefined;
+      const record = socket.close.bind(socket);
+      socket.close = (code?: number): void => {
+        if (code !== undefined && code !== 1000 && !(code >= 3000 && code <= 4999)) {
+          throw new TypeError(`First argument must be a valid error code number: ${code}`);
+        }
+        record(code);
+      };
+      return socket;
+    }
+
+    it('the liveness drop closes with relayUnavailable, and onClose hears the same code', async () => {
+      const socket = strictSocket();
+      const onClose = vi.fn();
+      const { opts } = baseOptions({ socket, onClose, heartbeatMs: 20, livenessTimeoutMs: 40 });
+      attachRelay(opts);
+      await new Promise((r) => setTimeout(r, 120));
+
+      expect(socket.closed).toEqual([CLOSE_CODES.relayUnavailable]);
+      expect(onClose).toHaveBeenCalledTimes(1);
+      expect(onClose).toHaveBeenCalledWith(CLOSE_CODES.relayUnavailable);
+    });
+
+    it('a socket that never opens is actually closed at the open deadline', async () => {
+      const socket = strictSocket();
+      socket.readyState = 0;
+      const onClose = vi.fn();
+      const { opts } = baseOptions({ socket, onClose, subscribeTimeoutMs: 20, livenessTimeoutMs: 10_000 });
+      attachRelay(opts);
+      await new Promise((r) => setTimeout(r, 60));
+
+      expect(socket.closed).toEqual([CLOSE_CODES.relayUnavailable]);
+      expect(onClose).toHaveBeenCalledWith(CLOSE_CODES.relayUnavailable);
+    });
+
+    it('a run of throwing sends is actually closed, not merely cleaned up', async () => {
+      const socket = strictSocket();
+      const onClose = vi.fn();
+      const { redis, opts } = baseOptions({ socket, onClose, heartbeatMs: 10_000, livenessTimeoutMs: 10_000 });
+      attachRelay(opts);
+      await new Promise((r) => setTimeout(r, 10));
+
+      socket.send = () => {
+        throw new Error('EPIPE');
+      };
+      for (let i = 0; i < 3; i++) await redis.publish(roomKeys('r1', NS).out, Buffer.from([i]));
+
+      expect(socket.closed).toEqual([CLOSE_CODES.relayUnavailable]);
+      expect(onClose).toHaveBeenCalledWith(CLOSE_CODES.relayUnavailable);
+    });
+  });
+
+  describe('the shared subscription, beyond the healthy path', () => {
+    function sharedRoom(redis: FakeRedis, makeSubscriber: () => FakeRedis = () => redis.fork()) {
+      const forks: FakeRedis[] = [];
+      const createSubscriber = (): FakeRedis => {
+        const fork = makeSubscriber();
+        forks.push(fork);
+        return fork;
+      };
+      const attach = (pid: string, over: Record<string, unknown> = {}) => {
+        const socket = new MockSocket();
+        const onClose = vi.fn();
+        const handle = attachRelay({
+          socket,
+          redis,
+          createSubscriber,
+          roomId: 'r1',
+          pid,
+          namespace: NS,
+          decodeInput: () => [],
+          spawnTicker: vi.fn().mockResolvedValue(undefined),
+          heartbeatMs: 20,
+          tickerCheckMs: 10_000,
+          tickerCheckJitterMs: 0,
+          livenessTimeoutMs: 10_000,
+          onClose,
+          ...over,
+        });
+        return { socket, handle, onClose };
+      };
+      return { forks, attach };
+    }
+
+    it('a subscribe timeout retires the hung subscription, so the next socket builds a fresh one', async () => {
+      // The second socket keeps the hung entry's reference count above zero,
+      // so releasing the first one alone left it registered and every later
+      // socket for the room joined a subscriber that would never deliver.
+      const redis = new FakeRedis();
+      let hang = true;
+      const room = sharedRoom(redis, () => {
+        const sub = redis.fork();
+        if (hang) (sub as unknown as { subscribe: () => Promise<unknown> }).subscribe = () => new Promise(() => {});
+        return sub;
+      });
+      const a = room.attach('pA', { subscribeTimeoutMs: 20 });
+      const b = room.attach('pB', { subscribeTimeoutMs: 10_000 });
+      await new Promise((r) => setTimeout(r, 60));
+      expect(a.socket.closed).toEqual([CLOSE_CODES.relayUnavailable]);
+      expect(room.forks).toHaveLength(1);
+
+      hang = false;
+      const c = room.attach('pC');
+      await new Promise((r) => setTimeout(r, 15));
+      expect(room.forks).toHaveLength(2);
+      const snapshot = Buffer.from([7]);
+      await redis.publish(roomKeys('r1', NS).out, snapshot);
+      expect(c.socket.sent).toContainEqual(snapshot);
+
+      b.handle.close();
+      c.handle.close();
+    });
+
+    it('CONTROL: a socket that times out does not take a HEALTHY shared subscription out of the registry', async () => {
+      const redis = new FakeRedis();
+      const room = sharedRoom(redis);
+      const a = room.attach('pA');
+      await new Promise((r) => setTimeout(r, 15));
+      const b = room.attach('pB', { subscribeTimeoutMs: 20 });
+      await new Promise((r) => setTimeout(r, 60));
+      expect(b.socket.closed).toEqual([]);
+      const c = room.attach('pC');
+      await new Promise((r) => setTimeout(r, 15));
+      expect(room.forks).toHaveLength(1);
+
+      a.handle.close();
+      b.handle.close();
+      c.handle.close();
+    });
+
+    it('re-seeds every socket it serves once the subscriber is ready again after a reconnect', async () => {
+      // A roster change announced while the subscriber connection was down is
+      // lost to every socket in the room, and nothing repeats it. A socket that
+      // joined mid-outage has its own ack already resolved, so the per-socket
+      // re-seed after the ack does not cover it either.
+      const redis = new FakeRedis();
+      const room = sharedRoom(redis);
+      const a = room.attach('pA');
+      const b = room.attach('pB');
+      await new Promise((r) => setTimeout(r, 15));
+      const keys = roomKeys('r1', NS);
+      await redis.hset(keys.meta, 'pLate', JSON.stringify({ name: 'Late' }));
+      a.socket.sent.length = 0;
+      b.socket.sent.length = 0;
+
+      room.forks[0]?.emit('ready');
+      await new Promise((r) => setTimeout(r, 15));
+
+      for (const s of [a.socket, b.socket]) {
+        const seeds = s.sent
+          .filter((f): f is string => typeof f === 'string')
+          .map((f) => JSON.parse(f) as { t?: string; seed?: boolean; map?: Record<string, unknown> })
+          .filter((f) => f.t === SERVER_FRAMES.meta && f.seed === true);
+        expect(seeds).toHaveLength(1);
+        expect(seeds[0]?.map).toHaveProperty('pLate');
+      }
+      a.handle.close();
+      b.handle.close();
+    });
+
+    it('CONTROL: the FIRST ready, before the subscribe was ever acknowledged, re-seeds nothing extra', async () => {
+      const redis = new FakeRedis();
+      let release: () => void = () => {};
+      const room = sharedRoom(redis, () => {
+        const sub = redis.fork();
+        const subscribe = sub.subscribe.bind(sub);
+        (sub as unknown as { subscribe: (...c: string[]) => Promise<unknown> }).subscribe = (...channels) =>
+          new Promise((resolve) => {
+            release = () => resolve(subscribe(...channels));
+          });
+        return sub;
+      });
+      const a = room.attach('pA');
+      await new Promise((r) => setTimeout(r, 15));
+      const seedsBefore = a.socket.sent.length;
+      room.forks[0]?.emit('ready');
+      await new Promise((r) => setTimeout(r, 15));
+      expect(a.socket.sent.length).toBe(seedsBefore);
+      release();
+      a.handle.close();
+    });
+
+    it('logs a subscriber error ONCE for the room, not once per socket it serves', async () => {
+      const log = vi.fn();
+      const redis = new FakeRedis();
+      const room = sharedRoom(redis);
+      const a = room.attach('pA', { log });
+      const b = room.attach('pB', { log });
+      await new Promise((r) => setTimeout(r, 15));
+
+      for (let i = 0; i < 8; i++) room.forks[0]?.emit('error', new Error('ECONNRESET'));
+      await new Promise((r) => setTimeout(r, 60));
+
+      const lines = log.mock.calls.filter((c) => c[0]?.kind === 'relay.subscriber-error');
+      expect(lines).toHaveLength(1);
+      expect(lines[0]?.[0].meta.count).toBe(8);
+      a.handle.close();
+      b.handle.close();
+    });
+
+    it('a joinMeta JSON cannot carry ends a CONNECTING socket at open instead of throwing out of the listener', () => {
+      const redis = new FakeRedis();
+      const log = vi.fn();
+      const socket = new MockSocket();
+      socket.readyState = 0;
+      const onClose = vi.fn();
+      const createSubscriber = (): FakeRedis => redis.fork();
+      attachRelay({
+        socket,
+        redis,
+        createSubscriber,
+        roomId: 'r-bigint',
+        pid: 'pBig',
+        namespace: NS,
+        joinMeta: { score: 1n },
+        decodeInput: () => [],
+        spawnTicker: vi.fn().mockResolvedValue(undefined),
+        heartbeatMs: 20,
+        log,
+        onClose,
+      });
+      socket.readyState = 1;
+      expect(() => socket.fire('open')).not.toThrow();
+      expect(socket.closed).toEqual([CLOSE_CODES.relayUnavailable]);
+      expect(onClose.mock.calls).toEqual([[CLOSE_CODES.relayUnavailable]]);
+      expect(log.mock.calls.filter((c) => c[0]?.kind === 'relay.publish-failed')).toHaveLength(1);
+    });
+
+    it('a joinMeta JSON cannot carry on an OPEN socket closes it and releases its subscription member', async () => {
+      const redis = new FakeRedis();
+      const room = sharedRoom(redis);
+      const cyclic: Record<string, unknown> = {};
+      cyclic.self = cyclic;
+      let bad: ReturnType<typeof room.attach> | undefined;
+      expect(() => {
+        bad = room.attach('pCycle', { joinMeta: cyclic });
+      }).not.toThrow();
+      expect(bad?.socket.closed).toEqual([CLOSE_CODES.relayUnavailable]);
+      expect(bad?.onClose.mock.calls).toEqual([[CLOSE_CODES.relayUnavailable]]);
+      await new Promise((r) => setTimeout(r, 15));
+      // The member was released, so the room held no subscription and the next
+      // socket builds its own rather than joining one nobody will ever release.
+      const next = room.attach('pNext');
+      expect(room.forks).toHaveLength(2);
+      next.handle.close();
+    });
+
+    it('a throwing host logger in one member stops neither its own teardown nor delivery to the others', async () => {
+      const redis = new FakeRedis();
+      const room = sharedRoom(redis);
+      const log = vi.fn(() => {
+        throw new Error('logger is down');
+      });
+      const a = room.attach('pA', { log });
+      const b = room.attach('pB', { log });
+      await new Promise((r) => setTimeout(r, 15));
+      const keys = roomKeys('r1', NS);
+
+      await redis.publish(keys.metaout, JSON.stringify({ t: ROOM_REJECT_FRAME, pid: 'pA' }));
+      expect(a.socket.closed).toEqual([CLOSE_CODES.capacity]);
+
+      const snapshot = Buffer.from([9]);
+      await redis.publish(keys.out, snapshot);
+      expect(b.socket.sent).toContainEqual(snapshot);
+
+      const c = room.attach('pC', { log });
+      await new Promise((r) => setTimeout(r, 15));
+      expect(() => room.forks[0]?.emit('end')).not.toThrow();
+      expect(b.socket.closed).toEqual([CLOSE_CODES.relayUnavailable]);
+      expect(c.socket.closed).toEqual([CLOSE_CODES.relayUnavailable]);
+    });
+
+    it('each member is re-seeded from its own copy of the roster, so one formatter editing it changes nothing for the next', async () => {
+      const redis = new FakeRedis();
+      const room = sharedRoom(redis);
+      const metaSeedPayload = (map: Record<string, unknown>) => {
+        const frame = { t: SERVER_FRAMES.meta, seed: true, map: { ...map } };
+        delete map.pLate;
+        return frame;
+      };
+      const a = room.attach('pA', { metaSeedPayload });
+      const b = room.attach('pB', { metaSeedPayload });
+      await new Promise((r) => setTimeout(r, 15));
+      await redis.hset(roomKeys('r1', NS).meta, 'pLate', JSON.stringify({ name: 'Late' }));
+      a.socket.sent.length = 0;
+      b.socket.sent.length = 0;
+
+      room.forks[0]?.emit('ready');
+      await new Promise((r) => setTimeout(r, 15));
+
+      for (const s of [a.socket, b.socket]) {
+        const seeds = s.sent
+          .filter((f): f is string => typeof f === 'string')
+          .map((f) => JSON.parse(f) as { seed?: boolean; map?: Record<string, unknown> })
+          .filter((f) => f.seed === true);
+        expect(seeds).toHaveLength(1);
+        expect(seeds[0]?.map).toHaveProperty('pLate');
+      }
+      a.handle.close();
+      b.handle.close();
     });
   });
 });

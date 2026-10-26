@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { ClientTick } from './clientTick.js';
 import { PlayoutBuffer } from '../core/playout.js';
+import { decodeInputAuto, type DefaultInput } from '../codec/snapshot.js';
 import {
   INPUT_HISTORY,
   INPUT_WINDOW,
@@ -772,6 +773,45 @@ describe('PredictedEntity', () => {
     // And the entity is intact: the next good input stamps the owed tick.
     entity.advance({ dir: 1 }, FRAME);
     expect(entity.stats.stamped).toBe(before.stats.stamped + 1);
+  });
+
+  it('on the binary wire EVERY input is shape checked, not only the first: a bad one later throws before anything is stamped and poisons no send', () => {
+    // `buttons: 256` and a NaN axis are both a `DefaultInput` to the type
+    // checker. Checked once, a later one was stamped, moved the mark, threw out
+    // of the encoder, and stayed in the re-send window to throw again on the
+    // next five sends.
+    const tick = new ClientTick({ tickMs: TICK_MS });
+    const sent: Uint8Array[] = [];
+    const conn = { tick, send: (payload: Uint8Array) => void sent.push(payload) };
+    const stick = (pose: Pose, input: DefaultInput, dt: number): Pose => ({ x: pose.x + input.axes[0] * SPEED * dt, y: pose.y });
+    const entity = new PredictedEntity<DefaultInput>({ conn, step: stick, maxSpeed: SPEED, initial: INITIAL });
+    const good: DefaultInput = { axes: [1, 0], buttons: 1 };
+
+    tick.anchorTo(100);
+    entity.advance(good, FRAME);
+    expect(sent).toHaveLength(1);
+
+    for (const bad of [
+      { axes: [0, 0], buttons: 256 },
+      { axes: [Number.NaN, 0], buttons: 0 },
+    ] as DefaultInput[]) {
+      tick.advance(DT);
+      const stats = entity.stats;
+      const pose = entity.pose;
+      expect(() => entity.advance(bad, FRAME)).toThrow(TypeError);
+      expect(() => entity.advance(bad, FRAME)).toThrow(/wire: 'json'/);
+      expect(entity.stats).toEqual(stats);
+      expect(entity.pose).toEqual(pose);
+      expect(sent).toHaveLength(1);
+    }
+
+    // The tick the bad inputs did not claim is still owed, and goes out with
+    // a good one: every record in the window decodes.
+    entity.advance(good, FRAME);
+    expect(sent).toHaveLength(2);
+    const records = decodeInputAuto(sent[1]!);
+    expect(records.map((r) => r.targetTick)).toEqual([100, 101, 102]);
+    for (const r of records) expect(r.data).toEqual(good);
   });
 
   it('a step that returns NaN is refused as a counted snap to the last authoritative pose, and the entity recovers', () => {

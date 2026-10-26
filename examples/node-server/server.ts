@@ -180,6 +180,17 @@ const http = createServer((req, res) => {
   const url = new URL(req.url ?? '/', `http://${req.headers.host}`);
 
   if (url.pathname === '/api/session' && req.method === 'POST') {
+    // REFUSED, NOT ECHOED. The answer's `room` is what the client opens its
+    // socket for, and the upgrade below replaces anything it does not
+    // recognise with 'pong', so echoing an unknown name minted a session for one
+    // room and seated the player in another. A 400 the client can see, the same
+    // as `createRoom`'s session route.
+    const room = url.searchParams.get('room') ?? 'pong';
+    if (!isRoomName(room)) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'unknown room' }));
+      return;
+    }
     const pid = randomUUID();
     const handle = Math.floor(Math.random() * 65535);
     // The token carries the claims the relay will trust for the whole socket's
@@ -189,7 +200,7 @@ const http = createServer((req, res) => {
     // tier stays redeemable forever after the subscription lapsed.
     const token = makeToken({ pid, handle, sub: `d.${pid}` }, { secret: SECRET });
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ token, playerId: pid, handle, room: url.searchParams.get('room') ?? 'pong' }));
+    res.end(JSON.stringify({ token, playerId: pid, handle, room }));
     return;
   }
 
@@ -277,7 +288,7 @@ http.on('upgrade', (req, socket, head) => {
         // fault, which is right (refusing during a blip would lock users out of
         // a healthy deployment) but it must never do so quietly: a degraded
         // Redis disables the cap in exactly the conditions the cap is
-        // load-bearing, since every socket holds its own subscriber connection.
+        // load-bearing, a deployment busy enough to be straining Redis.
         log: (e) => console.log(`[relay ${room}] ${e.lvl} ${e.kind} ${e.msg ?? ''}`),
         // Everything a HOST owns about the relay itself rides this one bag, so
         // an option added to `RelayOptions` later is reachable from here

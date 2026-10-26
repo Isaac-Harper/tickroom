@@ -175,7 +175,7 @@ export type AdmitSocketOptions = {
   socket: RelaySocket;
   /** The shared command client. */
   redis: RedisLike;
-  /** Builds this socket's own dedicated subscriber; forwarded straight to `attachRelay`. */
+  /** The subscriber factory, forwarded straight to `attachRelay`, which shares one subscriber per room per process keyed on this reference. */
   createSubscriber(): Subscriber;
   roomId: string;
   pid: string;
@@ -210,6 +210,16 @@ export type AdmitSocketOptions = {
  * Returns `null` when the socket was refused (the refusal frame and close
  * have already been sent), so a caller's own "did we admit" branch is a
  * null check rather than a second copy of the admission rules.
+ *
+ * THE PER-SUBJECT CAP IS A SOFT CAP. The count and the registration are two
+ * round trips, `checkAdmission`'s pipeline and then the `ZADD` below, so
+ * sockets for one subject admitted concurrently all read the same count and
+ * can overshoot `maxSocketsPerSubject` by however many were in flight at once.
+ * Making it exact means one Lua script doing the prune, the count and the add
+ * together, and `createMemoryRedis` deliberately matches only the scripts this
+ * library already sends. What the cap is for is the slow pile-up of a client's
+ * reconnect bug, which it stops exactly; a burst of parallel admissions
+ * overshooting it by the size of the burst is the accepted price.
  */
 export async function admitSocket(opts: AdmitSocketOptions): Promise<RelayHandle | null> {
   const {
@@ -245,8 +255,7 @@ export async function admitSocket(opts: AdmitSocketOptions): Promise<RelayHandle
   // but it must never do so quietly: see `AdmissionResult.socketCapEvaluated`.
   // One line per admission is fine here because it only ever fires while
   // Redis is degraded, and a run of them is the only warning an operator
-  // gets that the cap protecting the ticker's own subscriber connection is
-  // not currently enforcing anything.
+  // gets that the per-subject cap is not currently enforcing anything.
   if (!admission.socketCapEvaluated) {
     log?.({
       lvl: 'warn',

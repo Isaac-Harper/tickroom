@@ -5009,7 +5009,7 @@ describe('runTicker: pruning a player the simulation forgot', () => {
 // TR-A32: A REFUSAL IS ANSWERED ONCE, NOT ONCE PER JOIN.
 // ---------------------------------------------------------------------------
 describe('runTicker: rejecting a join into a full room', () => {
-  it('answers a burst of joins for one refused pid with a single reject', async () => {
+  it('answers a burst of joins from one refused connection with at most two rejects', async () => {
     // The reject goes out on the ROSTER channel, which fans out to every socket
     // in the room, so a producer that can pick the join rate picks the reject
     // rate too: one refused pid becomes a Redis and fan-out amplifier against
@@ -5039,16 +5039,58 @@ describe('runTicker: rejecting a join into a full room', () => {
 
     await new Promise((r) => setTimeout(r, 10));
     for (let i = 0; i < 50; i++) {
-      await redis.publish(keys.in, JSON.stringify({ t: 'join', pid: 'bob', c: `conn-${i}` }));
+      await redis.publish(keys.in, JSON.stringify({ t: 'join', pid: 'bob', c: 'conn-1' }));
     }
     await new Promise((r) => setTimeout(r, 60));
     await resultPromise;
     observer.disconnect();
 
-    expect(rejects).toHaveLength(1);
-    // The other 49 are counted rather than silently dropped, so the flood is
+    expect(rejects).toHaveLength(2);
+    // The other 48 are counted rather than silently dropped, so the flood is
     // visible without being amplified.
-    expect(stats.reduce((n, st) => n + st.rejectsSuppressed, 0)).toBe(49);
+    expect(stats.reduce((n, st) => n + st.rejectsSuppressed, 0)).toBe(48);
+  });
+
+  it('answers the ack-gated second join of a connection, and every other connection of the same pid', async () => {
+    // A relay publishes a join at once and again on its subscribe ack, and the
+    // reject answering the first can be lost to the subscription not yet being
+    // acknowledged. A window keyed on the pid alone swallowed the second answer
+    // and the answer to the player's other socket.
+    const redis = new FakeRedis();
+    const keys = roomKeys('r-reject-perconn', NS);
+    const rejected: Array<{ pid: string | undefined; c: string | undefined }> = [];
+    const observer = redis.fork();
+    observer.on('message', (_ch: unknown, msg: unknown) => {
+      if (typeof msg !== 'string') return;
+      const f = JSON.parse(msg) as { t?: string; pid?: string; c?: string };
+      if (f.t === 'room-reject') rejected.push({ pid: f.pid, c: f.c });
+    });
+    await observer.subscribe(keys.metaout);
+
+    const resultPromise = runTicker({
+      runtime: makeCounterRuntime({ tickHz: 50, create: withAlice, isFull: () => true }),
+      redis,
+      createSubscriber: () => redis.fork(),
+      roomId: 'r-reject-perconn',
+      namespace: NS,
+      maxRunMs: 400,
+      emptyGraceMs: 100_000,
+      log: () => {},
+    });
+
+    await new Promise((r) => setTimeout(r, 10));
+    for (const c of ['conn-a', 'conn-a', 'conn-b', 'conn-a']) {
+      await redis.publish(keys.in, JSON.stringify({ t: 'join', pid: 'bob', c }));
+    }
+    await new Promise((r) => setTimeout(r, 60));
+    await resultPromise;
+    observer.disconnect();
+
+    expect(rejected).toEqual([
+      { pid: 'bob', c: 'conn-a' },
+      { pid: 'bob', c: 'conn-a' },
+      { pid: 'bob', c: 'conn-b' },
+    ]);
   });
 
   it('a DIFFERENT refused pid is still answered, so the limit is per player', async () => {
@@ -5082,8 +5124,8 @@ describe('runTicker: rejecting a join into a full room', () => {
     await resultPromise;
     observer.disconnect();
 
-    // One each: a shared budget would refuse to tell carol and dave anything.
-    expect(rejected.sort()).toEqual(['bob', 'carol', 'dave']);
+    // A budget each: a shared one would refuse to tell carol and dave anything.
+    expect(rejected.sort()).toEqual(['bob', 'bob', 'carol', 'carol', 'dave']);
   });
 });
 
@@ -6378,5 +6420,586 @@ describe('runTicker: the step that produces tick T consumes the inputs stamped T
     expect(replayFrom(T - 1)).toBe(predicted);
     expect(replayFrom(T)).toBe(predicted);
     expect(replayFrom(T + 1)).toBe(predicted);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Server-path defects: a corrupt checkpoint, a queued write after a crash, a
+// publish after a confirmed loss, pid maps that never drained, and the
+// smaller exit-path orderings.
+// ---------------------------------------------------------------------------
+describe('runTicker: a checkpoint whose bytes cannot be decoded', () => {
+  it('starts fresh on gzip-tagged bytes that will not gunzip, rather than retrying them as a read fault', async () => {
+    const redis = new FakeRedis();
+    const keys = roomKeys('r-corrupt-gzip', NS);
+    await redis.set(keys.state, Buffer.from([0x1f, 0x8b, 0x00, 0x01, 0x02, 0x03]));
+    const logs: LogEvent[] = [];
+
+    const result = await runTicker({
+      runtime: makeCounterRuntime({ tickHz: 50 }),
+      redis,
+      createSubscriber: () => redis.fork(),
+      roomId: 'r-corrupt-gzip',
+      namespace: NS,
+      maxRunMs: 150,
+      emptyGraceMs: 100_000,
+      log: (ev) => logs.push(ev),
+    });
+
+    expect(result.reason).toBe('duration');
+    expect(result.ticks).toBeGreaterThan(0);
+    expect(logs.filter((l) => l.kind === 'ticker.checkpoint-read-failed')).toHaveLength(0);
+    expect(logs.find((l) => l.kind === 'ticker.checkpoint-refused')?.meta).toMatchObject({ reason: 'unparseable' });
+    expect(logs.find((l) => l.kind === 'ticker.fresh')?.meta).toMatchObject({ checkpoint: 'unparseable' });
+  });
+});
+
+describe('runTicker: a checkpoint queued behind a slow write', () => {
+  function heldFirstWriteRedis(stateKey: string) {
+    let releaseHeld: () => void = () => {};
+    const held = new Promise<void>((resolve) => {
+      releaseHeld = resolve;
+    });
+    class HeldFirstWriteRedis extends FakeRedis {
+      stateWrites = 0;
+
+      override async eval(script: string, numKeys: number, ...args: (string | number | Buffer)[]): Promise<unknown> {
+        if (script.includes('KEYS[2]') && String(args[0]) === stateKey) {
+          this.stateWrites++;
+          if (this.stateWrites === 1) await held;
+        }
+        return super.eval(script, numKeys, ...args);
+      }
+    }
+    return { redis: new HeldFirstWriteRedis(), release: () => releaseHeld() };
+  }
+
+  it('is skipped once a tick has thrown, so no write reads the state the throw left behind', async () => {
+    const keys = roomKeys('r-queued-crash', NS);
+    const { redis, release } = heldFirstWriteRedis(keys.state);
+    const POISON = -999;
+    const serialized: number[] = [];
+
+    const result = await runTicker({
+      runtime: makeCounterRuntime({
+        tickHz: 100,
+        create: withAlice,
+        tick: (state) => {
+          state.tick += 1;
+          if (state.tick >= 5) {
+            state.tick = POISON;
+            throw new Error('half-mutated');
+          }
+          return {};
+        },
+        serialize: (state) => {
+          serialized.push(state.tick);
+          return JSON.stringify({ tick: state.tick, players: [], full: false });
+        },
+      }),
+      redis,
+      createSubscriber: () => redis.fork(),
+      roomId: 'r-queued-crash',
+      namespace: NS,
+      checkpointMs: 0,
+      maxRunMs: 5000,
+      emptyGraceMs: 100_000,
+      log: () => {},
+    });
+    expect(result.reason).toBe('error');
+
+    release();
+    await new Promise((r) => setTimeout(r, 200));
+
+    expect(serialized.length).toBeGreaterThan(0);
+    expect(serialized).not.toContain(POISON);
+    expect(redis.stateWrites).toBe(1);
+  });
+
+  it('carries the state from when the chain reached it, not from when it was queued', async () => {
+    const keys = roomKeys('r-queued-fresh', NS);
+    const { redis, release } = heldFirstWriteRedis(keys.state);
+    const serialized: number[] = [];
+    let currentTick = 0;
+
+    const resultPromise = runTicker({
+      runtime: makeCounterRuntime({
+        tickHz: 100,
+        create: withAlice,
+        tick: (state) => {
+          state.tick += 1;
+          currentTick = state.tick;
+          return {};
+        },
+        serialize: (state) => {
+          serialized.push(state.tick);
+          return JSON.stringify({ tick: state.tick, players: [], full: false });
+        },
+      }),
+      redis,
+      createSubscriber: () => redis.fork(),
+      roomId: 'r-queued-fresh',
+      namespace: NS,
+      checkpointMs: 0,
+      maxRunMs: 600,
+      emptyGraceMs: 100_000,
+      log: () => {},
+    });
+
+    await vi.waitFor(() => expect(currentTick).toBeGreaterThanOrEqual(15), { timeout: 3000, interval: 5 });
+    const tickAtRelease = currentTick;
+    expect(serialized).toHaveLength(1);
+    const heldTick = serialized[0] as number;
+    release();
+    await resultPromise;
+
+    expect(tickAtRelease - heldTick).toBeGreaterThanOrEqual(10);
+    expect(serialized[1]).toBeGreaterThanOrEqual(tickAtRelease);
+  });
+});
+
+describe('runTicker: a confirmed lease loss', () => {
+  it('publishes nothing once the async renew has reported the loss', async () => {
+    const keys = roomKeys('r-no-late-publish', NS);
+    let lossConfirmed = false;
+    let publishedAfterLoss = 0;
+    class WatchingRedis extends FakeRedis {
+      override async eval(script: string, numKeys: number, ...args: (string | number | Buffer)[]): Promise<unknown> {
+        const reply = await super.eval(script, numKeys, ...args);
+        const isRenew = !script.includes('KEYS[2]') && !script.includes("'del'") && String(args[0]) === keys.lease;
+        if (isRenew && reply !== 'OK') lossConfirmed = true;
+        return reply;
+      }
+
+      override async publish(channel: string, message: string | Buffer): Promise<number> {
+        if (lossConfirmed && channel === keys.out) publishedAfterLoss++;
+        return super.publish(channel, message);
+      }
+    }
+    const redis = new WatchingRedis();
+
+    const resultPromise = runTicker({
+      runtime: makeCounterRuntime({ tickHz: 50, create: withAlice }),
+      redis,
+      createSubscriber: () => redis.fork(),
+      roomId: 'r-no-late-publish',
+      namespace: NS,
+      // A TTL far past the run, so the synchronous guard cannot be the finder:
+      // the async renew's confirmed refusal is the only detector.
+      leaseTtlMs: 100_000,
+      leaseRenewMs: 20,
+      checkpointMs: 100_000,
+      maxRunMs: 3000,
+      emptyGraceMs: 100_000,
+      log: () => {},
+    });
+
+    await new Promise((r) => setTimeout(r, 15));
+    await redis.set(keys.lease, 'a-thief', 'PX', 5000);
+
+    const result = await resultPromise;
+    expect(result.reason).toBe('lease-lost');
+    expect(lossConfirmed).toBe(true);
+    expect(publishedAfterLoss).toBe(0);
+  });
+
+  it('leaves a timeline floor on the way out, since it published past its last checkpoint', async () => {
+    const redis = new FakeRedis();
+    const keys = roomKeys('r-lost-floor', NS);
+
+    const resultPromise = runTicker({
+      runtime: makeCounterRuntime({ tickHz: 50, create: withAlice }),
+      redis,
+      createSubscriber: () => redis.fork(),
+      roomId: 'r-lost-floor',
+      namespace: NS,
+      leaseTtlMs: 100_000,
+      leaseRenewMs: 20,
+      checkpointMs: 100_000,
+      maxRunMs: 3000,
+      emptyGraceMs: 100_000,
+      log: () => {},
+    });
+    await new Promise((r) => setTimeout(r, 15));
+    await redis.set(keys.lease, 'a-thief', 'PX', 5000);
+
+    const result = await resultPromise;
+    expect(result.reason).toBe('lease-lost');
+    const floor = Number(await redis.get(keys.timeline));
+    expect(Number.isFinite(floor) && floor > 0).toBe(true);
+    // Never a write of the lease or the state it no longer owns.
+    expect(await redis.get(keys.lease)).toBe('a-thief');
+  });
+});
+
+describe('runTicker: input from a pid that never became a member', () => {
+  it('drops its playout state once it has gone unjoined for presenceTimeoutMs', async () => {
+    const redis = new FakeRedis();
+    const keys = roomKeys('r-stranger', NS);
+    const starvesOf = new Map<string, number>();
+    const health: { pid: string; h: number }[] = [];
+
+    const resultPromise = runTicker({
+      runtime: makeCounterRuntime({
+        tickHz: 50,
+        create: withAlice,
+        usesPlayout: () => true,
+        onStarve: (_state, pid) => {
+          starvesOf.set(pid, (starvesOf.get(pid) ?? 0) + 1);
+        },
+        onBufferHealth: (_state, pid, h) => health.push({ pid, h }),
+      }),
+      redis,
+      createSubscriber: () => redis.fork(),
+      roomId: 'r-stranger',
+      namespace: NS,
+      presenceTimeoutMs: 150,
+      statsMs: 50,
+      maxRunMs: 900,
+      emptyGraceMs: 100_000,
+      log: () => {},
+    });
+
+    await new Promise((r) => setTimeout(r, 10));
+    const far = (pid: string) =>
+      JSON.stringify({ t: 'in', pid, w: [{ seq: 1, targetTick: 9000, data: 1 } satisfies ClientInput] });
+    // A refused or never-joined pid, and one whose join is merely late.
+    await redis.publish(keys.in, far('ghost'));
+    await redis.publish(keys.in, far('latecomer'));
+    await new Promise((r) => setTimeout(r, 60));
+    // The relay's own heartbeat, so the latecomer stays a member throughout.
+    const heartbeat = setInterval(() => {
+      void redis.publish(keys.in, JSON.stringify({ t: 'join', pid: 'latecomer' }));
+    }, 50);
+    await redis.publish(keys.in, JSON.stringify({ t: 'join', pid: 'latecomer' }));
+
+    await new Promise((r) => setTimeout(r, 400));
+    const ghostAt = starvesOf.get('ghost') ?? 0;
+    const latecomerAt = starvesOf.get('latecomer') ?? 0;
+    await new Promise((r) => setTimeout(r, 200));
+    clearInterval(heartbeat);
+
+    expect(ghostAt).toBeGreaterThan(0);
+    expect(starvesOf.get('ghost')).toBe(ghostAt);
+    expect(health.filter((e) => e.pid === 'ghost').at(-1)).toEqual({ pid: 'ghost', h: 0 });
+    // A join that landed inside the window keeps the buffer it arrived with.
+    expect(starvesOf.get('latecomer') ?? 0).toBeGreaterThan(latecomerAt);
+    await resultPromise;
+  });
+});
+
+describe('runTicker: the smaller exit paths', () => {
+  it('counts a playerCount that throws before the first tick as a crash', async () => {
+    const redis = new FakeRedis();
+    const keys = roomKeys('r-count-throws', NS);
+
+    const result = await runTicker({
+      runtime: makeCounterRuntime({
+        tickHz: 50,
+        playerCount: () => {
+          throw new Error('no count');
+        },
+      }),
+      redis,
+      createSubscriber: () => redis.fork(),
+      roomId: 'r-count-throws',
+      namespace: NS,
+      maxRunMs: 5000,
+      emptyGraceMs: 100_000,
+      log: () => {},
+    });
+
+    expect(result.reason).toBe('error');
+    expect(await redis.get(keys.crashes)).toBe('1');
+    expect(await redis.get(keys.lease)).toBeNull();
+  });
+
+  it('records the crash BEFORE the lease is released, so a standby cannot win it first', async () => {
+    const keys = roomKeys('r-crash-order', NS);
+    const crashesAtRelease: (string | null)[] = [];
+    class ReleaseWatchingRedis extends FakeRedis {
+      override async eval(script: string, numKeys: number, ...args: (string | number | Buffer)[]): Promise<unknown> {
+        if (script.includes("'del'") && String(args[0]) === keys.lease) {
+          crashesAtRelease.push(await super.get(keys.crashes));
+        }
+        return super.eval(script, numKeys, ...args);
+      }
+    }
+    const redis = new ReleaseWatchingRedis();
+
+    const result = await runTicker({
+      runtime: makeCounterRuntime({
+        tickHz: 50,
+        create: withAlice,
+        tick: () => {
+          throw new Error('boom');
+        },
+      }),
+      redis,
+      createSubscriber: () => redis.fork(),
+      roomId: 'r-crash-order',
+      namespace: NS,
+      maxRunMs: 5000,
+      emptyGraceMs: 100_000,
+      log: () => {},
+    });
+
+    expect(result.reason).toBe('error');
+    expect(crashesAtRelease).toEqual(['1']);
+  });
+
+  it('leaves the timeline marker alone when the final checkpoint was refused', async () => {
+    const keys = roomKeys('r-final-refused', NS);
+    class RefuseLaterWritesRedis extends FakeRedis {
+      private writes = 0;
+
+      override async eval(script: string, numKeys: number, ...args: (string | number | Buffer)[]): Promise<unknown> {
+        if (script.includes('KEYS[2]') && String(args[0]) === keys.state) {
+          this.writes++;
+          if (this.writes > 1) return null;
+        }
+        return super.eval(script, numKeys, ...args);
+      }
+    }
+    const redis = new RefuseLaterWritesRedis();
+    await redis.set(keys.timeline, '12345');
+    const logs: LogEvent[] = [];
+
+    const result = await runTicker({
+      runtime: makeCounterRuntime({ tickHz: 50 }),
+      redis,
+      createSubscriber: () => redis.fork(),
+      roomId: 'r-final-refused',
+      namespace: NS,
+      checkpointMs: 100_000,
+      maxRunMs: 150,
+      emptyGraceMs: 100_000,
+      log: (ev) => logs.push(ev),
+    });
+
+    expect(result.reason).toBe('duration');
+    expect(logs.filter((l) => l.kind === 'ticker.checkpoint-refused-not-owner')).toHaveLength(1);
+    // The DEL is not owner-checked, so a refused writer must not issue it.
+    expect(await redis.get(keys.timeline)).toBe('12345');
+  });
+
+  it('a standby keeps polling through an acquire that throws, rather than rejecting', async () => {
+    let throwsLeft = 2;
+    class FlakyAcquireRedis extends FakeRedis {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      override async set(key: string, value: string | Buffer, ...args: any[]): Promise<any> {
+        if (args.includes('NX') && throwsLeft > 0) {
+          throwsLeft--;
+          throw new Error('acquire is down');
+        }
+        return super.set(key, value, ...args);
+      }
+    }
+    const redis = new FlakyAcquireRedis();
+
+    const result = await runTicker({
+      runtime: makeCounterRuntime({ tickHz: 50 }),
+      redis,
+      createSubscriber: () => redis.fork(),
+      roomId: 'r-standby-acquire-throws',
+      namespace: NS,
+      standbyMs: 2000,
+      maxRunMs: 300,
+      emptyGraceMs: 100_000,
+      log: () => {},
+    });
+
+    expect(throwsLeft).toBe(0);
+    expect(result.reason).toBe('duration');
+  });
+
+  it('an ordinary acquire that throws returns an error result rather than rejecting', async () => {
+    class DownAcquireRedis extends FakeRedis {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      override async set(key: string, value: string | Buffer, ...args: any[]): Promise<any> {
+        if (args.includes('NX')) throw new Error('acquire is down');
+        return super.set(key, value, ...args);
+      }
+    }
+    const redis = new DownAcquireRedis();
+    const logs: LogEvent[] = [];
+
+    const result = await runTicker({
+      runtime: makeCounterRuntime({ tickHz: 50 }),
+      redis,
+      createSubscriber: () => redis.fork(),
+      roomId: 'r-acquire-throws',
+      namespace: NS,
+      maxRunMs: 300,
+      emptyGraceMs: 100_000,
+      log: (ev) => logs.push(ev),
+    });
+
+    expect(result).toMatchObject({ reason: 'error', ticks: 0 });
+    expect(logs.filter((l) => l.kind === 'ticker.acquire-failed')).toHaveLength(1);
+  });
+
+  /** A `SET NX` that Redis applied but whose reply timed out: the write lands, the caller sees a rejection. */
+  class AppliedThenTimedOutRedis extends FakeRedis {
+    timeoutsLeft: number;
+    constructor(timeouts: number) {
+      super();
+      this.timeoutsLeft = timeouts;
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    override async set(key: string, value: string | Buffer, ...args: any[]): Promise<any> {
+      const reply: unknown = await super.set(key, value, ...args);
+      if (args.includes('NX') && this.timeoutsLeft > 0) {
+        this.timeoutsLeft--;
+        throw new Error('Command timed out');
+      }
+      return reply;
+    }
+  }
+
+  it('a standby whose acquire was applied but timed out finds its own lease and ticks rather than going busy', async () => {
+    const redis = new AppliedThenTimedOutRedis(1);
+    const keys = roomKeys('r-acquire-applied-timeout', NS);
+
+    const result = await runTicker({
+      runtime: makeCounterRuntime({ tickHz: 50 }),
+      redis,
+      createSubscriber: () => redis.fork(),
+      roomId: 'r-acquire-applied-timeout',
+      namespace: NS,
+      standbyMs: 600,
+      maxRunMs: 300,
+      emptyGraceMs: 100_000,
+      log: () => {},
+    });
+
+    expect(redis.timeoutsLeft).toBe(0);
+    expect(result.reason).toBe('duration');
+    expect(result.ticks).toBeGreaterThan(0);
+    expect(await redis.get(keys.lease)).toBeNull();
+  });
+
+  it('a standby whose acquire threw without applying still goes busy against a live incumbent', async () => {
+    let throwsLeft = 0;
+    class DroppedAcquireRedis extends FakeRedis {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      override async set(key: string, value: string | Buffer, ...args: any[]): Promise<any> {
+        if (args.includes('NX') && throwsLeft > 0) {
+          throwsLeft--;
+          throw new Error('Command timed out');
+        }
+        return super.set(key, value, ...args);
+      }
+    }
+    const redis = new DroppedAcquireRedis();
+    const keys = roomKeys('r-acquire-dropped', NS);
+    await acquireLease(redis, keys.lease, 'the-incumbent', { leaseTtlMs: 5000 });
+    throwsLeft = 1;
+
+    const result = await runTicker({
+      runtime: makeCounterRuntime({ tickHz: 50 }),
+      redis,
+      createSubscriber: () => redis.fork(),
+      roomId: 'r-acquire-dropped',
+      namespace: NS,
+      standbyMs: 150,
+      maxRunMs: 300,
+      emptyGraceMs: 100_000,
+      log: () => {},
+    });
+
+    expect(throwsLeft).toBe(0);
+    expect(result.reason).toBe('busy');
+    expect(await redis.get(keys.lease)).toBe('the-incumbent');
+  });
+
+  it('an acquire that threw on its last attempt releases the lease it may have taken before returning error', async () => {
+    const redis = new AppliedThenTimedOutRedis(1);
+    const keys = roomKeys('r-acquire-applied-error', NS);
+    const logs: LogEvent[] = [];
+
+    const result = await runTicker({
+      runtime: makeCounterRuntime({ tickHz: 50 }),
+      redis,
+      createSubscriber: () => redis.fork(),
+      roomId: 'r-acquire-applied-error',
+      namespace: NS,
+      maxRunMs: 300,
+      emptyGraceMs: 100_000,
+      log: (ev) => logs.push(ev),
+    });
+
+    expect(result).toMatchObject({ reason: 'error', ticks: 0 });
+    expect(logs.filter((l) => l.kind === 'ticker.acquire-failed')).toHaveLength(1);
+    expect(await redis.get(keys.lease)).toBeNull();
+  });
+
+  it('a clean null acquire whose recovery GET throws is busy, not error, against a live incumbent', async () => {
+    let throwsLeft = 0;
+    const keys = roomKeys('r-acquire-get-throws', NS);
+    class GetDownRedis extends FakeRedis {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      override async set(key: string, value: string | Buffer, ...args: any[]): Promise<any> {
+        if (args.includes('NX') && throwsLeft > 0) {
+          throwsLeft--;
+          throw new Error('Command timed out');
+        }
+        return super.set(key, value, ...args);
+      }
+      override async get(key: string): Promise<string | null> {
+        if (key === keys.lease && throwsLeft === 0 && getsDown) throw new Error('GET is down');
+        return super.get(key);
+      }
+    }
+    let getsDown = false;
+    const redis = new GetDownRedis();
+    await acquireLease(redis, keys.lease, 'the-incumbent', { leaseTtlMs: 5000 });
+    throwsLeft = 1;
+    getsDown = true;
+    const logs: LogEvent[] = [];
+
+    const result = await runTicker({
+      runtime: makeCounterRuntime({ tickHz: 50 }),
+      redis,
+      createSubscriber: () => redis.fork(),
+      roomId: 'r-acquire-get-throws',
+      namespace: NS,
+      standbyMs: 150,
+      maxRunMs: 300,
+      emptyGraceMs: 100_000,
+      log: (ev) => logs.push(ev),
+    });
+    getsDown = false;
+
+    expect(throwsLeft).toBe(0);
+    expect(result.reason).toBe('busy');
+    expect(logs.filter((l) => l.kind === 'ticker.acquire-failed')).toHaveLength(0);
+    expect(await redis.get(keys.lease)).toBe('the-incumbent');
+  });
+
+  it('a standby whose thrown acquire applied, then went busy on a throwing GET, releases its own lease', async () => {
+    const keys = roomKeys('r-acquire-applied-get-throws', NS);
+    class AppliedThenGetDownRedis extends AppliedThenTimedOutRedis {
+      override async get(key: string): Promise<string | null> {
+        if (key === keys.lease) throw new Error('GET is down');
+        return super.get(key);
+      }
+    }
+    const redis = new AppliedThenGetDownRedis(1);
+
+    const result = await runTicker({
+      runtime: makeCounterRuntime({ tickHz: 50 }),
+      redis,
+      createSubscriber: () => redis.fork(),
+      roomId: 'r-acquire-applied-get-throws',
+      namespace: NS,
+      standbyMs: 150,
+      maxRunMs: 300,
+      emptyGraceMs: 100_000,
+      log: () => {},
+    });
+
+    expect(result.reason).toBe('busy');
+    expect(await FakeRedis.prototype.get.call(redis, keys.lease)).toBeNull();
   });
 });

@@ -49,8 +49,9 @@
 // THE DOCUMENTED WAY TO GET ONE IS `RoomConnection`'S `predict` OPTION, which
 // owns an instance of this class and makes the three calls itself: `frame()`
 // advances it after the counter and the interpolator, every decoded snapshot
-// reconciles it before `onSnapshot`, and a snapshot the host declares as a
-// teleport snaps it first. Two of the four things a consumer got wrong in one
+// reconciles it AFTER `onSnapshot` (so the replay reads the step context the
+// host refreshed there), and a snapshot the host declares as a teleport snaps
+// it first. Two of the four things a consumer got wrong in one
 // week were the order of those calls, so the order is no longer the host's.
 // The class stays exported for a host that wants more than one predicted
 // entity (each on its own `conn` fake whose `send` merges the windows, since
@@ -223,7 +224,7 @@ function lerpHeading(a: number, b: number, t: number): number {
 }
 
 /** Every coordinate finite, the heading included when there is one. A pose that fails this is not a pose and must never reach the draw or the offset. */
-function isFinitePose(p: Pose): boolean {
+export function isFinitePose(p: Pose): boolean {
   return Number.isFinite(p.x) && Number.isFinite(p.y) && (p.heading === undefined || Number.isFinite(p.heading));
 }
 
@@ -255,12 +256,14 @@ function isDefaultInput(v: unknown): v is DefaultInput {
 }
 
 /**
- * The check the default wire makes on the input, ONCE, before the first
- * record is stamped: a `TypeError` that names the two alternatives, because
- * the alternative is `ByteWriter` refusing `undefined` several calls down
- * with a message about a `u8`. A checked input is trusted from then on:
- * `TInput` is one type for the life of the entity, and a check per stamp
- * would be paying for a compile-time fact on every frame.
+ * The check the default wire makes on EVERY input, before anything is
+ * stamped: a `TypeError` that names the two alternatives, because the
+ * alternative is `ByteWriter` refusing `undefined` several calls down with a
+ * message about a `u8`. It is not a compile-time fact that a first check
+ * could settle: `buttons: 256` and a NaN axis are both a `DefaultInput` to
+ * the type checker, and one let through after the first frame was pushed,
+ * moved the stamping mark, threw out of the encoder, and stayed in the
+ * re-send window to throw again on the next five sends.
  */
 function assertDefaultInput(input: unknown): void {
   if (isDefaultInput(input)) return;
@@ -310,8 +313,8 @@ export class PredictedEntity<TInput> {
   private readonly step: PredictedEntityOptions<TInput>['step'];
   /** The window to one frame for `conn.send`: the host's `encodeInput`, or the encoder `wire` names. */
   private readonly encode: (records: StampedRecord<TInput>[]) => ArrayBuffer | Uint8Array | string;
-  /** The shape check the default binary wire owes the first input, `null` once it has passed and on every other wire. Run in `advance` before anything moves, so a wrong shape throws on every frame until it is fixed rather than once. */
-  private shapeCheck: ((input: unknown) => void) | null;
+  /** The shape check the default binary wire owes every input, `null` on every other wire. Run in `advance` before anything moves, so a wrong shape throws on every frame it is passed rather than once. */
+  private readonly shapeCheck: ((input: unknown) => void) | null;
   /** One tick, seconds: `conn.tick.tickMs / 1000`, read once at construction. */
   private readonly dt: number;
   private readonly maxSpeed: number;
@@ -452,7 +455,9 @@ export class PredictedEntity<TInput> {
    * moved `dt` of real time (within `RENDER_SLEW`) toward one tick behind
    * the newest stamp, with what is left of the last correction added. Before
    * the counter is initialized it stamps nothing and returns `initial` (or
-   * the last authoritative pose, if a snapshot arrived first).
+   * the last authoritative pose, if a snapshot arrived first), and while it
+   * is unanchored (from a reconnect attempt, or a frozen render loop, until
+   * the epoch's first snapshot) it stamps and sends nothing and only draws.
    *
    * `input` is what the server will apply on those ticks, so run it through
    * the simulation's own clamp before passing it: the record predicted with
@@ -460,7 +465,8 @@ export class PredictedEntity<TInput> {
    * data; `undefined`, a function or a symbol has no JSON form and is refused
    * with a `TypeError` here, before anything is stamped, rather than stamped
    * as a record whose input the server cannot read. On the default binary
-   * wire it also has to be a `DefaultInput`, checked here once, the same way.
+   * wire it also has to be a `DefaultInput`, checked here on every call, the
+   * same way.
    *
    * `dt` is this frame's wall time in seconds. A value that is not a finite
    * non-negative number is NO TIME AT ALL: the playhead and the glide stand
@@ -479,10 +485,7 @@ export class PredictedEntity<TInput> {
         `PredictedEntity.advance: input must be JSON data, got ${input === undefined ? 'undefined' : typeof input}`,
       );
     }
-    if (this.shapeCheck !== null) {
-      this.shapeCheck(input);
-      this.shapeCheck = null;
-    }
+    this.shapeCheck?.(input);
 
     // A DURATION THAT IS NOT ONE IS ZERO. `Math.max(0, NaN)` is NaN, and a
     // NaN added to the playhead once compares false against every gate from
@@ -498,8 +501,18 @@ export class PredictedEntity<TInput> {
     if (!tick.initialized) return { ...this.curr };
     this.observeEpoch(tick.anchored);
 
+    // AN UNANCHORED COUNTER IS STILL COUNTING, ON THE LAST EPOCH'S TIMELINE.
+    // `markUnanchored` leaves the value running, so the main case this
+    // guards is a frozen tab coming back or a reconnect between its own
+    // attempt and its first snapshot: without it, a stamp made in that
+    // window names a tick of the OLD room (or the old, pre-freeze timeline),
+    // which the relay forwards and the new epoch's playout buffer keeps as a
+    // far-future entry. A re-assign into another room is the same window by
+    // a different cause. Nothing is stamped or sent until the epoch's first
+    // snapshot anchors it; the playhead and the draw below run on regardless.
+    const stamping = tick.anchored;
     const value = tick.value;
-    if (this.lastStamped < 0) {
+    if (stamping && this.lastStamped < 0) {
       // THE FIRST STAMP HAS NOTHING TO CATCH UP FROM. The counter is
       // already thousands of ticks into the room's life, so a mark of -1
       // would owe a record for every tick since the room booted. The pose
@@ -508,7 +521,7 @@ export class PredictedEntity<TInput> {
       // from the first frame.
       this.lastStamped = value - 1;
       this.poses.push({ tick: value - 1, pose: { ...this.curr } });
-    } else if (value + 1 < this.lastStamped) {
+    } else if (stamping && value + 1 < this.lastStamped) {
       // THE COUNTER JUMPED BACKWARD, past the one tick of slack a re-anchor
       // of -1 is allowed (that one costs nothing: the tick it lands on is
       // already stamped, stamping resumes a tick later, and the playhead
@@ -581,7 +594,7 @@ export class PredictedEntity<TInput> {
     // whatever the caller does to `input` afterwards. The speculation steps
     // the same copy, so it guesses byte for byte what the stamp will do.
     let data: TInput | undefined;
-    if (from <= value) {
+    if (stamping && from <= value) {
       data = JSON.parse(json) as TInput;
       for (let t = from; t <= value; t++) {
         this.records.push({ targetTick: t, data });

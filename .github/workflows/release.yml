@@ -67,8 +67,10 @@ jobs:
           node-version: '22'
 
       # npm 11.5.1+ is required for trusted publishing. ubuntu-latest ships an
-      # older npm with Node 22, so pin it explicitly rather than hoping.
-      - run: npm install -g npm@latest
+      # older npm with Node 22, so pin it explicitly rather than hoping. A
+      # RANGE, not `latest`: the next npm major is not something a release run
+      # should be the first build to meet.
+      - run: npm install -g npm@^11.5.1
 
       - run: npm ci
 
@@ -77,6 +79,7 @@ jobs:
       # is burned forever.
       - run: npm run build
       - run: npm run typecheck
+      - run: npm run lint
       - name: integration tier, Redis required
         env:
           TICKROOM_TEST_REDIS_URL: redis://127.0.0.1:6399

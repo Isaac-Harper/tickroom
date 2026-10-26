@@ -40,6 +40,7 @@ import {
   verifySpawnToken,
   verifyToken,
 } from '../server/index.js';
+import { DEFAULT_STANDBY_LEAD_MS } from '../server/ticker.js';
 
 // Both were public under `tickroom/adapters/vercel` before the admission
 // protocol moved to `src/server/admission.ts`, so they are re-exported rather
@@ -142,6 +143,14 @@ export const MIN_TICKER_RUN_MS = 10_000;
  */
 export const STANDBY_WAIT_MS = 8000;
 
+/**
+ * What a standby's wait must hold BEYOND the lead it was spawned with: the
+ * incumbent's own exit, a final checkpoint (a gzip of the whole room and a
+ * round trip) and the release. Below it the standby gives up moments before
+ * the lease frees and the room takes the cold handoff it was paid to avoid.
+ */
+const STANDBY_EXIT_ALLOWANCE_MS = 2000;
+
 /** The query parameter this route uses to tell a successor it is a STANDBY. */
 const STANDBY_PARAM = 'standby';
 
@@ -194,10 +203,20 @@ export const SPAWN_DELIVERED = 'delivered';
  * from Deployment Protection, a 200 from a route that lost the lease race:
  * both are the route's own answer, and handing them back unread is what this
  * spawn has always done with a non-2xx), with `SPAWN_DELIVERED` when none
- * does, and REJECTS only for a failure that lands before the receipt, which is
- * the only kind that means no ticker was started.
+ * does, and REJECTS for a failure that lands before the receipt, which is the
+ * only kind that means no ticker was started.
+ *
+ * A STANDBY ALSO REJECTS ON ANY ANSWER INSIDE THE RECEIPT WINDOW. A standby
+ * polls the lease for `standbyMs`, so a route that answers it that fast never
+ * got as far as waiting: refused, protected, crashed. Resolving told the
+ * incumbent its successor was sitting on the poll, and the incumbent skips its
+ * own exit spawn on exactly that belief, so the room went dark at the cap
+ * until some relay's poll noticed. `runTicker` clears that belief on a
+ * rejection. An EXIT spawn keeps resolving: answered quickly it is most often
+ * a ticker that lost the acquire to one already running the room, which is
+ * the ordinary outcome of a race and nothing the exit would act on anyway.
  */
-function deliverSpawn(spawnUrl: string): Promise<unknown> {
+function deliverSpawn(spawnUrl: string, standby: boolean): Promise<unknown> {
   const attempt = fetch(spawnUrl);
   return new Promise<unknown>((resolve, reject) => {
     const receipt = setTimeout(() => resolve(SPAWN_DELIVERED), SPAWN_ACK_MS);
@@ -210,6 +229,10 @@ function deliverSpawn(spawnUrl: string): Promise<unknown> {
     attempt.then(
       (res) => {
         clearTimeout(receipt);
+        if (standby) {
+          reject(new Error(`standby spawn answered ${res.status} inside SPAWN_ACK_MS (${SPAWN_ACK_MS}ms): the standby is not waiting for the lease`));
+          return;
+        }
         resolve(res);
       },
       (err: unknown) => {
@@ -303,6 +326,32 @@ export function createTickerRoute<TState, TEvent>(
     );
   }
 
+  // THE STANDBY'S WAIT IS SIZED AGAINST TWO NUMBERS, both checked here on the
+  // resolved values for the same reason as the two checks above. It must
+  // outlast the lead it was spawned with plus the incumbent's own exit, or it
+  // gives up just before the lease frees; and it comes out of `maxRunMs`,
+  // because the platform times the invocation, not the ownership. A lead at or
+  // past the lifetime disables the standby inside `runTicker`, so there is no
+  // wait to size.
+  const standbyMs = ticker.standbyMs ?? STANDBY_WAIT_MS;
+  const standbyLeadMs = ticker.standbyLeadMs ?? DEFAULT_STANDBY_LEAD_MS;
+  if (standbyLeadMs < maxRunMs) {
+    if (!(standbyMs > standbyLeadMs + STANDBY_EXIT_ALLOWANCE_MS)) {
+      throw new Error(
+        `createTickerRoute: standbyMs resolves to ${standbyMs}ms, which does not outlast standbyLeadMs (${standbyLeadMs}ms) plus ${STANDBY_EXIT_ALLOWANCE_MS}ms for the incumbent's final checkpoint and release. ` +
+          `A standby that stops polling before the lease is released costs a cold start and still leaves the room the cold handoff. ` +
+          `Raise standbyMs above ${standbyLeadMs + STANDBY_EXIT_ALLOWANCE_MS}ms, or lower standbyLeadMs.`
+      );
+    }
+    if (!(standbyMs < maxRunMs)) {
+      throw new Error(
+        `createTickerRoute: standbyMs (${standbyMs}ms) does not fit inside maxRunMs (${maxRunMs}ms). ` +
+          `A standby's poll comes out of its own invocation's lifetime, so it would reach its run cap before it could tick. ` +
+          `Lower standbyMs, or raise maxDurationS.`
+      );
+    }
+  }
+
   return async function tickerRoute(req: Request): Promise<Response> {
     const url = new URL(req.url);
     const rawRoom = url.searchParams.get('room');
@@ -358,7 +407,7 @@ export function createTickerRoute<TState, TEvent>(
       // invocation this is. A host-supplied `standbyMs` still tunes how long a
       // standby waits; it is ignored on the ordinary path, where waiting at
       // all would be wrong.
-      standbyMs: standby ? ticker.standbyMs ?? STANDBY_WAIT_MS : 0,
+      standbyMs: standby ? standbyMs : 0,
       // Must issue an authenticated request back to THIS SAME ROUTE, carrying
       // a fresh spawn token bound to the successor's room id (never the
       // token this invocation itself was called with: that one authorized
@@ -384,17 +433,14 @@ export function createTickerRoute<TState, TEvent>(
         }
         // Delivered, not awaited: this route is the thing being called, and it
         // does not answer until the successor exits. See `SPAWN_ACK_MS`.
-        return deliverSpawn(spawnUrl.toString());
+        return deliverSpawn(spawnUrl.toString(), spawnOpts.standby);
       },
     });
 
-    // A lease already held by another instance is not an error, it is the
-    // ordinary outcome of two invocations racing to become the ticker: the
-    // loser reports 200 so the caller (the relay's ensure-ticker check) does
-    // not treat a perfectly healthy room as a failure.
-    if (result.reason === 'busy') {
-      return new Response('busy', { status: 200 });
-    }
+    // 200 for every exit, 'busy' included: a lease already held by another
+    // instance is not an error, it is the ordinary outcome of two invocations
+    // racing to become the ticker, and the caller (the relay's ensure-ticker
+    // check) must not treat a perfectly healthy room as a failure.
     return new Response(result.reason, { status: 200 });
   };
 }
@@ -534,7 +580,9 @@ export type VercelRelayRouteOptions = Omit<HostRelayOptions, 'joinMeta' | 'spawn
      * once it delivers, so the cap costs no visible gap at all.
      *
      * A host that sets `lifetimeMs` explicitly wins: that is the escape hatch
-     * for a platform whose real cap this library has no way to read.
+     * for a platform whose real cap this library has no way to read. It is
+     * still checked against this cap plus `RELAY_EXIT_MARGIN_MS` at route
+     * creation, exactly like the ticker route's explicit `maxRunMs`.
      *
      * There is a MINIMUM, checked at route creation: the resolved lifetime has
      * to hold two expiry leads (see `MIN_RELAY_LIFETIME_MS`), so the smallest
@@ -613,7 +661,22 @@ export function createRelayRoute(opts: VercelRelayRouteOptions): (req: Request) 
     ...relay
   } = opts;
 
-  const lifetimeMs = relay.lifetimeMs ?? maxDurationS * 1000 - RELAY_EXIT_MARGIN_MS;
+  const platformCapMs = maxDurationS * 1000;
+
+  // The same fit check the ticker route runs on an explicit `maxRunMs`, which
+  // this route lacked: an explicit lifetime is otherwise free to land after the
+  // platform has already killed the function, so the relay announces an expiry
+  // it never reaches and every socket takes the cold drop the swap exists to
+  // replace, every cycle.
+  if (relay.lifetimeMs !== undefined && relay.lifetimeMs + RELAY_EXIT_MARGIN_MS > platformCapMs) {
+    throw new Error(
+      `createRelayRoute: lifetimeMs (${relay.lifetimeMs}ms) leaves less than RELAY_EXIT_MARGIN_MS (${RELAY_EXIT_MARGIN_MS}ms) before this function's own maxDuration (${maxDurationS}s = ${platformCapMs}ms). ` +
+        `The expiry announcement and the client's swap both happen inside that margin, so the platform would kill the socket first. ` +
+        `Lower lifetimeMs to at most ${platformCapMs - RELAY_EXIT_MARGIN_MS}ms, or raise maxDurationS to match the maxDuration your route file exports.`
+    );
+  }
+
+  const lifetimeMs = relay.lifetimeMs ?? platformCapMs - RELAY_EXIT_MARGIN_MS;
 
   // Checked on the RESOLVED value, so it bounds the derived lifetime and an
   // explicit one alike; see `MIN_RELAY_LIFETIME_MS` for the two failures this
@@ -700,7 +763,7 @@ export function createRelayRoute(opts: VercelRelayRouteOptions): (req: Request) 
               // The ticker route holds its response open for the whole run, so
               // waiting for it reported a 300s headers timeout as a failed
               // spawn on the first socket of every room. See `SPAWN_ACK_MS`.
-              return deliverSpawn(spawnUrl.toString());
+              return deliverSpawn(spawnUrl.toString(), false);
             },
           },
         });

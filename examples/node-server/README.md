@@ -89,8 +89,10 @@ nothing about how this server runs.
 POST /api/session?room=pong   ->   { token, playerId, handle, room }
 ```
 
-`room` is echoed back as given and defaults to `pong`; the two rooms this
-server serves are `pong` and `cursors`. Everything else 404s. The token carries
+`room` defaults to `pong`; the two rooms this server serves are `pong` and
+`cursors`, and any other value is refused with a 400 rather than echoed back,
+because the socket path would seat the player in `pong` instead. Every other
+path 404s. The token carries
 the claims the relay trusts for the whole socket's life and it **expires**, so
 a client re-mints rather than keeping one.
 

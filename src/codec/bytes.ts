@@ -221,16 +221,23 @@ export class ByteReader {
   private pos = 0;
 
   constructor(buf: ArrayBuffer | Uint8Array) {
-    if (buf instanceof Uint8Array) {
+    // ANY VIEW, NOT ONLY A Uint8Array, because the type is a compile-time
+    // claim and a caller past a permissive boundary hands over a `DataView`
+    // or an `Int16Array` just as easily, which `new DataView(view)` refuses
+    // with a bare `TypeError`. Read through a byte view over the view's own
+    // window instead.
+    const source: ArrayBuffer | ArrayBufferView = buf;
+    if (ArrayBuffer.isView(source)) {
       // Respect byteOffset/byteLength rather than assuming the view covers
       // its whole underlying buffer: a caller handing us a subarray (a slice
       // of a larger frame) must only ever have that slice readable, not
       // whatever memory happens to sit around it in the parent buffer.
-      this.view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-      this.arr = buf;
+      this.view = new DataView(source.buffer, source.byteOffset, source.byteLength);
+      this.arr =
+        source instanceof Uint8Array ? source : new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
     } else {
-      this.view = new DataView(buf);
-      this.arr = new Uint8Array(buf);
+      this.view = new DataView(source);
+      this.arr = new Uint8Array(source);
     }
   }
 

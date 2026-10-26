@@ -5,6 +5,128 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-10-26
+
+A bug-fix pass over the ticker's exit paths, the shared subscriber, the two
+adapters and a handful of client correctness traps. Nothing on the wire moved.
+
+### Fixed
+
+**Server and relay**
+
+- A checkpoint body that was read in full but will not decode (including
+  gzip-tagged bytes that will not gunzip) is `'unparseable'` and starts the
+  room fresh immediately. Only the Redis `getBuffer` is retried; retrying a
+  decode failure as a read fault used to abandon every spawn with `'error'`
+  until the key's own TTL ran out, locking the room for up to an hour.
+- A checkpoint write still waiting on the chain when a tick throws is now
+  skipped, so it can no longer persist that tick's half-mutated state. The
+  envelope is still serialised when the chain reaches the write, so a write
+  queued behind a slow one carries the room as it is then rather than as it
+  was when queued.
+- A confirmed lease loss (`lostLeaseExplicitly` or a refused checkpoint write)
+  is checked before the publish block on every iteration instead of after, so
+  nothing is published once ownership is known gone.
+- A buffered pid that stops being a member is dropped after
+  `presenceTimeoutMs` (`dropStrangers`), and stale `rejectedAt` entries are
+  pruned on the stats cadence. Both used to leak for the life of the room.
+- On a thrown ticker, the crash count is now recorded before the timeline
+  marker write and the lease release, and the startup `playerCount` read moved
+  inside the loop's own `try`, so a throw there counts as a crash instead of
+  escaping the crash-loop guard entirely.
+- A refused final checkpoint write no longer deletes the `timeline` marker
+  (the room is not this invocation's to clear it from), and a lease-lost exit
+  that ran at least one tick now writes the marker too, best effort, for the
+  same reason a thrown ticker already did.
+- `acquireLease` errors are now caught: a standby keeps polling through a
+  transient Redis failure instead of throwing out of `runTicker`. Once any
+  attempt has thrown, a later null `SET NX` reply is followed by a `GET`
+  checking whether this run's own owner already holds the key (a reply Redis
+  processed but whose response outran the client's timeout); when it does,
+  that counts as acquired, with ownership dated from the FIRST thrown attempt
+  rather than this one, which can only understate the lease's remaining life.
+  A recovery `GET` that itself throws counts as a lost attempt, answering
+  `'busy'`. Whenever any attempt threw, the `'busy'` and `'error'` exits now
+  run an owner-checked lease release, raced against
+  `CRASH_RECORD_TIMEOUT_MS`. Only a last attempt that still threw returns
+  `'error'` (`ticker.acquire-failed`). `DEFAULT_STANDBY_LEAD_MS` is exported
+  directly from `ticker.ts`.
+- `room-reject` suppression is now keyed on pid AND connection id `c`, with a
+  budget of `REJECTS_PER_INTERVAL` (2) per connection per
+  `REJECT_INTERVAL_MS`: a relay's immediate join and its ack-gated join carry
+  the same `c`, and the reject answering the first could be lost on pub/sub
+  before the relay's subscription was acknowledged. Bound through relays: at
+  most twice `maxSocketsPerSubject` rejects per pid per interval.
+- `roomSubscriber.ts`: a subscription that never acknowledges is retired
+  rather than left in the registry for every later socket to wait out again; a
+  shared subscription resubscribes its channels and re-seeds every member's
+  roster after a reconnect, recovering an announcement that pub/sub dropped
+  while it was down, with each member getting its own null-prototype roster
+  copy; the subscriber's own `'error'` events are counted once per
+  subscription rather than once per socket it serves; and every member
+  delivery (a snapshot, a meta frame, the resubscribe, `'end'`, a dead
+  subscription) is now wrapped so one throwing member cannot stop delivery to
+  the rest.
+- `attachRelay`'s host `log` callback is now guarded once at the top, so a
+  throwing logger cannot escape a Redis delivery, a timer or a transport
+  callback and stop delivery to the rest of the room.
+- A `joinMeta` that `JSON.stringify` cannot serialise (a BigInt, a cycle) no
+  longer throws out of the heartbeat: it is counted as a publish failure, and
+  the socket is cleaned up and closed 4004.
+- The relay closes a transport with no `terminate()` using
+  `CLOSE_CODES.relayUnavailable` (4004) instead of 1006, which `ws` and a
+  browser refuse to send and would throw on from inside the liveness timer.
+  The open-timeout path closes the same way, and `onSubscriptionDead` now
+  goes through the same helper, so `onClose` and the wire agree there too.
+- The per-subject admission cap is a soft cap: the count and the registration
+  are two round trips, so sockets for one subject admitted concurrently can
+  overshoot it by however many were in flight at once.
+
+**Adapters and client**
+
+- `adapters/node.ts` imports the server modules directly instead of through
+  the `tickroom/server` barrel, so a host injecting its own Redis clients
+  never loads `ioredis`; the default client pair is resolved on demand.
+  Passing exactly one of `redis`/`createSubscriber` now throws instead of
+  silently defaulting the other onto a different store.
+- `adapters/vercel.ts` checks an explicit relay `lifetimeMs` against
+  `maxDurationS` at route creation, and checks `standbyMs` against
+  `standbyLeadMs` and `maxRunMs` the same way, rather than discovering either
+  mismatch live. A standby spawn now rejects on any answer inside the receipt
+  window, since that means the standby never reached its lease poll; an exit
+  spawn is unchanged.
+- `.github/workflows/release.yml` now runs `npm run lint` and pins npm to
+  `^11.5.1` instead of `latest`. The node-server example's session route
+  refuses a non-canonical `room` with 400 instead of echoing it back.
+- Every binary-wire input is shape-checked before stamping, not only the
+  first; a wrong-typed input that slipped past the type checker (`buttons:
+  256`, a NaN axis) used to throw on every frame after the first rather than
+  once.
+- `PredictedEntity` no longer stamps or sends while the client's tick counter
+  is unanchored for the current epoch, which used to name ticks on the old
+  room's timeline during a reconnect or a re-assign.
+- Version skew recovery only reloads once the reload marker has actually been
+  written to `sessionStorage`; a denied write (private browsing, quota)
+  latches `'version-skew'` directly instead of reloading forever. The storage
+  lookup itself is now resolved inside a try, so a browser that blocks
+  storage access (a `SecurityError` thrown by the `sessionStorage` getter)
+  also latches rather than throwing on every snapshot.
+- `connectStartedAt`, on both `RoomConnection` and `StallInputs`, is
+  `number | null` rather than a 0 sentinel, for the same reason the clock-step
+  tracking below is: `performance.now()` can read 0 for a real connection
+  start.
+- `SnapshotInterpolator.resumeFrom` now bounds the glide at zero for a
+  measured speed of exactly 0 (a snap); only a genuinely missing speed is
+  unbounded. The two used to collapse to the same value, so a stationary
+  entity could glide unbounded across a reconnect.
+- The time-based frame prune never drops the frame the playhead is currently
+  bracketing against.
+- `RoomConnection`'s clock-step tracking uses `null` rather than 0 for "not
+  yet stepping", since 0 is a real `performance.now()` reading.
+- `ByteReader` accepts any `ArrayBufferView`, not only a `Uint8Array`, reading
+  through a byte view over the view's own window instead of refusing with a
+  `TypeError`.
+
 ## [1.1.0] - 2026-09-12
 
 One subscriber per room per process instead of one per socket. Nothing on the

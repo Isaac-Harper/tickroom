@@ -12,7 +12,7 @@ import {
 import { PLAYOUT_MAX_AHEAD } from '../core/index.js';
 
 // A connection attempt is considered "in progress" only once connectStartedAt
-// is positive; 0 means idle and can never stall (see the dedicated test
+// is non-null; null means idle and can never stall (see the dedicated test
 // below). Every other test needs a real attempt in progress, so they anchor
 // on this arbitrary non-zero baseline and express `now` as an offset from it.
 const STARTED = 1_000_000;
@@ -31,8 +31,8 @@ function baseInputs(overrides: Partial<StallInputs> = {}): StallInputs {
 }
 
 describe('stallDecision', () => {
-  it('never stalls before a connection attempt has started (connectStartedAt 0)', () => {
-    const d = stallDecision(baseInputs({ connectStartedAt: 0, now: 100_000_000 }));
+  it('never stalls before a connection attempt has started (connectStartedAt null)', () => {
+    const d = stallDecision(baseInputs({ connectStartedAt: null, now: 100_000_000 }));
     expect(d.stalled).toBe(false);
     expect(d.silentMs).toBe(0);
   });

@@ -412,7 +412,9 @@ describe('createTickerRoute', () => {
     await callTicker(tickerRouteWith());
     const { spawnSuccessor } = tickerOptionsPassed();
 
-    await spawnSuccessor('lobby', { standby: true });
+    // The standby's own answer arriving at once is a standby that is not
+    // waiting, which rejects; this case is about the URL, not the answer.
+    await spawnSuccessor('lobby', { standby: true }).catch(() => undefined);
     await spawnSuccessor('lobby', { standby: false });
 
     const standbyUrl = new URL(String(fetchMock.mock.calls[0]?.[0]));
@@ -506,6 +508,51 @@ describe('createTickerRoute', () => {
     const answer: unknown = await tickerOptionsPassed().spawnSuccessor('lobby', { standby: false });
     expect(answer).toBeInstanceOf(Response);
     expect((answer as Response).status).toBe(403);
+  });
+
+  it('a STANDBY spawn answered inside the receipt window REJECTS, so the exit spawn still fires', async () => {
+    // A standby polls for the lease for `standbyMs`, so the route answering it
+    // within `SPAWN_ACK_MS` means it never got as far as waiting: a 403 from
+    // Deployment Protection, a 5xx, a crash. Resolving made the ticker keep
+    // `standbySpawned` and skip its own exit spawn, so the room went dark at
+    // the cap until a relay poll noticed. The ticker clears the flag on a
+    // REJECTION, which is the contract this answers.
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('forbidden', { status: 403 })));
+    await callTicker(tickerRouteWith());
+
+    vi.useFakeTimers();
+    await expect(tickerOptionsPassed().spawnSuccessor('lobby', { standby: true })).rejects.toThrow(/403/);
+  });
+
+  it('CONTROL: a STANDBY spawn left unanswered is still delivered', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockReturnValue(new Promise(() => {})));
+    await callTicker(tickerRouteWith());
+
+    vi.useFakeTimers();
+    const spawn = tickerOptionsPassed().spawnSuccessor('lobby', { standby: true });
+    await vi.advanceTimersByTimeAsync(SPAWN_ACK_MS);
+    await expect(spawn).resolves.toBe(SPAWN_DELIVERED);
+  });
+
+  it('THROWS AT ROUTE CREATION when the standby wait does not outlast the standby lead', () => {
+    // A standby spawned `standbyLeadMs` before the cap has to still be polling
+    // when the incumbent's final checkpoint and release land; one that gives up
+    // first costs a cold start and buys the cold handoff anyway.
+    expect(() => tickerRouteWith({ standbyMs: 3500 })).toThrow(/standbyMs/);
+    expect(() => tickerRouteWith({ standbyMs: 8000, standbyLeadMs: 7000 })).toThrow(/standbyLeadMs/);
+  });
+
+  it('THROWS AT ROUTE CREATION when the standby wait does not fit inside maxRunMs', () => {
+    // The poll comes out of the invocation's own lifetime.
+    expect(() => tickerRouteWith({ maxDurationS: 40, standbyMs: 12_000 })).toThrow(/maxRunMs/);
+  });
+
+  it('CONTRAST: the shipped standby numbers fit at the duration floor, and a lead past the lifetime disables the check', () => {
+    const floorSeconds = (TICKER_EXIT_MARGIN_MS + MIN_TICKER_RUN_MS) / 1000;
+    expect(() => tickerRouteWith({ maxDurationS: floorSeconds })).not.toThrow();
+    // `runTicker` never fires a standby when the lead exceeds the lifetime, so
+    // there is no standby wait to size.
+    expect(() => tickerRouteWith({ maxDurationS: floorSeconds, standbyLeadMs: 60_000 })).not.toThrow();
   });
 });
 
@@ -679,6 +726,16 @@ describe('createRelayRoute', () => {
     expect(() => relayRouteWith(new MockSocket(), { lifetimeMs: RELAY_EXPIRY_LEAD_MS + 1000 })).toThrow(
       /TWO expiry leads/
     );
+  });
+
+  it('THROWS when an explicit lifetimeMs does not leave the exit margin before maxDurationS', () => {
+    // The ticker's explicit `maxRunMs` had this check and the relay's explicit
+    // `lifetimeMs` did not: a relay announcing its expiry after the platform
+    // has already killed it is a cold drop for every socket, every cycle.
+    expect(() => relayRouteWith(new MockSocket(), { maxDurationS: 60, lifetimeMs: 55_000 })).toThrow(
+      /RELAY_EXIT_MARGIN_MS/
+    );
+    expect(() => relayRouteWith(new MockSocket(), { maxDurationS: 60, lifetimeMs: 50_000 })).not.toThrow();
   });
 
   it('THROWS on an explicit lifetimeMs at the bare lead, not only on a derived one', () => {

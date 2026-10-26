@@ -33,11 +33,12 @@ import {
   type RoomEnvelope,
   type ClientInput,
   type CheckpointEnvelope,
+  type CheckpointInspection,
   type RoomStats,
   type Logger,
   type LogKind,
 } from '../core/index.js';
-import { writeCheckpoint, readCheckpoint, STATE_TTL_S } from './checkpoint.js';
+import { writeCheckpoint, decodeCheckpoint, STATE_TTL_S } from './checkpoint.js';
 import type { Subscriber } from './redis.js';
 
 
@@ -431,14 +432,22 @@ const MAX_PID_LENGTH = 128;
  */
 const PLAYOUT_AHEAD_MS = 2000;
 
-/** Shortest gap between two `room-reject` frames for the same pid. One second, so the relay's own once-per-second join heartbeat is answered every time and anything faster is not. */
+/** The window `room-reject` frames are rate limited over, per pid AND connection. One second, so the relay's own once-per-second join heartbeat is answered every time and anything faster is not. */
 const REJECT_INTERVAL_MS = 1000;
+
+/**
+ * Rejects one connection may be sent per `REJECT_INTERVAL_MS`. Two, because a
+ * relay opens every connection with two joins in quick succession (the
+ * immediate one and the one gated on its subscribe ack), and the reject
+ * answering the first can be lost to a subscription not yet acknowledged.
+ */
+const REJECTS_PER_INTERVAL = 2;
 
 /** How often a STANDBY invocation retries the acquire. Fast enough that the handoff gap is dominated by the predecessor's own release rather than by this poll. */
 const STANDBY_POLL_MS = 25;
 
 /** Default `standbyLeadMs`: a cold function start plus a host's `init`, with room to spare. */
-const DEFAULT_STANDBY_LEAD_MS = 3000;
+export const DEFAULT_STANDBY_LEAD_MS = 3000;
 
 /**
  * Default `presenceTimeoutMs`, DERIVED from the relay's own join cadence
@@ -661,21 +670,81 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
   // attempt time is the last instant this ticker can prove anything about, and
   // anything later credits itself with ownership it may not have. Same rule as
   // the two renew sites below.
-  let acquireAttemptAt = Date.now();
-  let acquired = await acquireLease(redis, keys.lease, owner, { leaseTtlMs });
+  //
+  // A THROWN ACQUIRE IS NOT A LOST ONE, and it must not escape either: a
+  // standby polling through a Redis blip keeps polling, and an attempt that
+  // still threw when the polling ran out is reported as 'error' rather than
+  // rejecting out of `runTicker`.
+  //
+  // AND A THROWN ACQUIRE MAY HAVE WON. A `SET NX` that Redis processed but
+  // whose reply outran the shared client's `commandTimeout` rejects here while
+  // the key already holds this run's owner, so every later `SET NX` answers
+  // null against our own lease and a standby would poll out to 'busy' with
+  // nobody ticking the room for a whole TTL. So once any attempt has thrown, a
+  // null reply is followed by a GET, and our own owner in the key IS an
+  // acquire. Its ownership is dated from the FIRST thrown attempt: whichever
+  // attempt Redis actually applied was issued no earlier than that, so this is
+  // the one date that can only understate the lease's remaining life.
+  let acquireError: unknown = null;
+  let firstThrownAttemptAt: number | null = null;
+  let ownershipFrom = 0;
+  const tryAcquire = async (attemptAt: number): Promise<boolean> => {
+    try {
+      const ok = await acquireLease(redis, keys.lease, owner, { leaseTtlMs });
+      acquireError = null;
+      if (ok) {
+        ownershipFrom = attemptAt;
+        return true;
+      }
+      if (firstThrownAttemptAt === null) return false;
+      // The null reply already said the key is held; only WHOSE is in doubt,
+      // so a GET that throws is a lost attempt, not a failed one.
+      let holder: string | null;
+      try {
+        holder = await redis.get(keys.lease);
+      } catch {
+        return false;
+      }
+      if (holder !== owner) return false;
+      ownershipFrom = firstThrownAttemptAt;
+      return true;
+    } catch (err) {
+      acquireError = err;
+      firstThrownAttemptAt ??= attemptAt;
+      return false;
+    }
+  };
+  const firstAttemptAt = Date.now();
+  let acquired = await tryAcquire(firstAttemptAt);
   if (!acquired && standbyMs > 0) {
-    const standbyUntil = acquireAttemptAt + standbyMs;
+    const standbyUntil = firstAttemptAt + standbyMs;
     while (!acquired && Date.now() < standbyUntil) {
       await sleep(STANDBY_POLL_MS);
-      acquireAttemptAt = Date.now();
-      acquired = await acquireLease(redis, keys.lease, owner, { leaseTtlMs });
+      acquired = await tryAcquire(Date.now());
     }
   }
   if (!acquired) {
+    if (acquireError !== null) {
+      log({ lvl: 'error', kind: 'ticker.acquire-failed', room: roomId, meta: { error: String(acquireError) } });
+    }
+    // Any attempt that threw may have set the key, including one a later
+    // clean null reply then answered 'busy' over, and an unreleased lease
+    // keeps every successor out for a whole TTL. Owner-checked, so it can only
+    // ever delete our own; bounded, so a Redis that is down cannot hang the
+    // exit on it.
+    if (firstThrownAttemptAt !== null) {
+      await Promise.race([
+        releaseLease(redis, keys.lease, owner).catch((err: unknown) =>
+          log({ lvl: 'error', kind: 'ticker.release-failed', room: roomId, meta: { error: String(err) } })
+        ),
+        sleep(CRASH_RECORD_TIMEOUT_MS),
+      ]);
+    }
+    if (acquireError !== null) return { reason: 'error', ticks: 0, uptimeMs: Date.now() - startedAt };
     return { reason: 'busy', ticks: 0, uptimeMs: 0 };
   }
 
-  let clock: OwnershipClock = createOwnershipClock(acquireAttemptAt);
+  let clock: OwnershipClock = createOwnershipClock(ownershipFrom);
   let owns = true;
   let lostLeaseExplicitly = false;
 
@@ -870,7 +939,7 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
   let incarnation: string;
   /** The grid time the restored checkpoint's own tick was stamped with, or null when there was nothing to restore or it predates the field. See the `nextTickAt` initialiser. */
   let restoredGridAt: number | null = null;
-  /** Set at the end of setup, once the restored or freshly created room can actually be counted. */
+  /** Set as the loop starts, once the restored or freshly created room can actually be counted. */
   let emptySince: number | null = null;
 
   // --- 3. metadata authority ---
@@ -913,8 +982,14 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
    * ticker admitted itself rather than being trusted forever.
    */
   const lastJoinAt = new Map<string, number>();
-  /** When each refused pid was last sent a `room-reject`, so the answer to a join flood is one frame rather than one per join. */
-  const rejectedAt = new Map<string, number>();
+  /**
+   * Per refused pid, per connection `c`, the current `room-reject` window: when
+   * it opened and how many were sent in it, so the answer to a join flood is
+   * at most `REJECTS_PER_INTERVAL` frames per connection rather than one per
+   * join. Per CONNECTION because a reject is aimed at one (see the join
+   * branch), so one socket's window must not silence another's.
+   */
+  const rejectedAt = new Map<string, Map<string, { at: number; sent: number }>>();
 
   /** Opened inside the guarded setup below, so a `createSubscriber` that throws cannot leave this null AND the lease held. */
   let sub: Subscriber | null = null;
@@ -958,6 +1033,8 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
    * buffers from its own first consume, exactly as `onBufferHealth` restarts.
    */
   const depthSamples = new Map<string, { sum: number; n: number }>();
+  /** When each buffered pid that is not a member was first seen without membership. See `dropStrangers`. */
+  const strangerSince = new Map<string, number>();
 
   // --- SETUP, GUARDED AS ONE UNIT ---
   //
@@ -1096,11 +1173,19 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
       // handling below: that is `inspectCheckpoint`'s job, it is a fact about
       // the bytes rather than about the connection, and no amount of retrying
       // changes it.
+      //
+      // SO ONLY THE READ IS RETRIED, NEVER THE DECODE. Bytes carrying the gzip
+      // magic that will not gunzip throw out of `decodeCheckpoint`, and retried
+      // as a read fault they abandoned every spawn with 'error' until the key's
+      // TTL ran out: no fresh start, no crash count, a room locked for an hour.
+      let undecodable = false;
       if (!crashLoop) {
         let readError: unknown = null;
+        let rawBytes: Uint8Array | null = null;
         for (let attempt = 0; attempt < CHECKPOINT_READ_ATTEMPTS; attempt++) {
           try {
-            rawBody = await readCheckpoint(redis, keys.state);
+            // `getBuffer`, never `get`: see `readCheckpoint`.
+            rawBytes = await redis.getBuffer(keys.state);
             readError = null;
             break;
           } catch (err) {
@@ -1118,6 +1203,11 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
           });
           return abandonSetup('error', true);
         }
+        try {
+          rawBody = decodeCheckpoint(rawBytes);
+        } catch {
+          undecodable = true;
+        }
       }
       // `inspectCheckpoint` rather than `unpackCheckpoint`, so a start-fresh
       // can SAY WHY. "There was no checkpoint" and "there was one this build
@@ -1127,7 +1217,9 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
       // fleet, and an operator has to be able to tell them apart from the log
       // alone. Reported at `warn` for a real checkpoint that was refused and
       // said nothing at all for an absent one, so a cold room stays silent.
-      const inspected = inspectCheckpoint(rawBody);
+      const inspected: CheckpointInspection = undecodable
+        ? { ok: false, reason: 'unparseable', foundVersion: null }
+        : inspectCheckpoint(rawBody);
       const envelope = inspected.ok ? inspected.envelope : null;
       if (!inspected.ok && inspected.reason !== 'absent') {
         log({
@@ -1460,14 +1552,10 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
       busSuspect = true;
     };
     redis.on?.('reconnecting', onReconnecting);
-
-    // The last thing setup does, because it is the first thing about the room
-    // that is only knowable once the room exists.
-    emptySince = runtime.playerCount(state) === 0 ? Date.now() : null;
   } catch (err) {
     // Anything the guarded block above could throw and did not handle itself:
     // `runtime.create`, `runtime.deserialize`, `createSubscriber`, the meta
-    // read, `playerCount`. All of it is fatal to this invocation and none of
+    // read. All of it is fatal to this invocation and none of
     // it may leave the lease held or the renew running.
     log({ lvl: 'error', kind: 'ticker.setup-threw', room: roomId, meta: { error: String(err) } });
     return abandonSetup('error', true);
@@ -1483,8 +1571,12 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
    * decay backstop fires at full strength on the very first starved tick
    * instead of ramping. Not reporting a final 0 leaves whatever depth was last
    * observed pinned on the wire for a player who no longer has a buffer at all.
+   *
+   * Also clears the pid's `strangerSince` entry, so a pid dropped here for any
+   * reason starts a fresh grace in `dropStrangers` if its input comes back.
    */
   function dropPlayout(pid: string): void {
+    strangerSince.delete(pid);
     if (!playouts.delete(pid)) return;
     starve.forget(pid);
     lateSeen.delete(pid);
@@ -1647,19 +1739,31 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
    */
   let checkpointChain: Promise<unknown> = Promise.resolve();
 
+  /** Set synchronously in the tick loop's catch, before the error exit's first await. */
+  let crashed = false;
+
   function queueCheckpoint(): Promise<void> {
     // Both arms run the write, so one rejected checkpoint does not poison the
     // chain for every later one.
-    const next = checkpointChain.then(
-      () => writeCheckpointNow(),
-      () => writeCheckpointNow()
-    );
+    const next = checkpointChain.then(writeQueuedCheckpoint, writeQueuedCheckpoint);
     checkpointChain = next;
     return next;
   }
 
-  async function writeCheckpointNow(): Promise<void> {
-    const envelope: CheckpointEnvelope = {
+  // THE STATE IS SERIALISED WHEN THE CHAIN REACHES THE WRITE, NOT WHEN IT IS
+  // QUEUED, so a write held behind a slow one carries the room as it is then
+  // rather than as it was a spike ago. That is always between two synchronous
+  // ticks, so the state is consistent unless a tick threw, and `crashed` is set
+  // before the error exit yields, so no write still waiting reads the
+  // half-mutated state of the tick that threw. A `serialize` that throws
+  // rejects only this write.
+  async function writeQueuedCheckpoint(): Promise<void> {
+    if (crashed) return;
+    await writeCheckpointNow(packCheckpoint(takeCheckpoint()));
+  }
+
+  function takeCheckpoint(): CheckpointEnvelope {
+    return {
       v: CHECKPOINT_VERSION,
       tick: runtime.currentTick(state),
       graceUntilTick: runtime.graceUntilTick?.(state) ?? 0,
@@ -1673,7 +1777,10 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
       incarnation,
       body: runtime.serialize(state),
     };
-    const reply = await writeCheckpoint(redis, keys.state, packCheckpoint(envelope), STATE_TTL_S, {
+  }
+
+  async function writeCheckpointNow(json: string): Promise<void> {
+    const reply = await writeCheckpoint(redis, keys.state, json, STATE_TTL_S, {
       leaseKey: keys.lease,
       owner,
     });
@@ -1726,8 +1833,14 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
    * Runs every tick and is deliberately cheap: nothing is allocated and nothing
    * is even asked of the runtime while the roster is empty or while every
    * mapped pid is still present, which is every tick in normal operation.
+   *
+   * It runs `dropStrangers` first, unconditionally, because that sweep covers
+   * the pids this roster pass can never see: ones holding playout state
+   * without ever having been members, which neither `present` nor the
+   * metadata map names.
    */
-  function reconcileMembership(): void {
+  function reconcileMembership(now: number): void {
+    dropStrangers(now);
     if (runtime.presentPids === undefined || (metaMap.size === 0 && present.size === 0)) return;
     const reported = guardHost(() => runtime.presentPids!(state), 'presentPids');
     // A membership the host could not report is not a membership of nobody:
@@ -1758,6 +1871,31 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
         dropPlayout(pid);
       }
     }
+  }
+
+  /**
+   * Drops the playout state of a pid that has sent stamped input without
+   * being a member for `presenceTimeoutMs`. Every pid-keyed map above is
+   * otherwise cleaned only when a member leaves or is forgotten, so a refused
+   * pid, or one whose join never arrived, kept a buffer, a streak, a late
+   * baseline and a depth sample for the rest of the room's life, starving
+   * every tick. The grace is the presence timeout rather than zero because a
+   * join can arrive after the input it precedes, across a handoff, and the
+   * heartbeat repeats it well inside that window.
+   */
+  function dropStrangers(now: number): void {
+    if (playouts.size === 0) return;
+    let stale: string[] | null = null;
+    for (const pid of playouts.keys()) {
+      if (present.has(pid)) {
+        strangerSince.delete(pid);
+        continue;
+      }
+      const since = strangerSince.get(pid);
+      if (since === undefined) strangerSince.set(pid, now);
+      else if (now - since >= presenceTimeoutMs) (stale ??= []).push(pid);
+    }
+    if (stale !== null) for (const pid of stale) dropPlayout(pid);
   }
 
   function publishMeta(): void {
@@ -1807,7 +1945,7 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
         // that distinction, a room sitting at capacity would eject its own
         // existing players on every reconnect.
         if (!already && (guardHost(() => runtime.isFull?.(state), 'isFull') ?? false)) {
-          // AT MOST ONE REJECT PER PID PER INTERVAL. The reject goes out on the
+          // A BOUNDED NUMBER OF REJECTS PER INTERVAL. The reject goes out on the
           // ROSTER channel, which fans out to every socket in the room, so a
           // producer that can pick the join rate picks the reject rate too and
           // one refused pid becomes a Redis and fan-out amplifier: exactly the
@@ -1815,15 +1953,33 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
           // rule every other client-rate path in this file follows. The relay's
           // own heartbeat is one join per second per socket, so a well-behaved
           // client is still answered every time; anything faster is answered
-          // once and counted. Suppressing one costs nothing on its own, since a
+          // at most `REJECTS_PER_INTERVAL` times and counted. Suppressing one costs nothing on its own, since a
           // lost reject already means the client's own timeout handles it.
-          const rejectedLast = rejectedAt.get(env.pid);
+          //
+          // KEYED ON THE CONNECTION AS WELL AS THE PID, because a reject is
+          // aimed at one socket and a window shared across a pid let one
+          // socket's answer silence the next's. The bound that keeps this a
+          // client-rate path within the rule: through a relay, the connections
+          // one pid can hold are capped by admission (`maxSocketsPerSubject`),
+          // so a pid draws at most that many times `REJECTS_PER_INTERVAL`
+          // frames a second; a producer writing `keys.in` directly can mint
+          // any `c`, but it can equally publish on `keys.metaout` itself.
+          const rejectConn = typeof env.c === 'string' ? env.c : '';
           const rejectNow = Date.now();
-          if (rejectedLast !== undefined && rejectNow - rejectedLast < REJECT_INTERVAL_MS) {
+          let byConn = rejectedAt.get(env.pid);
+          if (byConn === undefined) {
+            byConn = new Map();
+            rejectedAt.set(env.pid, byConn);
+          }
+          const rejectWindow = byConn.get(rejectConn);
+          if (rejectWindow === undefined || rejectNow - rejectWindow.at >= REJECT_INTERVAL_MS) {
+            byConn.set(rejectConn, { at: rejectNow, sent: 1 });
+          } else if (rejectWindow.sent < REJECTS_PER_INTERVAL) {
+            rejectWindow.sent++;
+          } else {
             rejectsSuppressed++;
             return;
           }
-          rejectedAt.set(env.pid, rejectNow);
           // THE REJECT NAMES THE CONNECTION, NOT JUST THE PLAYER. A pid holds
           // two live sockets on purpose for a moment: that overlap is what the
           // per-attach `c` exists for and what the relay's planned lifetime
@@ -2101,6 +2257,11 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
   if (nextTickAt > Date.now()) await sleep(nextTickAt - Date.now());
 
   try {
+    // INSIDE THE LOOP'S TRY, NOT SETUP'S: `playerCount` runs every tick, so a
+    // throw here is the room's own state failing and is counted as a crash,
+    // where setup's catch counts nothing and the crash-loop escape never
+    // engaged.
+    emptySince = runtime.playerCount(state) === 0 ? Date.now() : null;
     while (true) {
       // THE GRID TIME THIS ITERATION IS FOR, captured before the bottom of the
       // loop advances it. Everything a CLIENT plays back on is stamped with
@@ -2138,7 +2299,7 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
       }
 
       // 4b. the roster follows the simulation's membership, not the socket's
-      reconcileMembership();
+      reconcileMembership(iterationStart);
 
       // 5. playout consume-exact pass, BEFORE the tick and FOR the tick the
       // step below produces.
@@ -2336,6 +2497,30 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
         }
       }
 
+      // 7b. A CONFIRMED LOSS ENDS THE RUN BEFORE ANYTHING IS PUBLISHED. Both
+      // flags are set off the hot path (the async renew's refusal, a refused
+      // checkpoint write), so they land between iterations or during the
+      // guard's own awaited renew, and checked only at the bottom of the loop
+      // they let one more snapshot, depth frame and roster frame go out into
+      // a room Redis had already said belongs to somebody else.
+      if (lostLeaseExplicitly || refusedNotOwner) {
+        owns = false;
+        exitReason = 'lease-lost';
+        // LOGGED HERE TOO, because for a long time only the synchronous finder
+        // said anything: a Redis restart that expired every lease produced a
+        // fleet of tickers exiting 'lease-lost' with not one line saying so.
+        // `finder` is what separates the two, since they fire under opposite
+        // conditions (a confirmed refusal off the hot path, versus ownership
+        // having already lapsed when an iteration began).
+        log({
+          lvl: 'error',
+          kind: 'ticker.lease-lost',
+          room: roomId,
+          meta: { finder: refusedNotOwner ? 'checkpoint' : 'renew' },
+        });
+        break;
+      }
+
       if (owns) {
         // 8. publish the snapshot
         //
@@ -2456,8 +2641,12 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
         }
       }
 
-      // 10. stats, flushed every `statsMs` regardless of ownership (a
-      // ticker that just lost the lease still wants its final numbers seen)
+      // 10. stats, flushed every `statsMs`. A lost lease never reaches this
+      // step: both finders break out above (the guard at 7, a confirmed loss
+      // at 7b), so the window that saw the loss is never written, and the
+      // `ticker.lease-lost` line is what reports it. Writing it would put a
+      // non-owner's numbers on the key the balancer and the relay read
+      // capacity from, over the ones the new owner is publishing.
       if (now - lastStatsAt >= statsMs) {
         const elapsedS = (now - lastStatsAt) / 1000;
         const measuredHz = elapsedS > 0 ? ticksSinceStats / elapsedS : runtime.tickHz;
@@ -2546,6 +2735,17 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
         // its own cleanup) must not leave a phantom-full roster behind
         // forever. Riding an existing cadence costs nothing extra.
         redis.expire(keys.meta, metaTtlS).catch(() => {});
+
+        // A reject older than its own interval suppresses nothing any more, so
+        // it is dropped; otherwise every refused pid ever seen stays here.
+        let expiredRejects: string[] | null = null;
+        for (const [pid, byConn] of rejectedAt) {
+          let expiredConns: string[] | null = null;
+          for (const [c, rejectWindow] of byConn) if (now - rejectWindow.at >= REJECT_INTERVAL_MS) (expiredConns ??= []).push(c);
+          if (expiredConns !== null) for (const c of expiredConns) byConn.delete(c);
+          if (byConn.size === 0) (expiredRejects ??= []).push(pid);
+        }
+        if (expiredRejects !== null) for (const pid of expiredRejects) rejectedAt.delete(pid);
 
         // A PLAYER IS PRESENT BECAUSE A RELAY KEEPS SAYING SO, not because one
         // said so once. The relay heartbeats its join every second and the
@@ -2758,24 +2958,8 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
           });
       }
 
-      // 12. exit conditions
-      if (lostLeaseExplicitly || refusedNotOwner) {
-        owns = false;
-        exitReason = 'lease-lost';
-        // LOGGED HERE TOO, because for a long time only the synchronous finder
-        // said anything: a Redis restart that expired every lease produced a
-        // fleet of tickers exiting 'lease-lost' with not one line saying so.
-        // `finder` is what separates the two, since they fire under opposite
-        // conditions (a confirmed refusal off the hot path, versus ownership
-        // having already lapsed when an iteration began).
-        log({
-          lvl: 'error',
-          kind: 'ticker.lease-lost',
-          room: roomId,
-          meta: { finder: refusedNotOwner ? 'checkpoint' : 'renew' },
-        });
-        break;
-      }
+      // 12. exit conditions (a confirmed lease loss is checked earlier, before
+      // the publish block; see 7b)
       if (tickerShouldExit({ now: Date.now(), startedAt, emptySince }, { maxTickerMs: maxRunMs, emptyGraceMs })) {
         exitReason = Date.now() - startedAt >= maxRunMs ? 'duration' : 'empty';
         break;
@@ -2806,6 +2990,7 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
       await sleep(nextTickAt - Date.now());
     }
   } catch (err) {
+    crashed = true;
     log({ lvl: 'error', kind: 'ticker.tick-threw', room: roomId, meta: { error: String(err) } });
     exitReason = 'error';
   } finally {
@@ -2826,23 +3011,6 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
     // written by a tick that completed, so the room falls back to a state that
     // demonstrably simulates, at the cost of the seconds since.
     if (exitReason === 'error') {
-      if (owns) {
-        // THE TIMELINE MARKER GOES DOWN BEFORE THE LEASE COMES UP, because the
-        // instant the lease is released a standby polling every 25ms can win
-        // it and reach its own grid decision. Written from `lastStampedAt`,
-        // which is the stamp of the iteration that threw: at or above anything
-        // actually published, which is the safe side to be on for a floor.
-        try {
-          await redis.set(keys.timeline, String(lastStampedAt), 'EX', STATE_TTL_S);
-        } catch (err) {
-          log({ lvl: 'error', kind: 'ticker.timeline-write-failed', room: roomId, meta: { error: String(err) } });
-        }
-        try {
-          await releaseLease(redis, keys.lease, owner);
-        } catch (err) {
-          log({ lvl: 'error', kind: 'ticker.release-failed', room: roomId, meta: { error: String(err) } });
-        }
-      }
       // Counted so a successor that keeps hitting the same throw eventually
       // starts the room FRESH instead of restoring the poison (see the startup
       // read). Short TTL, because crashes a minute apart are not a loop.
@@ -2863,6 +3031,10 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
       // out, which is the crash-loop guard failing in both directions at once.
       // Raced against a short timer for the same reason the successor spawn is
       // raced: a slow Redis must not hold the exit open.
+      //
+      // AND RECORDED BEFORE THE LEASE IS RELEASED, because a standby polling
+      // every 25ms can win the lease the instant it is free and read the
+      // counter before this crash is on it.
       await Promise.race([
         (async () => {
           try {
@@ -2875,6 +3047,23 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
         })(),
         sleep(CRASH_RECORD_TIMEOUT_MS),
       ]);
+      if (owns) {
+        // THE TIMELINE MARKER GOES DOWN BEFORE THE LEASE COMES UP, because the
+        // instant the lease is released a standby polling every 25ms can win
+        // it and reach its own grid decision. Written from `lastStampedAt`,
+        // which is the stamp of the iteration that threw: at or above anything
+        // actually published, which is the safe side to be on for a floor.
+        try {
+          await redis.set(keys.timeline, String(lastStampedAt), 'EX', STATE_TTL_S);
+        } catch (err) {
+          log({ lvl: 'error', kind: 'ticker.timeline-write-failed', room: roomId, meta: { error: String(err) } });
+        }
+        try {
+          await releaseLease(redis, keys.lease, owner);
+        } catch (err) {
+          log({ lvl: 'error', kind: 'ticker.release-failed', room: roomId, meta: { error: String(err) } });
+        }
+      }
     } else if (owns) {
       try {
         // Through the chain, so it cannot overtake a periodic write that is
@@ -2888,7 +3077,10 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
         // where the marker is only a floor. Left behind, a marker from some
         // earlier crashed invocation would keep raising the floor of every
         // successor for a full state TTL.
-        await redis.del(keys.timeline);
+        //
+        // NOT WHEN THE WRITE WAS REFUSED: then no checkpoint of ours landed,
+        // the room is somebody else's, and this DEL is not owner-checked.
+        if (!refusedNotOwner) await redis.del(keys.timeline);
       } catch (err) {
         log({ lvl: 'error', kind: 'ticker.final-checkpoint-failed', room: roomId, meta: { error: String(err) } });
       }
@@ -2897,6 +3089,22 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
       } catch (err) {
         log({ lvl: 'error', kind: 'ticker.release-failed', room: roomId, meta: { error: String(err) } });
       }
+    } else if (exitReason === 'lease-lost' && ticks > 0) {
+      // A LOST LEASE WRITES NO CHECKPOINT, SO IT LEAVES THE SAME FLOOR A
+      // THROWN TICKER DOES: it published past its last periodic write. This
+      // only helps an owner that has NOT yet read the marker, which in
+      // practice means the key expired with nobody waiting (a Redis restart,
+      // a lapse under a sick connection); a successor that took the lease
+      // while this one still believed it held it read its floor long ago.
+      // Safe without the lease because the floor is only ever combined with
+      // `max`, and a successor already running publishes past it anyway.
+      // Raced like the crash record, since a lost lease is often a sick Redis.
+      await Promise.race([
+        redis.set(keys.timeline, String(lastStampedAt), 'EX', STATE_TTL_S).catch((err: unknown) => {
+          log({ lvl: 'error', kind: 'ticker.timeline-write-failed', room: roomId, meta: { error: String(err) } });
+        }),
+        sleep(CRASH_RECORD_TIMEOUT_MS),
+      ]);
     }
 
     // 14. spawn a successor if anyone is still here.

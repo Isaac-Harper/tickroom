@@ -26,9 +26,10 @@ import type { Subscriber } from './redis.js';
  * does that depends on WHICH socket it is holding stays per socket: the join
  * heartbeat, the playout depth frame, the snapshot backlog drop (a slow socket
  * must not stall its neighbours), the inbound rate limit, the ticker check, the
- * liveness deadline and the lifetime. This file owns exactly the three things
- * that are properties of the SUBSCRIPTION rather than of a socket: delivery,
- * the subscribe acknowledgement, and the probe that says the subscription is
+ * liveness deadline and the lifetime. This file owns exactly the things that
+ * are properties of the SUBSCRIPTION rather than of a socket: delivery, the
+ * subscribe acknowledgement and the resubscribe after a reconnect, the count of
+ * the connection's own errors, and the probe that says the subscription is
  * still alive.
  *
  * THE REGISTRY IS KEYED ON THE SUBSCRIBER FACTORY AS WELL AS THE ROOM, and
@@ -42,8 +43,8 @@ import type { Subscriber } from './redis.js';
  * is a module binding.
  *
  * THE CONSEQUENCE FOR A HOST IS ONE LINE: PASS A STABLE FACTORY. Both shipped
- * adapters do (`adapters/node.ts` resolves `hostCreateSubscriber ?? createSubscriber`
- * to the same function object on every connection, and `adapters/vercel.ts`
+ * adapters do (`adapters/node.ts` hands over the host's injected factory or the
+ * default module's, the same function object on every connection, and `adapters/vercel.ts`
  * passes the module's own import), so nothing has to change to get the sharing.
  * A host that builds a FRESH closure per socket (`createSubscriber: () => makeOne()`
  * written inside the connection handler) gets one subscriber per socket exactly
@@ -70,6 +71,40 @@ export interface MetaFrame {
 }
 
 /**
+ * Turns the raw `keys.meta` hash into the shape a roster seed is built from:
+ * one parsed, well-formed record per pid. Shared by the per-socket seed
+ * (`relay.ts`'s `seedRoster`, which still does its own `HGETALL` for a join
+ * or a subscribe ack) and the resubscribe path below, which reads the hash
+ * ONCE for the whole room rather than once per socket.
+ *
+ * `Object.create(null)`, NOT `{}`, AND THE REASON IS A HASH FIELD NAME. The
+ * keys here are pids, which come from a host's own identity system, and
+ * `map[k] = ...` on an object literal with `k` of `__proto__` REPARENTS the
+ * object instead of adding a property: the entry then vanishes from
+ * `JSON.stringify`, so that player is missing from the seed while the
+ * ticker's own broadcast (built with `Object.fromEntries`, which has no such
+ * rule) does include them. A null-prototype object has no `__proto__`
+ * setter, so the assignment is an ordinary own property and serialises.
+ */
+export function parseRosterHash(raw: Record<string, string>): Record<string, unknown> {
+  const map: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  for (const [k, v] of Object.entries(raw)) {
+    try {
+      const parsed: unknown = JSON.parse(v);
+      // The ticker writes `env.meta ?? {}`, so every legitimate entry is a
+      // plain object. Anything else in this hash was not written by the
+      // roster path, and a scalar or an array reaching a host formatter that
+      // expects a record is a crash in the host's code rather than a seed.
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) continue;
+      map[k] = parsed;
+    } catch {
+      // a corrupt single field must not blank the whole seed
+    }
+  }
+  return map;
+}
+
+/**
  * One socket's half of a shared subscription. Every method is called
  * synchronously from a Redis delivery or a timer, so each one must behave the
  * way the relay's own message path does: cheap, never throwing, and guarded
@@ -80,8 +115,16 @@ export interface RoomSubscriberMember {
   onSnapshot(payload: Buffer): void;
   /** A frame off `keys.metaout`, with the one JSON parse already done, or `null` for anything that is not an object. */
   onMeta(text: string, frame: MetaFrame | null): void;
-  /** The subscriber emitted `'error'`. Counted, never logged per event: a flapping connection emits them at whatever rate it likes. */
-  onSubscriberError(err: unknown): void;
+  /**
+   * The subscriber came back from a reconnect and its channels are subscribed
+   * again. Anything published on `keys.metaout` while it was down reached
+   * nobody, and a roster change is announced exactly once, so the member
+   * re-seeds its socket's roster. The `HGETALL` behind this is read ONCE for
+   * the whole subscription (see `parseRosterHash`) rather than once per
+   * member, so the parsed roster arrives as an argument instead of each
+   * member fetching its own.
+   */
+  onResubscribed(roster: Record<string, unknown>): void;
   /** The subscriber emitted `'end'`, i.e. the connection is gone for good. */
   onSubscriberEnd(): void;
   /** `PROBE_MISS_LIMIT` probes went unanswered: this subscription no longer delivers anything to anyone. */
@@ -97,12 +140,24 @@ export interface RoomSubscriptionHandle {
    * that way and why the answer is bounded by what was actually sent.
    */
   readonly probeChannel: string;
-  /** True when this member built the subscriber rather than joining one that already existed. */
-  readonly created: boolean;
   /** The SUBSCRIBE acknowledgement, shared: a socket attaching mid-subscribe waits on the same promise the first one is racing. */
   ready(): Promise<unknown>;
   /** Starts the self-probe, at the first attaching socket's heartbeat cadence. Idempotent; later members find it already running. */
   startProbing(heartbeatMs: number): void;
+  /**
+   * The subscriber `'error'` events since the last call, and the newest one,
+   * or `null` when there were none. Counted ONCE for the subscription and
+   * taken by whichever member flushes first, so one error on a connection that
+   * serves twenty sockets is one count on one line, not twenty lines.
+   */
+  takeErrors(): { count: number; error: string } | null;
+  /**
+   * Takes the subscription out of the registry so the next socket for this
+   * room builds a fresh one. For a subscribe that never acknowledged: the
+   * members already holding it keep their reference, and the subscriber is
+   * still disconnected when the last of them goes.
+   */
+  retire(): void;
   /** Drops this member. The subscriber is disconnected when the last one goes. Idempotent. */
   release(): void;
 }
@@ -122,6 +177,7 @@ class RoomSubscriberEntry {
   readonly ready: Promise<unknown>;
   readonly probeChannel: string;
   private readonly redis: RedisLike;
+  private readonly metaKey: string;
   private readonly registry: Map<string, RoomSubscriberEntry> | null;
   private readonly key: string;
   private probeTimer: ReturnType<typeof setInterval> | null = null;
@@ -131,17 +187,22 @@ class RoomSubscriberEntry {
   private probesSent = 0;
   private probesAnswered = 0;
   private disconnected = false;
+  private acknowledged = false;
+  private errorCount = 0;
+  private lastError: string | null = null;
 
   constructor(opts: {
     createSubscriber(): Subscriber;
     redis: RedisLike;
     outChannel: string;
     metaChannel: string;
+    metaKey: string;
     probeChannel: string;
     registry: Map<string, RoomSubscriberEntry> | null;
     key: string;
   }) {
     this.redis = opts.redis;
+    this.metaKey = opts.metaKey;
     this.probeChannel = opts.probeChannel;
     this.registry = opts.registry;
     this.key = opts.key;
@@ -164,7 +225,13 @@ class RoomSubscriberEntry {
         // from the set; a `Set` iteration skips a member deleted before it is
         // reached, which is exactly the right answer, and copying the set per
         // snapshot would allocate once a tick per room for nothing.
-        for (const member of this.members) member.onSnapshot(messageBuf);
+        for (const member of this.members) {
+          try {
+            member.onSnapshot(messageBuf);
+          } catch {
+            // see `deliverEach`
+          }
+        }
         return;
       }
       if (channel === this.probeChannel) {
@@ -187,11 +254,58 @@ class RoomSubscriberEntry {
         // forwards it verbatim: the roster channel is the seam a host's own
         // control traffic rides.
       }
-      for (const member of this.members) member.onMeta(text, frame);
+      this.deliverEach((member) => member.onMeta(text, frame));
     });
 
+    // COUNTED ON THE SUBSCRIPTION, NOT ON EVERY SOCKET IT SERVES. One event on
+    // one connection is one fact, and pushing it into every member's counter
+    // turned a flapping subscriber into a line per socket per beat.
     this.sub.on('error', (err: unknown) => {
-      for (const member of this.members) member.onSubscriberError(err);
+      this.errorCount++;
+      this.lastError = String(err);
+    });
+    // A READY AFTER THE FIRST ACKNOWLEDGEMENT IS A RECONNECT, and the
+    // acknowledgement every member waited on says nothing about it. ioredis
+    // resubscribes on its own, but whatever was published on the roster
+    // channel while the connection was down reached nobody. So the channels
+    // are subscribed again HERE, and only once that is acknowledged is every
+    // member told to re-read the roster: the same subscribe-then-read order
+    // that makes the per-socket seed race-free (see the ack in `relay.ts`).
+    // Subscribing a channel twice is idempotent in Redis, so racing ioredis's
+    // own resubscribe costs one redundant reply. A ready before the first
+    // acknowledgement is the initial connect, which the members' own ack
+    // already covers.
+    this.sub.on('ready', () => {
+      if (!this.acknowledged || this.disconnected) return;
+      this.sub
+        .subscribe(opts.outChannel, opts.metaChannel, opts.probeChannel)
+        .then(() =>
+          // THE ROSTER HASH IS READ ONCE FOR THE SUBSCRIPTION, NOT ONCE PER
+          // MEMBER. A room with a hundred sockets used to run a hundred
+          // `HGETALL`s against the same key on every bus reconnect; the
+          // result is the same for all of them, so it is fetched here and
+          // handed to each member, the same split `onMeta`'s single parse
+          // already makes between shared work and per-socket decision.
+          this.redis.hgetall(this.metaKey).then((raw) => {
+            // A COPY EACH, null-prototype like the original (see
+            // `parseRosterHash`), so a host formatter that edits its map
+            // cannot change the roster the next member is seeded with.
+            const roster = parseRosterHash(raw);
+            this.deliverEach((member) =>
+              member.onResubscribed(Object.assign(Object.create(null) as Record<string, unknown>, roster))
+            );
+          })
+        )
+        .catch((err: unknown) => {
+          // Either the resubscribe itself dropped before it landed (the next
+          // ready runs this again, and a connection that never comes back is
+          // the probe's to catch) or the roster read failed on an otherwise
+          // live connection. One line for the subscription either way, not
+          // one per member: the same consolidation the `'error'` listener
+          // above makes.
+          this.errorCount++;
+          this.lastError = String(err);
+        });
     });
     this.sub.on('end', () => {
       // The connection is gone for good, so no socket this subscription serves
@@ -199,7 +313,7 @@ class RoomSubscriberEntry {
       // for this room builds a fresh subscriber rather than joining a dead one.
       this.retire();
       this.clearProbe();
-      for (const member of [...this.members]) member.onSubscriberEnd();
+      this.deliverEach((member) => member.onSubscriberEnd(), true);
     });
 
     this.ready = this.sub.subscribe(opts.outChannel, opts.metaChannel, opts.probeChannel).catch((err: unknown) => {
@@ -211,6 +325,20 @@ class RoomSubscriberEntry {
       this.retire();
       throw err;
     });
+    this.ready.then(
+      () => {
+        this.acknowledged = true;
+      },
+      () => {}
+    );
+  }
+
+  takeErrors(): { count: number; error: string } | null {
+    if (this.errorCount === 0) return null;
+    const taken = { count: this.errorCount, error: this.lastError ?? '' };
+    this.errorCount = 0;
+    this.lastError = null;
+    return taken;
   }
 
   add(member: RoomSubscriberMember): void {
@@ -309,7 +437,24 @@ class RoomSubscriberEntry {
     // COPIED, unlike the snapshot loop: every member is about to close, which
     // drains the set this is walking, and a member that never got told would
     // hold an open socket onto a subscription that delivers nothing.
-    for (const member of [...this.members]) member.onSubscriptionDead(sent, answered);
+    this.deliverEach((member) => member.onSubscriptionDead(sent, answered), true);
+  }
+
+  /**
+   * ONE MEMBER'S THROW STOPS NOTHING ELSE. Every member call runs host code
+   * (a logger, a formatter, a socket send), and an unguarded throw in this
+   * loop skipped every member after it and escaped into ioredis's reply
+   * parser or a timer. `copy` for the loops whose members close, and so
+   * drain the set being walked.
+   */
+  private deliverEach(deliver: (member: RoomSubscriberMember) => void, copy = false): void {
+    for (const member of copy ? [...this.members] : this.members) {
+      try {
+        deliver(member);
+      } catch {
+        // the member's own socket is the only one that pays for it
+      }
+    }
   }
 
   private clearProbe(): void {
@@ -319,7 +464,7 @@ class RoomSubscriberEntry {
   }
 
   /** Takes this entry out of the registry so the next attach builds a fresh one. Never disconnects: that is the reference count's job. */
-  private retire(): void {
+  retire(): void {
     if (this.registry?.get(this.key) === this) this.registry.delete(this.key);
   }
 }
@@ -338,12 +483,14 @@ export function acquireRoomSubscription(opts: {
   redis: RedisLike;
   outChannel: string;
   metaChannel: string;
+  /** `keys.meta`, the hash the resubscribe path reads once for the whole room to re-seed every member's roster. */
+  metaKey: string;
   /** This socket's own probe channel. Used only when this socket CREATES the subscription; a socket joining one probes on the channel already in use. */
   probeChannel: string;
   shared: boolean;
   member: RoomSubscriberMember;
 }): RoomSubscriptionHandle {
-  const { createSubscriber, redis, outChannel, metaChannel, probeChannel, shared, member } = opts;
+  const { createSubscriber, redis, outChannel, metaChannel, metaKey, probeChannel, shared, member } = opts;
 
   let registry: Map<string, RoomSubscriberEntry> | null = null;
   let existing: RoomSubscriberEntry | undefined;
@@ -360,19 +507,28 @@ export function acquireRoomSubscription(opts: {
     existing = registry.get(outChannel);
   }
 
-  const created = existing === undefined;
   const entry =
     existing ??
-    new RoomSubscriberEntry({ createSubscriber, redis, outChannel, metaChannel, probeChannel, registry, key: outChannel });
-  if (created && registry) registry.set(outChannel, entry);
+    new RoomSubscriberEntry({
+      createSubscriber,
+      redis,
+      outChannel,
+      metaChannel,
+      metaKey,
+      probeChannel,
+      registry,
+      key: outChannel,
+    });
+  if (existing === undefined && registry) registry.set(outChannel, entry);
   entry.add(member);
 
   let released = false;
   return {
     probeChannel: entry.probeChannel,
-    created,
     ready: () => entry.ready,
     startProbing: (heartbeatMs: number) => entry.startProbing(heartbeatMs),
+    takeErrors: () => entry.takeErrors(),
+    retire: () => entry.retire(),
     release: () => {
       if (released) return;
       released = true;

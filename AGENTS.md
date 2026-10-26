@@ -24,9 +24,9 @@ or anything realtime where several clients need to agree on state changing many
 times a second.
 
 PUBLIC repo, MIT licensed, and PUBLISHED TO NPM as `tickroom`
-(`npm install tickroom ioredis`). `package.json` says 1.0.0 and this tree IS
-1.0.0: `CHANGELOG.md` is the record of what that release carries, and its
-"Migrating from 0.3" list is the break-by-break guide.
+(`npm install tickroom ioredis`). `package.json` says 1.1.1 and this tree IS
+1.1.1: `CHANGELOG.md` is the record of what each release carries; its "Migrating from 0.3" list is still the break-by-break
+guide for anyone coming off the 0.x line.
 
 RELEASES GO OUT FROM A VERSION TAG through `.github/workflows/release.yml`
 using npm trusted publishing (OIDC): `npm version` plus a pushed tag is the
@@ -204,6 +204,10 @@ values, and the invariants below for the rules.
   `refuseSocket` (frame, retry, unconditional close, `frameSent` and `socketClosed`
   latched SEPARATELY). `CONN_TOUCH_MS` and `CONN_KEY_TTL_S` are asserted against
   `relay.ts`'s exported `DEFAULT_CONN_STALE_MS`, never a number retyped here.
+  THE PER-SUBJECT CAP IS SOFT: the count (`checkAdmission`) and the registration
+  (the `ZADD`) are two round trips, so sockets for one subject admitted
+  concurrently can overshoot it by however many were in flight at once, which is
+  the accepted price for not making it a single Lua script.
 - `src/server/ticker.ts` - THE CORE. `runTicker`, the whole authoritative loop, and
   the file to read slowly. `guardHost` wraps every runtime hook and ticker
   callback; `serverTime` is the SCHEDULED grid time; `playoutMaxAhead` defaults to
@@ -214,12 +218,32 @@ values, and the invariants below for the rules.
   re-exported from the server barrel. `ticker.lease-lost` carries `meta.finder`
   (`guard`, `renew`, `checkpoint`, `setup`); `busSuspect` forces one awaited renew
   before the next publish and its listener is `redis.off`'d on EVERY exit;
-  checkpoint writes are serialised through `queueCheckpoint`; every pre-loop exit
-  goes through `abandonSetup`; `standbySpawned` is set on ISSUE and cleared on
-  REJECT; `reconcileMembership` IS THE SINGLE PLACE MEMBERSHIP CHANGES. It
-  publishes `encodeDepth(mean per pid)` on `keys.metaout` for the relay, sampled
-  where `onBufferHealth` is reported, and exports `HostTickerOptions` for the
-  adapters to spread.
+  checkpoint writes are serialised through `queueCheckpoint`, which serialises
+  the envelope LAZILY, when the chain reaches the write, and skips it once
+  `crashed` is set (synchronously, in the loop's catch), so a queued write can
+  never carry a thrown tick's half-mutated state; every pre-loop exit
+  goes through `abandonSetup`; a CONFIRMED lease loss is checked BEFORE the
+  publish block, never after, so nothing is published past it; `acquireLease`
+  errors are caught, so a standby keeps polling through a Redis blip; once any
+  attempt has thrown, a later null reply is followed by a GET checking whether
+  our own owner already holds the key, which counts as acquired and dates
+  ownership from the FIRST thrown attempt rather than this one (understates,
+  never overclaims), while a recovery GET that itself throws is a lost attempt
+  (`'busy'`); whenever any attempt threw, the `'busy'` and `'error'` exits run
+  an owner-checked release raced against `CRASH_RECORD_TIMEOUT_MS`; only a last
+  attempt that still threw returns `'error'` (`ticker.acquire-failed`) rather
+  than rejecting out of `runTicker`; `standbySpawned` is set on ISSUE and
+  cleared on REJECT; `reconcileMembership` IS THE SINGLE PLACE MEMBERSHIP
+  CHANGES, and drops a buffered pid that is not a member for
+  `presenceTimeoutMs` (`dropStrangers`); a `room-reject` is suppressed per pid
+  AND connection `c`, budgeted at `REJECTS_PER_INTERVAL` (2) per
+  `REJECT_INTERVAL_MS`, since a relay's immediate join and its ack-gated join
+  share one `c` and the first reject can be lost before the subscribe acks. It
+  publishes `encodeDepth(mean per
+  pid)` on `keys.metaout` for the relay, sampled where `onBufferHealth` is
+  reported, and exports `HostTickerOptions` for the adapters to spread plus
+  `DEFAULT_STANDBY_LEAD_MS`, imported directly by `adapters/vercel.ts` rather
+  than through the barrel.
 - `src/server/relay.ts` - `attachRelay`, `checkAdmission`, `HostRelayOptions`: one
   socket to the bus, and a CONSUMER of the control plane. It bounds its own
   subscribe, drops snapshots under transport backpressure, holds repeat spawns off,
@@ -230,7 +254,10 @@ values, and the invariants below for the rules.
   `{ns}:{roomId}:relay:{conn}`. ITS SUBSCRIBER IS THE ROOM'S, NOT THE SOCKET'S:
   see `src/server/roomSubscriber.ts` below and `sharedSubscriber`. It exports
   `DEFAULT_CONN_STALE_MS` (which
-  `admission.ts` asserts against) and `DEFAULT_LIVENESS_TIMEOUT_MS`. A TRUST
+  `admission.ts` asserts against) and `DEFAULT_LIVENESS_TIMEOUT_MS`. A DEAD
+  SOCKET WITH NO `terminate` IS CLOSED WITH `relayUnavailable` (4004), NEVER
+  1006, which `ws` and a browser throw on if a caller sends it (`dropSocket`);
+  the open-timeout path closes 4004 for the same reason. A TRUST
   BOUNDARY on input: a `ping` is recognised by the literal prefix `{"t":"ping"`
   before anything is decoded, on the STRING and buffer arms alike, and
   `joinFragments` normalises an all-`Uint8Array` array into one buffer before
@@ -247,11 +274,20 @@ values, and the invariants below for the rules.
   `RelayHandle.gapsSample()`).
 - `src/server/roomSubscriber.ts` - ONE SUBSCRIBER PER ROOM PER PROCESS, reference
   counted, which is what `attachRelay` joins instead of opening a connection of
-  its own. It owns exactly three things: delivery (the `messageBuffer` listener
-  and the single JSON parse of a roster frame, fanned out to every member in
-  process), the shared SUBSCRIBE acknowledgement a socket attaching mid-subscribe
-  waits on, and the self-probe, which is now one per room rather than one per
-  socket and drops EVERY socket it serves when it goes unanswered. Everything
+  its own. It owns the things that are properties of the SUBSCRIPTION rather
+  than of a socket: delivery (the `messageBuffer` listener and the single JSON
+  parse of a roster frame, fanned out to every member in process), the shared
+  SUBSCRIBE acknowledgement a socket attaching mid-subscribe waits on, the
+  RESUBSCRIBE after a reconnect (on the subscriber's `'ready'` past the first,
+  re-subscribing the three channels and then telling every member to re-read
+  the roster, `onResubscribed`, since whatever published while it was down
+  reached nobody), the subscriber's own `'error'` events COUNTED ONCE per
+  subscription rather than once per socket (`takeErrors`, flushed by whichever
+  member asks first), and the self-probe, one per room PER PROCESS rather than
+  one per socket and drops EVERY socket it serves when it goes unanswered. A
+  subscribe that never acknowledges is RETIRED (`retire`), not merely
+  released, so a socket that joined it mid-failure does not leave a dead entry
+  for every later socket to wait out. Everything
   per-socket stays in `relay.ts`: the backlog drop, the join heartbeat, the depth
   frame, the rate limit, liveness, lifetime. THE REGISTRY IS KEYED ON THE
   `createSubscriber` REFERENCE as well as the room, because the factory is the
@@ -293,12 +329,19 @@ values, and the invariants below for the rules.
   `advance(input, dt)`, `reconcile(pose, snapTick)`, `snapTo(pose)`, `pose`,
   `stats`; `Pose` is `{ x, y, heading? }` and A REPLAY KEEPS NOTHING ELSE. THE WIRE
   IS BINARY BY DEFAULT: `encodeInputWindow` REQUIRES `TInput` to be `DefaultInput`,
-  the first input is checked BEFORE ANYTHING MOVES with a `TypeError` naming
+  and EVERY input is checked before anything moves, not only the first (a
+  shape a wrong-typed input can satisfy on one call and fail on the next, since
+  `DefaultInput` is a type the checker is happy with at `buttons: 256` or a NaN
+  axis), with a `TypeError` naming
   `wire: 'json'` and `encodeInput` as the ways out, and both wires decode through
-  `decodeInputAuto`. THE DRAW IS A PLAYHEAD, NOT THE COUNTER. The step is
+  `decodeInputAuto`. STAMPING AND SENDING STOP WHILE THE COUNTER IS UNANCHORED
+  FOR THIS EPOCH: an unanchored counter is still counting, on the OLD room's
+  timeline, so a stamp taken then names a tick the new room's playout buffer
+  keeps as a far-future entry; the playhead and the draw run on regardless.
+  THE DRAW IS A PLAYHEAD, NOT THE COUNTER. The step is
   `step(pose, input, dt, tick)` at all three call sites, `tick` being the record's
   own `targetTick`. `snapTo(pose)` IS THE ONLY CALL THE GAME DRIVES and THE RECORDS
-  ARE KEPT across it. `predictedEntity.test.ts` (59 cases) drives it against a
+  ARE KEPT across it. `predictedEntity.test.ts` (60 cases) drives it against a
   server model and the REAL `ClientTick` and `PlayoutBuffer` on one wall clock.
 - `src/client/interpolation.ts` - `SnapshotInterpolator`: buffered playback on the
   SERVER timeline (`receivedAt` only estimates the clock offset), jitter-adaptive
@@ -346,6 +389,10 @@ values, and the invariants below for the rules.
 - `src/codec/bytes.ts` - `ByteWriter` / `ByteReader`, BOTH TRUST BOUNDARIES: the
   reader bounds-checks every read, and every integer setter refuses a non-integer
   or out-of-range value with `CodecError` rather than letting `DataView` wrap it.
+  `ByteReader` ACCEPTS ANY `ArrayBufferView`, NOT ONLY A `Uint8Array`: a caller
+  past a permissive boundary hands over a `DataView` or an `Int16Array` just as
+  easily, which `new DataView(view)` refuses outright, so it reads through a
+  `Uint8Array` over the view's own window (`byteOffset`/`byteLength`) instead.
   Also `ProtocolVersionError`, a `CodecError` subtype carrying `expected`/`found`
   with `name === 'ProtocolVersionError'`, which is what `RoomConnection`
   duck-types on so a host's own codec can participate without importing anything.
@@ -371,11 +418,23 @@ values, and the invariants below for the rules.
   `maxRunMs = min(MAX_TICKER_MS, maxDurationS * 1000 - TICKER_EXIT_MARGIN_MS)` and
   `lifetimeMs = maxDurationS * 1000 - RELAY_EXIT_MARGIN_MS`, floored on the RESOLVED
   value by `MIN_TICKER_RUN_MS` and `MIN_RELAY_LIFETIME_MS`; the cap only ever LOWERS
-  the lifetime, so `MAX_TICKER_MS` (700s) stays the default. The spawn URL carries
-  `standby=1`, mapped to `STANDBY_WAIT_MS`, and `deliverSpawn`'s `SPAWN_ACK_MS`
-  (3000) IS COUPLED TO THE TICKER'S `EXIT_SPAWN_WAIT_MS`: it rejects only for a
-  failure BEFORE the receipt, leaves the connection open and drops only the WAIT,
-  never `AbortSignal.timeout`, and exports the sentinel `SPAWN_DELIVERED`.
+  the lifetime, so `MAX_TICKER_MS` (700s) stays the default. AN EXPLICIT
+  `relay.lifetimeMs` IS CHECKED AGAINST `maxDurationS` AT ROUTE CREATION, same as
+  the ticker route's explicit `maxRunMs`: it throws if less than
+  `RELAY_EXIT_MARGIN_MS` is left before the platform's own cap, rather than
+  announcing an expiry the function is killed before reaching. `standbyMs` and
+  `standbyLeadMs` are resolved and checked the same way when the lead is inside
+  `maxRunMs`: `standbyMs` must exceed `standbyLeadMs + STANDBY_EXIT_ALLOWANCE_MS`
+  (2000, the incumbent's own checkpoint and release) and fit under `maxRunMs`.
+  The spawn URL carries `standby=1`, mapped to the resolved `standbyMs`, and
+  `deliverSpawn(spawnUrl, standby)`'s `SPAWN_ACK_MS` (3000) IS COUPLED TO THE
+  TICKER'S `EXIT_SPAWN_WAIT_MS`: an EXIT spawn rejects only for a failure BEFORE
+  the receipt and resolves on a quick answer (the ordinary acquire-race
+  outcome), leaves the connection open and drops only the WAIT, never
+  `AbortSignal.timeout`; a STANDBY spawn additionally REJECTS on ANY answer
+  inside `SPAWN_ACK_MS`, because that means the standby never reached its lease
+  poll and `runTicker` must not believe one is still coming. Exports the
+  sentinel `SPAWN_DELIVERED`.
   `createRoom` IS THE PRIMARY ENTRY POINT (`VercelRoomOptions` in,
   `{ ticker, ws, session, balancer, config }` out, the `ticker`/`relay`/`balancer`
   hatches applied LAST, `namespace` before them since it prefixes keys AND
@@ -392,12 +451,22 @@ values, and the invariants below for the rules.
   `MAX_EXCLUDE_IDS`; `defaultDecodeInput` aliases `decodeInputAuto`;
   `createRelayRoute` takes `maxAgeS` into its own `verifyToken`.
 - `src/adapters/node.ts` - the same server core behind a plain `ws` server, no
-  serverless at all. IT IMPORTS NOTHING FROM THE OTHER ADAPTER and carries its own
+  serverless at all. IMPORTS THE SERVER MODULES DIRECTLY
+  (`server/admission.js`, `server/session.js`, `server/ticker.js`), NEVER THE
+  `server/index.js` BARREL, because the barrel's `server/redis.ts` re-export
+  loads `ioredis` at module top and this adapter's whole reason to exist (one
+  process on `createMemoryRedis()`) is the host that never installs it; the
+  default `getRedis`/`createSubscriber` pair is loaded ON DEMAND instead
+  (`resolveClients`), cached by the module system so the default factory stays
+  one function object across calls, which the shared-subscriber registry needs.
+  IT IMPORTS NOTHING FROM THE OTHER ADAPTER and carries its own
   copy of `logRoomNormalised` for that reason; its guarded `'connection'` listener
   logs `node-relay.connection` and closes 1011. IT HAS TWO OF THE FOUR PIECES
   `createRoom` COMPOSES, which is why there is no `createNodeRoom`:
-  `attachNodeRelay` and `runNodeTicker` share only `redis`/`createSubscriber` (pass
-  both or neither) and the `ensureTicker` guard the example hand-rolls.
+  `attachNodeRelay` and `runNodeTicker` share only `redis`/`createSubscriber`,
+  passing exactly one of the pair now THROWS (`requireBothOrNeither`) rather
+  than silently defaulting the other onto a different store, and the
+  `ensureTicker` guard the example hand-rolls.
 - `src/testing/lockstep.ts` - the whole of `tickroom/testing`. `runLockstep` runs a
   host's own `RoomRuntime` and its own `predict.step` against each other with a
   modelled `lead` and `delay`, through the host's own `encode`/`decode` so the
@@ -510,13 +579,22 @@ Rules. The trap each one guards against is often a gotcha below.
   because the renew is an owner-checked compare-and-extend, `lastOwnedAt` is
   non-decreasing, and a `false` reply is a fact no later reply can take back.
 - OWNERSHIP IS DATED FROM THE RENEW ATTEMPT, not from the reply, because Redis
-  extended the key when it PROCESSED the command. The split-brain margin that
-  buys is MEASURED by `tests/splitbrain.redis.test.ts`; changing this line,
-  `mayPublish` or the `SET NX` invalidates a measurement rather than an argument.
+  extended the key when it PROCESSED the command. The ACQUIRE path dates the
+  same way: once an attempt has thrown, a recovery GET that finds our own owner
+  already in the key dates ownership from the FIRST thrown attempt, never a
+  later one, so it can only understate the lease's remaining life. The
+  split-brain margin that buys is MEASURED by `tests/splitbrain.redis.test.ts`;
+  changing this line, `mayPublish` or the `SET NX` invalidates a measurement
+  rather than an argument.
 - EVERY EXIT FROM THE TICK LOOP NAMES ITSELF, and a lost lease has TWO finders
   (the async renew's `lostLeaseExplicitly` and the synchronous pre-publish
   `mayPublish` guard) that must both set it. `exitReason` defaults to
-  `'duration'`, the one exit that means everything is fine.
+  `'duration'`, the one exit that means everything is fine. A CONFIRMED LOSS IS
+  CHECKED BEFORE THE PUBLISH BLOCK, not after: both finders land off the hot
+  path (an async renew's refusal, a refused checkpoint write) between
+  iterations or during the guard's own awaited renew, so checking them late let
+  one more snapshot, depth frame and roster frame out into a room Redis had
+  already handed to somebody else.
 - A checkpoint carries a geometry digest and a mismatch starts fresh, and A
   CHECKPOINT WHOSE VERSION THIS BUILD DOES NOT IMPLEMENT STARTS FRESH in both
   directions, with the log line saying so. Without the digest a deploy that moves
@@ -570,7 +648,13 @@ Rules. The trap each one guards against is often a gotcha below.
   ONLY WHERE A LEAVE ARRIVES. A runtime with a grace period never emits a leave
   for the player it eventually forgets. `reconcileMembership` is the single place
   membership changes; a map cleaned up on the leave path alone is a leak with a
-  player's name on it.
+  player's name on it. AND A PID THAT SENDS STAMPED INPUT WITHOUT EVER BECOMING A
+  MEMBER IS THE SAME LEAK FROM THE OTHER DIRECTION: a refused pid, or one whose
+  join never arrived, kept a playout buffer, a streak, a late baseline and a
+  depth sample for the rest of the room's life, starving every tick for nothing.
+  `dropStrangers` drops it after `presenceTimeoutMs` of being buffered but not
+  present, the same grace as a leave, because a join can legitimately arrive
+  after the input it precedes.
 - Interpolate remote entities on the SERVER's clock, never on the local arrival
   clock. Arrival times are the noise; `serverTime` is the signal.
 - Never freeze a remote entity on interpolation underrun. Extrapolate.
@@ -621,8 +705,13 @@ Rules. The trap each one guards against is often a gotcha below.
   `deserialize` stay UNGUARDED on purpose: those are not reached through a
   client-supplied payload, so a throw in one is a genuine loop failure.
 - A THROWN TICKER WRITES NO FINAL CHECKPOINT AND SPAWNS NO SUCCESSOR. The state
-  at the moment of a throw is half-mutated by definition. It releases the lease,
-  increments `room:{id}:crashes`, and lets the relay's poll pace the retry. A
+  at the moment of a throw is half-mutated by definition. It increments
+  `room:{id}:crashes` BEFORE writing the timeline marker and releasing the
+  lease, so a standby polling every 25ms cannot win the lease and read the
+  counter before this crash is on it, and then lets the relay's poll pace the
+  retry. The startup `playerCount` read lives inside the loop's own `try` now
+  rather than setup's, so a throw there is counted as a crash too instead of
+  escaping the guard. A
   CRASH LOOP IS THE CHECKPOINT'S FAULT, NOT THE SUCCESSOR'S, AND IT HAS NO
   CEILING OF ITS OWN: a deterministic throw that wrote a final checkpoint of the
   HALF-MUTATED state spawned a successor which restored those bytes and threw in
@@ -653,7 +742,15 @@ Rules. The trap each one guards against is often a gotcha below.
   IT, because `writeCheckpoint` compresses BEFORE it issues its `SET` and gzip
   time scales with the body, so two writes started in tick order otherwise reach
   Redis in gzip-completion order. The chain makes the order the ROOM's rather
-  than the compressor's and costs nothing on the ordinary path.
+  than the compressor's and costs nothing on the ordinary path. THE ENVELOPE IS
+  SERIALISED WHEN THE CHAIN REACHES THE WRITE, NOT WHEN IT IS QUEUED, and a
+  `crashed` flag set in the loop's catch BEFORE the error exit's first await
+  turns every write not yet serialised into a no-op. Chain time always falls
+  between two synchronous ticks, so the state is consistent unless a tick
+  threw, and the flag covers exactly that. Serialising at queue time instead
+  closed the crash too, but made a write held behind a 1s Redis spike carry the
+  state of a second ago, which failed the split-brain duplicate-tick bound 4 of
+  5 runs.
 - A CHECKPOINT CARRIES THE GRID IT WAS TAKEN ON, AND A SUCCESSOR CONTINUES IT.
   Both halves of the adoption window are load-bearing: after a hard death the
   newest checkpoint is a periodic one the predecessor kept publishing past, so
@@ -678,16 +775,25 @@ Rules. The trap each one guards against is often a gotcha below.
   restore as `max(gridAt, timeline)` whether or not a checkpoint restored; and
   DELETED by any exit that does write a final checkpoint, because that
   checkpoint's own `gridAt` is strictly better than a floor and a stale marker
-  would raise the floor of every successor for a whole state TTL.
+  would raise the floor of every successor for a whole state TTL. NOT DELETED
+  when that final write was REFUSED, though: a refusal means no checkpoint of
+  this invocation's landed and the room belongs to somebody else, and `DEL` is
+  not owner-checked. A LOST LEASE OWES THE SAME FLOOR AS A THROW: an exit at
+  `'lease-lost'` that ran at least one tick also writes the marker best effort,
+  raced the same way the crash record is, because it too published past its
+  last periodic checkpoint.
 - THE INVOCATION'S LIFETIME IS MEASURED FROM INVOCATION ENTRY; ONLY OWNERSHIP IS
   DATED FROM THE ACQUIRE. `maxRunMs` exists to stay inside a cap the PLATFORM
   measures from the moment the request arrived, so a standby's poll comes out of
   the same budget rather than being free.
 - `standbyMs` MUST EXCEED `standbyLeadMs` PLUS THE INCUMBENT'S OWN EXIT, AND MUST
-  FIT INSIDE `maxRunMs`. `standbySpawned` is set on ISSUE and cleared on REJECT,
+  FIT INSIDE `maxRunMs`; `createTickerRoute` checks both on the resolved values
+  at route creation rather than leaving them to be discovered live.
+  `standbySpawned` is set on ISSUE and cleared on REJECT,
   because a spawn request to a ticker endpoint does not respond until the
   successor exits minutes later; a rejected standby does not suppress the exit
-  spawn.
+  spawn, and a STANDBY spawn answered inside `SPAWN_ACK_MS` is treated as a
+  rejection for the same reason: the standby cannot have reached its poll yet.
 - THE INPUT WINDOW IS PUSHED NEWEST FIRST, but only after the first consume,
   because before then the ahead bound has no consumer floor and the first push
   establishes the reference itself. Two regimes, cleanly separated. A `-1`
@@ -748,9 +854,13 @@ Rules. The trap each one guards against is often a gotcha below.
   latches every client in the room. They are dropped and COUNTED. A host's own
   control traffic still forwards untouched, which keeps this a filter, not a cage.
 - A RELAY PROBES ITS OWN SUBSCRIPTION, SAME MECHANISM AS THE TICKER'S AND FOR THE
-  SAME REASON, and PER CONNECTION rather than per room: a shared channel is
-  quadratic in room size and, worse, lets a healthy subscriber answer for a dead
-  one, which turns the one signal built to catch this into the thing hiding it.
+  SAME REASON: ONE PROBE PER SUBSCRIPTION, i.e. per room PER PROCESS since 1.1,
+  shared the same way delivery is, rather than one global channel every room's
+  probe answers on. A channel shared across rooms is quadratic in the fleet's
+  size and, worse, lets a healthy subscriber answer for a dead one, which turns
+  the one signal built to catch this into the thing hiding it; `sharedSubscriber:
+  false` falls back to one probe per socket, the pre-1.1 shape, rather than to
+  the wrong answer.
 - A PROBE ANSWER IS BOUNDED BY WHAT WAS SENT, NOT MERELY MONOTONIC, on both
   probes, because both channel names are derivable by anyone who can write to the
   bus: one forged `n` of 1e15 against an unbounded `n > answered` pins the
@@ -1312,6 +1422,13 @@ to trust that nothing was running. The real-Redis files namespace every key per
 run (`itest-{uuid}`) and delete it afterwards, so they never disturb a shared
 instance. Start one with
 `redis-server --port 6399 --save '' --appendonly no --daemonize yes`.
+On the fw13 server the test Redis runs in rootless Podman rather than a plain
+binary, and rootless Podman's default pasta networking adds intermittent
+~40ms reply stalls on pipelined commands, which flaked
+`tests/smoothness.redis.test.ts` about 1 in 3 runs (a planned handoff missing
+the grid adoption window) on an unchanged tree. Run it with host networking
+instead:
+`podman run -d --name tickroom-redis --network host docker.io/library/redis:8 redis-server --port 6399 --save '' --appendonly no`.
 
 `TICKROOM_SPLITBRAIN_REPS=10 npm run test:measure` IS A LONG FORM, NOT A GATE.
 One rep of `tests/splitbrain.redis.test.ts`'s eight cases is what the nightly
@@ -1319,8 +1436,8 @@ runs; ten reps is what a quiet machine runs when anything in `lease.ts`, the
 renew cadence or the lease constants moves, because a margin measured once is an
 anecdote.
 
-Measured on this tree after a clean build, `npm pack --dry-run` is **73 files,
-386.4 kB packed and 1.1 MB unpacked**. Re-measure those three numbers after a
+Measured on this tree after a clean build, `npm pack --dry-run` is **81 files,
+413.3 kB packed and 1.2 MB unpacked**. Re-measure those three numbers after a
 build rather than quoting them forward: they are the only thing that would have
 caught the `outDir` gotcha above.
 
@@ -1362,12 +1479,12 @@ are the package's site.
 
 ## Status
 
-MEASURED ON THIS TREE, not estimated, PER TIER, on the 1.0.0 commit:
-`npm run test:unit` is **1149 passed across 34 files** with
+MEASURED ON THIS TREE, not estimated, PER TIER, on the 1.1.1 working tree:
+`npm run test:unit` is **1208 passed across 34 files** with
 `TICKROOM_TEST_REDIS_URL` pointed at an unused port (6499), which is the
 no-services promise proved rather than assumed; `npm run test:integration` is
-**1197 across 43** with a local Redis on 6399; `npm run test:measure` is **16
-across 4** on the same Redis and a quiet laptop; `npm test` is the sum, **1213
+**1256 across 43** with a local Redis on 6399; `npm run test:measure` is **16
+across 4** on the same Redis and a quiet laptop; `npm test` is the sum, **1272
 across 47**. `npx tsc --noEmit` is clean repo-wide including `examples/`, and
 `npm run build` emits `dist/` cleanly. Roughly 18,700 lines of source and 28,700
 of tests. `README.md`, `AGENTS.md` and the five files under `docs/` are the whole
@@ -1380,7 +1497,8 @@ exercised rather than argued.
 
 THE LONG RUNS HAPPEN ON A SECOND MACHINE. Anything that takes minutes (the whole
 suite, the split-brain long form, the bench's own multi-client runs) executes on
-the fw13 server, a 16-core NixOS box, with Redis in Docker and the browser
+the fw13 server, a 16-core NixOS box, with Redis in Podman (host networking,
+see the gotcha above) and the browser
 harness in the official Playwright container rather than on the laptop. A machine
 with sixteen cores busy is not a slower laptop, it is a different measurement,
 and that is how the last wall-clock cases were found.

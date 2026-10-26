@@ -1809,6 +1809,74 @@ describe('SnapshotInterpolator', () => {
     expect(peak).toBeLessThan(1000);
   });
 
+  it('a measured speed of exactly 0 is a measurement: an entity that stood still and was moved across a reconnect snaps rather than sweeping', () => {
+    // `0` used to read as "no measurement" and mapped to an unbounded glide,
+    // so an entity the player had watched standing still, relocated while the
+    // socket was down, swept the whole distance in over `EXTRAP_CAP_MS`. A
+    // second of a speed of zero is zero.
+    const interp = new SnapshotInterpolator<string>({ minDelayMs: 100, maxDelayMs: 100, startDelayMs: 100 });
+    let held = new Map<string, InterpolatedEntity>();
+    let pushed = 0;
+    for (let now = 0; now <= 2000; now += 1000 / 60) {
+      while (pushed * 50 + 40 <= now) {
+        interp.push(frame(pushed * 50, pushed * 50 + 40, { a: { x: 0, y: 0 } }));
+        pushed++;
+      }
+      const out = interp.sample(1 / 60, now);
+      if (out.size > 0) held = out;
+    }
+    expect(held.get('a')!.speed).toBe(0);
+
+    interp.clear();
+    interp.resumeFrom(held);
+    interp.push(frame(10_000, 10_040, { a: { x: 5000, y: 0 } }));
+    interp.push(frame(10_050, 10_090, { a: { x: 5005, y: 0 } }));
+    interp.push(frame(10_100, 10_140, { a: { x: 5010, y: 0 } }));
+
+    // The midpoint of the bracket [10_050, 10_100], with no offset at all.
+    expect(interp.sample(1 / 60, 10_215).get('a')!.x).toBeCloseTo(5007.5, 6);
+
+    // CONTROL: a pose with no speed on it is still "unknown", and glides in
+    // from the held pose unclamped.
+    const unknown = new SnapshotInterpolator<string>({ minDelayMs: 100, maxDelayMs: 100, startDelayMs: 100 });
+    unknown.resumeFrom(new Map([['a', { x: 0, y: 0 }]]));
+    unknown.push(frame(10_000, 10_040, { a: { x: 5000, y: 0 } }));
+    unknown.push(frame(10_050, 10_090, { a: { x: 5005, y: 0 } }));
+    unknown.push(frame(10_100, 10_140, { a: { x: 5010, y: 0 } }));
+    expect(unknown.sample(1 / 60, 10_215).get('a')!.x).toBeLessThan(100);
+  });
+
+  it('the time prune never evicts the frame the playhead brackets against, even after a stream gap longer than its horizon', () => {
+    // Two seconds with no frames, then the stream resumes. The playhead lands
+    // between the last frame before the gap and the first after it, and the
+    // last frame before the gap is far below the time horizon: pruned, the
+    // playhead fell off the front of the buffer mid-bracket and the draw
+    // lurched forward and then crawled.
+    const interp = new SnapshotInterpolator<string>({ minDelayMs: 100, maxDelayMs: 100, startDelayMs: 100 });
+    const arrivals: Arrival[] = [];
+    for (let t = 0; t <= 1000; t += 50) arrivals.push({ serverTime: t, receivedAt: t + 40, entities: { a: { x: t / 10, y: 0 } } });
+    for (let t = 3000; t <= 4000; t += 50) arrivals.push({ serverTime: t, receivedAt: t + 40, entities: { a: { x: t / 10, y: 0 } } });
+
+    let next = 0;
+    const xs: number[] = [];
+    for (let now = 0; now <= 3200; now += 1000 / 60) {
+      while (next < arrivals.length && arrivals[next]!.receivedAt <= now) {
+        const a = arrivals[next]!;
+        interp.push(frame(a.serverTime, a.receivedAt, a.entities));
+        next++;
+      }
+      const out = interp.sample(1 / 60, now).get('a')!;
+      if (now >= 3045 && !out.extrapolated) xs.push(out.x);
+    }
+
+    const steps = xs.slice(1).map((x, i) => x - xs[i]!);
+    expect(steps.length).toBeGreaterThan(5);
+    for (const d of steps) {
+      expect(d).toBeGreaterThan(2);
+      expect(d).toBeLessThan(5);
+    }
+  });
+
   it('a held pose that never reappears is dropped at the next clear(), not carried into a later epoch', () => {
     // `resumeFrom` seeds a pose per entity and consumes it on that entity's
     // first render, so an entity that never comes back (it left the room while

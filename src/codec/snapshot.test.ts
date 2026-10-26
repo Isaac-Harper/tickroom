@@ -436,6 +436,29 @@ describe('default input window codec', () => {
     expect(decodeInputWindow({} as unknown as Uint8Array)).toEqual([]);
   });
 
+  it('decodeInputWindow reads any ArrayBufferView over its own window, never throwing on a view that is not a Uint8Array', () => {
+    // The guard admits every `ArrayBuffer.isView`, and `ByteReader` built its
+    // `DataView` straight from anything that was not a `Uint8Array`, which
+    // `DataView`'s constructor refuses with a bare TypeError: a `DataView` or an
+    // `Int8Array` passed the guard and then threw.
+    const records = [{ seq: 7, targetTick: 7, axes: [1, -1] as [number, number], buttons: 3 }];
+    const bytes = encodeInputWindow(records);
+    const padded = new Uint8Array(bytes.length + 8);
+    padded.fill(0xee);
+    padded.set(bytes, 4);
+    const views: ArrayBufferView[] = [
+      new DataView(padded.buffer, 4, bytes.length),
+      new Int8Array(padded.buffer, 4, bytes.length),
+      new Uint8ClampedArray(padded.buffer, 4, bytes.length),
+    ];
+    for (const view of views) {
+      const asInput = view as unknown as Uint8Array;
+      expect(() => decodeInputWindow(asInput)).not.toThrow();
+      expect(decodeInputWindow(asInput)).toEqual(decodeInputWindow(bytes));
+      expect(decodeInputWindow(asInput)).toHaveLength(1);
+    }
+  });
+
   it('a crafted count:255 with no record bytes behind it does NOT allocate 255 records', () => {
     // A hand-built packet: valid version and type, but a declared record
     // count of 255 with zero bytes of actual record data following. A

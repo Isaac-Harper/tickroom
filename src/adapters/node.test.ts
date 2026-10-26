@@ -13,25 +13,33 @@
 // one, because "refuses with the shared codes" is a claim about two modules
 // agreeing and a stub can only assert about itself.
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
+import { build } from 'esbuild';
+import { fileURLToPath } from 'node:url';
 
 const mocks = vi.hoisted(() => ({
   getRedis: vi.fn(),
   createSubscriber: vi.fn(),
   runTicker: vi.fn(),
   admitSocket: vi.fn(),
-  real: { admitSocket: null as unknown as typeof import('../server/index.js')['admitSocket'] },
+  real: { admitSocket: null as unknown as typeof import('../server/admission.js')['admitSocket'] },
 }));
 
-vi.mock('../server/index.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../server/index.js')>();
+// Mocked at the MODULES the adapter imports, not at the barrel, because the
+// adapter no longer touches the barrel (it pulls `ioredis` in at load; see the
+// last group in this file). The Redis factories are reached through a dynamic
+// import, which a module mock covers the same way.
+vi.mock('../server/redis.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../server/redis.js')>();
+  return { ...actual, getRedis: mocks.getRedis, createSubscriber: mocks.createSubscriber };
+});
+vi.mock('../server/ticker.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../server/ticker.js')>();
+  return { ...actual, runTicker: mocks.runTicker };
+});
+vi.mock('../server/admission.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../server/admission.js')>();
   mocks.real.admitSocket = actual.admitSocket;
-  return {
-    ...actual,
-    getRedis: mocks.getRedis,
-    createSubscriber: mocks.createSubscriber,
-    runTicker: mocks.runTicker,
-    admitSocket: mocks.admitSocket,
-  };
+  return { ...actual, admitSocket: mocks.admitSocket };
 });
 
 import { CLOSE_CODES, SERVER_FRAMES, roomKeys } from '../core/index.js';
@@ -377,4 +385,81 @@ describe('runNodeTicker', () => {
     await runNodeTicker({ runtime: {} as never, roomId: 'lobby', restartOnExit: false });
     expect(mocks.runTicker).toHaveBeenCalledTimes(1);
   });
+});
+
+describe('the two clients are both injected, or neither is', () => {
+  // Supplied alone, the other one defaulted to a real ioredis connection, so a
+  // command client and a subscriber pointed at two different stores: every
+  // command lands, nothing is ever delivered, and everything reads healthy.
+  it('attachNodeRelay refuses a redis with no createSubscriber, and the reverse, at the call', () => {
+    const { redis, createSubscriber } = { redis: new FakeRedis(), createSubscriber: () => new FakeRedis() };
+    expect(() => attachNodeRelay(new FakeWss(), baseOpts({ redis }))).toThrow(/both or neither/);
+    expect(() => attachNodeRelay(new FakeWss(), baseOpts({ createSubscriber }))).toThrow(/both or neither/);
+  });
+
+  it('runNodeTicker refuses the same half pair before it runs anything', async () => {
+    mocks.runTicker.mockReset();
+    await expect(runNodeTicker({ runtime: {} as never, roomId: 'lobby', redis: new FakeRedis() })).rejects.toThrow(
+      /both or neither/
+    );
+    expect(mocks.runTicker).not.toHaveBeenCalled();
+  });
+
+  it('CONTROL: both together are accepted', () => {
+    const redis = new FakeRedis();
+    expect(() => attachNodeRelay(new FakeWss(), baseOpts({ redis, createSubscriber: () => redis.fork() }))).not.toThrow();
+  });
+});
+
+describe('the node adapter loads without ioredis', () => {
+  const repoRoot = fileURLToPath(new URL('../..', import.meta.url));
+
+  /** The bare packages an entry reaches through STATIC imports only, following the graph esbuild actually resolved. */
+  async function staticPackagesOf(entry: string): Promise<{ packages: Set<string>; dynamic: Set<string> }> {
+    const result = await build({
+      entryPoints: [entry],
+      absWorkingDir: repoRoot,
+      bundle: true,
+      write: false,
+      metafile: true,
+      platform: 'node',
+      format: 'esm',
+      packages: 'external',
+      logLevel: 'silent',
+    });
+    const inputs = result.metafile.inputs;
+    const packages = new Set<string>();
+    const dynamic = new Set<string>();
+    const seen = new Set<string>();
+    const walk = (path: string): void => {
+      if (seen.has(path)) return;
+      seen.add(path);
+      for (const imported of inputs[path]?.imports ?? []) {
+        if (imported.kind === 'dynamic-import') {
+          dynamic.add(imported.path);
+          continue;
+        }
+        if (imported.kind !== 'import-statement') continue;
+        if (imported.external) packages.add(imported.path);
+        else walk(imported.path);
+      }
+    };
+    walk(entry);
+    return { packages, dynamic };
+  }
+
+  // `ioredis` is an OPTIONAL peer dependency, and a host on `createMemoryRedis()`
+  // is exactly the host that never installs it. A static import anywhere on
+  // this module's graph fails that host at load, before any option it passed
+  // could say it wanted no Redis.
+  it('reaches ioredis through no static import, and loads the Redis factories lazily', async () => {
+    const { packages, dynamic } = await staticPackagesOf('src/adapters/node.ts');
+    expect(packages).not.toContain('ioredis');
+    expect(dynamic).toContain('src/server/redis.ts');
+  }, 30_000);
+
+  it('CONTROL: the server barrel does reach it, so the walk can see the import it is looking for', async () => {
+    const { packages } = await staticPackagesOf('src/server/index.ts');
+    expect(packages).toContain('ioredis');
+  }, 30_000);
 });

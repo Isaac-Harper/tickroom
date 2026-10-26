@@ -15,6 +15,8 @@ export const LOG_KINDS = [
   // --- ticker (`src/server/ticker.ts`), one per room lifetime event ---
   /** error: `RoomRuntime.init` threw; this invocation exits without a room. */
   'ticker.init-failed',
+  /** error: the lease acquire threw (not merely lost) on the last attempt; the invocation returns 'error' without a room. */
+  'ticker.acquire-failed',
   /** error: setup (the checkpoint read, the subscribe, the restore) threw; the lease goes back and nothing is spawned. */
   'ticker.setup-threw',
   /** error: three consecutive invocations threw; the stored checkpoint is ignored and the room starts fresh. */

@@ -466,10 +466,14 @@ export interface RoomStats {
    */
   refusedInputs: number;
   /**
-   * `room-reject` frames NOT published because one had already gone to that pid
-   * within the last second. A join for a refused pid is answered on the roster
-   * channel, which fans out to every socket in the room, so a producer that can
-   * choose the join rate would otherwise choose the reject rate too.
+   * `room-reject` frames NOT published because this connection already
+   * received `REJECTS_PER_INTERVAL` within the last `REJECT_INTERVAL_MS`.
+   * Keyed on pid AND connection id, not pid alone: a relay's immediate join
+   * and its ack-gated join share one connection id, and the first reject can
+   * be lost on pub/sub before that subscription is acknowledged. A join for a
+   * refused pid is answered on the roster channel, which fans out to every
+   * socket in the room, so a producer that can choose the join rate would
+   * otherwise choose the reject rate too.
    */
   rejectsSuppressed: number;
   /**

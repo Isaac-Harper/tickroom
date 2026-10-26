@@ -4,8 +4,8 @@ import type { RedisLike } from '../core/index.js';
 /**
  * Connection helpers for the two roles every host needs: a shared command
  * client (the ticker's publisher, the relay's publisher/admission reads) and
- * one-off subscriber connections (one per socket the relay holds, one per
- * ticker run).
+ * one-off subscriber connections (one per room per process the relay serves,
+ * one per socket with `sharedSubscriber: false`, one per ticker run).
  *
  * TWO HARD CONSTRAINTS THAT SHAPE THIS FILE, both non-negotiable properties
  * of how Redis pub/sub actually works, not a design preference:

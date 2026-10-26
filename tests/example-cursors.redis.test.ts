@@ -230,6 +230,13 @@ d('examples/cursors through a real socket', () => {
       // Open the door only once the lease exists, so the relay's own spawn
       // poll cannot race the ticker that is already starting.
       expect(await waitFor(async () => (await raw.get(keys.lease)) !== null, 5000, 25)).toBe(true);
+      // AND only once the ticker is SUBSCRIBED to its input channel, which
+      // happens after the acquire. A lease says who owns the room, not that it
+      // can hear joins: both first join publishes can land in that gap, and the
+      // room then sits empty until the next join heartbeat, a second later.
+      expect(
+        await waitFor(async () => Number(((await raw.pubsub('NUMSUB', keys.in)) as [string, number])[1]) >= 1, 5000, 5)
+      ).toBe(true);
 
       // EVERY INPUT THE RELAY PARSED, counted by whether it named a tick. This
       // is the unstamped claim observed ON THE WIRE rather than read off the
@@ -471,10 +478,11 @@ d('examples/cursors through a real socket', () => {
         // A probe timer that fires late enough to land inside the same tick
         // as the previous probe has its coordinate overwritten on the server
         // before any snapshot can carry it: on-arrival input keeps only the
-        // newest value per tick, by design. A shared runner did exactly that
-        // once in a full-suite run (12 of 13 observed with every probe
-        // arriving). So the line is exact when the timers fired on time and
-        // tolerates precisely the probes the host coalesced, never more.
+        // newest value per tick, by design. So the line is exact when the
+        // timers fired on time and tolerates precisely the probes the host
+        // coalesced, never more. A 12 of 13 with nothing coalesced was the
+        // room still empty when probe 0 landed, which the NUMSUB gate above
+        // closes.
         expect(coalescedProbes, 'probes a starved timer landed inside one tick').toBeLessThanOrEqual(2);
         expect(distinctProbePositions, 'probe coordinates observed on the server cursor').toBeGreaterThanOrEqual(
           probes.length - coalescedProbes

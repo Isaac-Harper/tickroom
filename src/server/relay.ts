@@ -22,6 +22,7 @@ import {
 import type { Subscriber } from './redis.js';
 import {
   acquireRoomSubscription,
+  parseRosterHash,
   type MetaFrame,
   type RoomSubscriberMember,
   type RoomSubscriptionHandle,
@@ -133,7 +134,11 @@ export interface RelayOptions {
   socket: RelaySocket;
   /** The shared command client (publishes join/leave/input, reads no state itself). */
   redis: RedisLike;
-  /** Builds this socket's own dedicated subscriber for `keys.out`/`keys.metaout`. */
+  /**
+   * Builds a subscriber for `keys.out`/`keys.metaout`. Called once per room per
+   * process, not once per socket, unless `sharedSubscriber` is false; the
+   * sharing is keyed on this reference, so pass a stable one.
+   */
   createSubscriber(): Subscriber;
   roomId: string;
   pid: string;
@@ -595,13 +600,25 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
     lifetimeMs,
     inboundCapacity = 100,
     inboundRefillPerSecond = 70,
-    log = defaultLog,
+    log: hostLog = defaultLog,
     onClose,
     onRateDrop,
     onBadInput,
     onLivenessDrop,
     onPublishFailed,
   } = opts;
+
+  // A THROWING HOST LOGGER IS SWALLOWED HERE, ONCE, because nearly every line
+  // below is written from a Redis delivery, a timer or a transport callback,
+  // where a throw either skips the teardown it was announcing or escapes into
+  // the reply parser and stops delivery to every other socket in the room.
+  const log: Logger = (ev) => {
+    try {
+      hostLog(ev);
+    } catch {
+      // nothing a host logger does may reach the socket's own paths
+    }
+  };
 
   const keys = roomKeys(roomId, namespace);
   const bucket = new TokenBucket({ capacity: inboundCapacity, refillPerSecond: inboundRefillPerSecond });
@@ -672,15 +689,15 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
   // interleaved, and it leaves no second, uncoalesced publish path for a
   // later refactor to accidentally move onto a client-driven cadence.
   //
-  // The snapshot backlog drops and the subscriber's own error events are
-  // flushed the same way and for the same reason: both are driven by
-  // traffic the client can shape (a socket that stops reading backs up at
-  // the tick rate), so both are counted and reported once a beat.
+  // The snapshot backlog drops are flushed the same way and for the same
+  // reason: they are driven by traffic the client can shape (a socket that
+  // stops reading backs up at the tick rate), so they are counted and reported
+  // once a beat. The subscriber's own error events are too, but they are
+  // counted on the SUBSCRIPTION, which several sockets share, and taken by
+  // whichever socket flushes first; see `takeErrors` in `roomSubscriber.ts`.
   let publishFailures = 0;
   let lastPublishError: string | null = null;
   let backlogDrops = 0;
-  let subscriberErrors = 0;
-  let lastSubscriberError: string | null = null;
   let misaddressedDrops = 0;
   let sendFailures = 0;
   let lastSendError: string | null = null;
@@ -731,12 +748,9 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
       backlogDrops = 0;
       log({ lvl: 'warn', kind: 'relay.backlog-drop', room: roomId, pid, meta: { count, capBytes: snapshotBacklogBytes } });
     }
-    if (subscriberErrors > 0) {
-      const count = subscriberErrors;
-      const error = lastSubscriberError;
-      subscriberErrors = 0;
-      lastSubscriberError = null;
-      log({ lvl: 'warn', kind: 'relay.subscriber-error', room: roomId, pid, meta: { count, error } });
+    const subscriberErrors = subscription?.takeErrors() ?? null;
+    if (subscriberErrors !== null) {
+      log({ lvl: 'warn', kind: 'relay.subscriber-error', room: roomId, pid, meta: subscriberErrors });
     }
     if (misaddressedDrops > 0) {
       const count = misaddressedDrops;
@@ -772,10 +786,53 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
     }
   }
 
-  function publishJoin(): void {
-    joinPublished = true;
+  /**
+   * Answers false when the socket was ended instead. A `joinMeta` that
+   * `JSON.stringify` cannot carry (a BigInt, a cycle) fails the same way on
+   * every beat and used to throw out of the `'open'` listener, so the socket
+   * is closed once, counted as a publish failure and logged by the tail flush
+   * in `cleanup`, which also releases its subscription member.
+   */
+  function publishJoin(): boolean {
     const envelope: RoomEnvelope = { t: 'join', pid, meta: joinMeta, c: conn };
-    redis.publish(keys.in, JSON.stringify(envelope)).catch(notePublishFailure);
+    let text: string;
+    try {
+      text = JSON.stringify(envelope);
+    } catch (err) {
+      notePublishFailure(err);
+      cleanup(CLOSE_CODES.relayUnavailable);
+      try {
+        socket.close(CLOSE_CODES.relayUnavailable);
+      } catch {
+        // cleanup already ran; a socket that cannot be closed is gone anyway
+      }
+      return false;
+    }
+    joinPublished = true;
+    redis.publish(keys.in, text).catch(notePublishFailure);
+    return true;
+  }
+
+  /**
+   * Ends a socket this relay has concluded is already gone, and answers the
+   * code the peer will see, so the caller hands `onClose` that same code.
+   * `terminate()` when the transport has one (the peer sees 1006, the abnormal
+   * closure a dropped connection is); otherwise a close with
+   * `relayUnavailable`, which the client answers with an ordinary reconnect.
+   * NEVER `close(1006)`: 1006 is a code the transport REPORTS, and both `ws`
+   * and a browser THROW when a caller sends it, which from inside the
+   * heartbeat's `setInterval` was an uncaught exception that took the process
+   * and every other socket in it down.
+   */
+  function dropSocket(): number {
+    const code = socket.terminate ? 1006 : CLOSE_CODES.relayUnavailable;
+    try {
+      if (socket.terminate) socket.terminate();
+      else socket.close(code);
+    } catch {
+      // a socket that cannot be closed is gone, which is the conclusion
+    }
+    return code;
   }
 
   /**
@@ -809,13 +866,7 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
     // later; this is the same conclusion reached from evidence already in
     // hand.
     if (consecutiveSendFailures >= SEND_FAILURE_LIMIT && !closed) {
-      try {
-        if (socket.terminate) socket.terminate();
-        else socket.close(1006);
-      } catch {
-        // the socket is already gone, which is exactly what was concluded
-      }
-      cleanup(1006);
+      cleanup(dropSocket());
     }
   }
 
@@ -861,52 +912,38 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
     }
   }
 
+  /**
+   * Turns a parsed roster map into the wire frame and sends it. The one
+   * place that calls `metaSeedPayload`, which matters now that the roster
+   * can arrive from TWO places: `seedRoster`'s own `HGETALL` (join, subscribe
+   * ack) and `onResubscribed`'s shared one (see `parseRosterHash` in
+   * `roomSubscriber.ts`). A THROWING formatter is caught HERE rather than
+   * left to whichever caller happens to be a promise chain, because the
+   * resubscribe path calls this once per member in one loop: an unguarded
+   * throw for one socket's formatter would stop every member after it in
+   * that loop from being re-seeded at all.
+   */
+  function sendRosterSeed(map: Record<string, unknown>): void {
+    if (closed) return;
+    try {
+      const payload = metaSeedPayload ? metaSeedPayload(map) : { t: SERVER_FRAMES.meta, seed: true, map };
+      // `JSON.stringify` returns undefined for `undefined` (and for a bare
+      // function or symbol) despite its lying type. Suppressing the frame
+      // beats sending the four characters "undefined" down a control
+      // channel, and it gives a host a deliberate way to opt out of the
+      // seed entirely when it seeds the roster by some other route.
+      const frame = JSON.stringify(payload) as string | undefined;
+      if (frame === undefined) return;
+      sendControl(frame);
+    } catch (err) {
+      log({ lvl: 'warn', kind: 'relay.meta-seed-failed', room: roomId, pid, meta: { error: String(err) } });
+    }
+  }
+
   function seedRoster(): void {
     redis
       .hgetall(keys.meta)
-      .then((raw) => {
-        if (closed) return;
-        // `Object.create(null)`, NOT `{}`, AND THE REASON IS A HASH FIELD NAME.
-        // The keys here are pids, which come from a host's own identity
-        // system, and `map[k] = ...` on an object literal with `k` of
-        // `__proto__` REPARENTS the object instead of adding a property: the
-        // entry then vanishes from `JSON.stringify`, so that player is
-        // missing from the seed while the ticker's own broadcast (built with
-        // `Object.fromEntries`, which has no such rule) does include them.
-        // The two halves of one roster disagreeing is precisely the failure
-        // `metaSeedPayload` exists to keep hosts out of. A null-prototype
-        // object has no `__proto__` setter, so the assignment is an ordinary
-        // own property and serialises. `JSON.stringify` handles one fine.
-        const map: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
-        for (const [k, v] of Object.entries(raw)) {
-          try {
-            const parsed: unknown = JSON.parse(v);
-            // The ticker writes `env.meta ?? {}`, so every legitimate entry is
-            // a plain object. Anything else in this hash was not written by
-            // the roster path, and a scalar or an array reaching a host
-            // formatter that expects a record is a crash in the host's code
-            // rather than a seed.
-            if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) continue;
-            map[k] = parsed;
-          } catch {
-            // a corrupt single field must not blank the whole seed
-          }
-        }
-        // The host's formatter, if any, decides the client-visible shape;
-        // see `metaSeedPayload` for why that seam exists. A formatter that
-        // THROWS lands in the `.catch` below and is reported as a seed
-        // failure, which is correct: this path runs at most twice per
-        // socket, so it is not client-rate and a real log line is affordable.
-        const payload = metaSeedPayload ? metaSeedPayload(map) : { t: SERVER_FRAMES.meta, seed: true, map };
-        // `JSON.stringify` returns undefined for `undefined` (and for a bare
-        // function or symbol) despite its lying type. Suppressing the frame
-        // beats sending the four characters "undefined" down a control
-        // channel, and it gives a host a deliberate way to opt out of the
-        // seed entirely when it seeds the roster by some other route.
-        const frame = JSON.stringify(payload) as string | undefined;
-        if (frame === undefined) return;
-        sendControl(frame);
-      })
+      .then((raw) => sendRosterSeed(parseRosterHash(raw)))
       .catch((err) => log({ lvl: 'warn', kind: 'relay.meta-seed-failed', room: roomId, pid, meta: { error: String(err) } }));
   }
 
@@ -1179,18 +1216,22 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
       if (closed) return;
       handleMeta(text, frame);
     },
+    // THE ROSTER IS RE-READ AFTER A RECONNECT, for the same reason it is
+    // re-read after the first ack: a change announced while nothing was
+    // subscribed is lost for good. A socket that has not started its session
+    // yet seeds in `startSession`, which runs after this resubscribe anyway.
+    // The roster itself is already parsed, by the SUBSCRIPTION rather than
+    // by this socket: see `parseRosterHash` in `roomSubscriber.ts`.
+    onResubscribed(roster: Record<string, unknown>): void {
+      if (closed || !started) return;
+      sendRosterSeed(roster);
+    },
     // A SUBSCRIBER THAT DIES IS NOT A SUBSCRIBER THAT ERRORS LOUDLY. Both of
     // the next two arrive on a connection the client can never see, and a relay
     // that ignores them keeps an open socket that will never receive another
     // snapshot: the client's own stall detector eventually shows the player a
     // banner, which is a far worse answer than closing and letting the
-    // reconnect ladder land on a fresh relay. The 'error' events are COUNTED
-    // rather than logged per event, because a flapping connection emits them at
-    // whatever rate it likes.
-    onSubscriberError(err: unknown): void {
-      subscriberErrors++;
-      lastSubscriberError = String(err);
-    },
+    // reconnect ladder land on a fresh relay.
     onSubscriberEnd(): void {
       if (closed) return;
       log({ lvl: 'error', kind: 'relay.subscriber-dead', room: roomId, pid });
@@ -1215,17 +1256,12 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
         msg: 'the snapshot subscription stopped delivering: closing so the client reconnects onto a fresh relay',
         meta: { sent, answered },
       });
-      // `terminate`, not a graceful close, for the same reason the liveness
-      // path uses it: the client's reconnect ladder treats every non-terminal
-      // close alike, so waiting on a closing handshake buys nothing here and
-      // delays the reconnect that is the whole point.
-      try {
-        if (socket.terminate) socket.terminate();
-        else socket.close(CLOSE_CODES.relayUnavailable);
-      } catch {
-        // a socket that cannot be closed is gone, which is the conclusion
-      }
-      cleanup(CLOSE_CODES.relayUnavailable);
+      // Through `dropSocket()`, the same path the liveness check and the
+      // send-failure limit use, so `onClose` and the wire agree: a
+      // `terminate()` reports 1006 on the wire, and `cleanup` must be handed
+      // that same code rather than a hardcoded `relayUnavailable` that only
+      // matches the `close()` fallback.
+      cleanup(dropSocket());
     },
   };
 
@@ -1242,6 +1278,7 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
     redis,
     outChannel: keys.out,
     metaChannel: keys.metaout,
+    metaKey: keys.meta,
     probeChannel,
     shared: sharedSubscriber,
     member,
@@ -1304,7 +1341,7 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
     // measured over a second on a cold connection, during which a
     // RECONNECTING player would sit admitted-but-frozen server-side while
     // their own client predicts motion nobody is simulating.
-    publishJoin();
+    if (!publishJoin()) return;
     seedRoster();
 
     ensureTicker();
@@ -1319,7 +1356,7 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
     // schedules drifting against each other.
     heartbeatTimer = setInterval(() => {
       if (closed) return;
-      publishJoin();
+      if (!publishJoin()) return;
       // Second job: emit one line for however many publishes failed, frames
       // were dropped for backlog, and subscriber errors fired since the last
       // beat. This is the cadence the client cannot drive, which is the whole
@@ -1354,9 +1391,7 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
         } catch {
           // see the observability-seam note on RelayOptions
         }
-        if (socket.terminate) socket.terminate();
-        else socket.close(1006);
-        cleanup(1006);
+        cleanup(dropSocket());
         return;
       }
     }, heartbeatMs);
@@ -1437,9 +1472,11 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
     openDeadlineTimer = setTimeout(() => {
       if (closed || started) return;
       log({ lvl: 'warn', kind: 'relay.open-timeout', room: roomId, pid, meta: { waitedMs: subscribeTimeoutMs } });
-      cleanup(1006);
+      // `relayUnavailable`, never 1006, which `ws` refuses to send and which
+      // left this socket open behind the catch below; see `dropSocket`.
+      cleanup(CLOSE_CODES.relayUnavailable);
       try {
-        socket.close(1006);
+        socket.close(CLOSE_CODES.relayUnavailable);
       } catch {
         // cleanup already ran; a socket that cannot be closed is gone anyway
       }
@@ -1483,12 +1520,21 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
       // directly) or it happened before (the HSET necessarily preceded it,
       // and this later read observes it). There is no third case.
       //
+      // THAT HOLDS AT THE MOMENT OF THE ACK, AND A SHARED ACK CAN BE OLD. A
+      // socket joining a subscription that was acknowledged minutes ago gets
+      // this promise already resolved, and the connection under it may be in
+      // the middle of a reconnect, when nothing is subscribed at all. That
+      // case is closed from the other end: the subscription resubscribes on
+      // the reconnect's `'ready'` and every member re-reads the roster once
+      // that lands (`onResubscribed` above), so an announcement lost in the
+      // gap is recovered from the hash exactly as it is here.
+      //
       // A socket still CONNECTING at this point has not published its first
       // join yet, so there is nothing to re-publish and nothing to re-seed:
       // `startSession` runs AFTER this ack in that ordering, and its own
       // seed already has the property this pair exists to give.
       if (!started) return;
-      publishJoin();
+      if (!publishJoin()) return;
       seedRoster();
     })
     .catch((err) => {
@@ -1502,6 +1548,13 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
       // operator reads to find real subscribe failures.
       if (closed) return;
       log({ lvl: 'error', kind: 'relay.subscribe-failed', room: roomId, pid, meta: { error: String(err) } });
+      // AND THE SUBSCRIPTION IS RETIRED, not merely released. Another socket
+      // still holding it keeps its reference count above zero, so releasing
+      // this socket alone left a subscribe that never acknowledged in the
+      // registry, and every later socket for the room joined it and waited out
+      // its own timeout. A HEALTHY subscription never reaches here: once it
+      // has acknowledged, every socket that joins it resolves at once.
+      subscription?.retire();
       // NOT report-and-proceed any more. The first publish and seed did run,
       // so the room knows this player exists, but the socket will never
       // receive a snapshot or a roster change: it is admitted and deaf, and
@@ -1702,10 +1755,11 @@ export interface AdmissionResult {
    * fails, so a `ZCARD` that errored used to arrive here as `undefined`,
    * slide past a `typeof === 'number'` check, and disable the cap for that
    * admission with nothing said anywhere. That cap is not a nuisance
-   * control: every socket holds its own Redis subscriber connection, so one
-   * client opening sockets without limit can exhaust a managed plan's
-   * concurrent connection ceiling and take the ROOM TICKER's subscriber
-   * down with it, which is a total outage rather than a personal one.
+   * control: every socket holds a join, a playout buffer and its own share of
+   * the rate limit, and with `sharedSubscriber: false` its own Redis
+   * subscriber connection too, enough of which exhaust a managed plan's
+   * concurrent connection ceiling and take the ROOM TICKER's subscriber down
+   * with it.
    *
    * FAILING OPEN IS STILL THE RIGHT ANSWER and this field is not a step
    * toward changing it. Failing closed would lock every user out of a

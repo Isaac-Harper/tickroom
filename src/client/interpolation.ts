@@ -186,10 +186,14 @@ export const EXTRAP_CAP_MS = 150;
  * A second of the entity's own speed is a bound rather than a policy. It exists
  * so a pose held across a genuinely long outage, or a key reused by a different
  * entity, cannot buy an arbitrarily long lie; at any ordinary reconnect the
- * outage is a fraction of that and the clamp never binds. With no measured
- * speed to scale (the common case, since `clear()` has just dropped the motion
- * state the speed lived in) there is nothing to bound it with and the glide is
- * unclamped, which is the same trade made deliberately rather than by accident.
+ * outage is a fraction of that and the clamp never binds. `RoomConnection`
+ * always hands `resumeFrom` the held poses it just sampled, which carry a
+ * measured speed; it is only a HOST calling `resumeFrom` by hand, with poses
+ * that never went through `sample()`, that can omit it. With no measured speed
+ * to scale there is nothing to bound it with and the glide is unclamped, which
+ * is the same trade made deliberately rather than by accident. A measured
+ * speed of exactly 0 is not "no measurement": it bounds the glide at nothing,
+ * so an entity that was standing still snaps.
  */
 export const RESUME_GLIDE_MAX_MS = 1000;
 
@@ -572,7 +576,7 @@ export class SnapshotInterpolator<K extends string | number> {
   private lastSeenAt = new Map<K, number>();
   private motion = new Map<K, EntityMotionState>();
   /** Poses a reconnecting host was holding on screen, waiting for their entity's first render of the new epoch. Empty except in the moments after `resumeFrom`. See that method. */
-  private resumeSeed = new Map<K, { x: number; y: number; heading?: number | undefined; speed: number }>();
+  private resumeSeed = new Map<K, { x: number; y: number; heading?: number | undefined; speed: number | null }>();
   /** Keys the host has declared teleported, each with the destination it holds at and the `serverTime` the playhead has to reach before ordinary interpolation resumes. Empty except between a `teleport` call and the playhead catching up with it. See that method. */
   private teleports = new Map<K, { serverTime: number; sample: EntitySample }>();
 
@@ -1046,7 +1050,11 @@ export class SnapshotInterpolator<K extends string | number> {
       const horizon = playServerTime - (this.currentDelayMs + this.extrapCapMs + 2 * this.intervalMs);
       let drop = 0;
       while (drop < this.frames.length && this.frames[drop]!.serverTime < horizon) drop++;
-      drop = Math.min(drop, this.frames.length - 2);
+      // Never past the bracket's left edge, the same stop the count cap makes:
+      // after a stream gap longer than the horizon, the newest frame before the
+      // gap is still what the playhead brackets against, and it is below the
+      // horizon.
+      drop = Math.min(drop, this.frames.length - 2, Math.max(0, this.bracketIndex(playServerTime)));
       if (drop > 0) this.frames.splice(0, drop);
     }
 
@@ -1163,11 +1171,14 @@ export class SnapshotInterpolator<K extends string | number> {
    * Drop all buffered frames and per-entity state, and reset the adaptive
    * delay to its starting value.
    *
-   * THIS IS THE RECONNECT CALL. A `RoomConnection` that drops and comes back
-   * holds no reference to its interpolator, so nothing else can do it: without
-   * this call the first frame of the new epoch is bracketed against a frame
-   * from seconds ago, which is a guaranteed snap on every reconnect. Clear
-   * from `onStatus` the moment the connection leaves `'open'`.
+   * THIS IS THE RECONNECT CALL, AND THE CONNECTION MAKES IT. Without it the
+   * first frame of the new epoch is bracketed against a frame from seconds
+   * ago, which is a guaranteed snap on every reconnect. A `RoomConnection`
+   * driving this interpolator (`interpolate`, with `into` or without) calls
+   * it at every epoch boundary, immediately followed by `resumeFrom` with the
+   * poses it was drawing; a host never calls it for that interpolator. A host
+   * keeping one BY HAND, outside `interpolate`, owns the same pair at its own
+   * reconnect.
    *
    * The clock offset is reset too, not merely the frames. It is an estimate of
    * a specific socket's path delay; a new connection may take a different
@@ -1281,10 +1292,14 @@ export class SnapshotInterpolator<K extends string | number> {
       if (!Number.isFinite(pose.x) || !Number.isFinite(pose.y)) continue;
       // A speed arriving on a host-supplied pose crosses the same boundary
       // `push()` guards: non-finite or negative is no measurement at all, and
-      // has to read as "unknown" (unclamped) rather than as a bound of NaN,
-      // which every comparison downstream would silently pass.
-      const measured = pose.speed ?? this.motion.get(key)?.speed ?? 0;
-      const speed = Number.isFinite(measured) && measured > 0 ? measured : 0;
+      // has to read as "unknown" (`null`, unclamped) rather than as a bound of
+      // NaN, which every comparison downstream would silently pass. A finite
+      // 0 IS a measurement, of an entity that was standing still, and bounds
+      // the glide at nothing: read as "unknown" it swept a stationary entity
+      // relocated across the reconnect in at tens of thousands of units a
+      // second.
+      const measured = pose.speed ?? this.motion.get(key)?.speed;
+      const speed = measured !== undefined && Number.isFinite(measured) && measured >= 0 ? measured : null;
       this.resumeSeed.set(key, { x: pose.x, y: pose.y, heading: pose.heading, speed });
     }
   }
@@ -1840,7 +1855,7 @@ export class SnapshotInterpolator<K extends string | number> {
       const dx = seed.x - x;
       const dy = seed.y - y;
       const mag = Math.hypot(dx, dy);
-      const allowed = seed.speed > 0 ? (seed.speed * RESUME_GLIDE_MAX_MS) / 1000 : Infinity;
+      const allowed = seed.speed === null ? Infinity : (seed.speed * RESUME_GLIDE_MAX_MS) / 1000;
       const scale = mag > allowed ? allowed / mag : 1;
       offX = dx * scale;
       offY = dy * scale;

@@ -21,7 +21,7 @@ import {
 } from '../core/index.js';
 import { ClientTick, TICK_STEP_CAP, type ClientTickView } from './clientTick.js';
 import { SnapshotInterpolator, type EntitySample, type InterpolatedEntity } from './interpolation.js';
-import { PredictedEntity, type Pose, type StampedRecord } from './predictedEntity.js';
+import { PredictedEntity, isFinitePose, type Pose, type StampedRecord } from './predictedEntity.js';
 import type { DefaultInput } from '../codec/snapshot.js';
 import {
   stallDecision,
@@ -331,7 +331,7 @@ export interface RoomConnectionOptions<TSnap extends DecodedSnapshotLike, K exte
   interpolate?: SnapshotInterpolationOptions<TSnap, K> | undefined;
   /** Predict this client's own entity. See `PredictionOptions`. With it, `frame(now, input)` REQUIRES its second argument and returns the pose to draw as `own`; without it, `own` is always `null` and `input` is ignored. */
   predict?: PredictionOptions<TSnap, TInput> | undefined;
-  /** Every decoded snapshot, in the concrete type `decodeSnapshot` returned. For the discrete state interpolation cannot smooth; the moving entities are `interpolate`'s job and the own entity is `predict`'s. It runs LAST: after the frame is pushed into the interpolator, after every declared teleport, and after the own entity is reconciled, so what a host reads here (`conn.own`, `conn.ownStats`) is the state this snapshot produced and not the one before it. */
+  /** Every decoded snapshot, in the concrete type `decodeSnapshot` returned. For the discrete state interpolation cannot smooth; the moving entities are `interpolate`'s job and the own entity is `predict`'s. It runs after the frame is pushed into the interpolator and after every declared teleport, and BEFORE the own entity is snapped or reconciled, deliberately: the replay runs the host's `step`, so context the host refreshes here (a grid, a closing ring) is what the replay reads. `conn.own` and `conn.ownStats` read here are the prediction as the previous snapshot left it; the reconciled pose is there on the next frame (`frame().own`). */
   onSnapshot?: ((snap: TSnap) => void) | undefined;
   /** JSON control frames the host relay sends: a roster update, a capacity notice, a quota warning. Parsed for you; handed back as the parsed value, or the raw string if it did not parse as JSON. The library's OWN control frames (`pong`, `relay-expiring`) are consumed here and never reach this callback, because they are transport bookkeeping rather than anything a host has an opinion about. */
   onText?: ((msg: unknown) => void) | undefined;
@@ -702,7 +702,7 @@ export class RoomConnection<
   private outstandingPings = new Map<number, number>();
   private session: SessionInfo | null = null;
 
-  private connectStartedAt = 0;
+  private connectStartedAt: number | null = null;
   private lastSnapAt = 0;
   private epochDelivered = false;
   private stallActive = false;
@@ -714,7 +714,8 @@ export class RoomConnection<
   private serverClockSeeded = false;
   private clockOffsets: number[] = [];
   private lastClockSampleAt = 0;
-  private clockStepSince = 0;
+  /** When the current run of stepped clock samples began, `null` while there is none. Never 0 for that: 0 is a real `performance.now()` reading. */
+  private clockStepSince: number | null = null;
   private clockStepSamples: number[] = [];
   private lastSnapTick = 0;
   private lastSnapServerTime = 0;
@@ -1109,7 +1110,7 @@ export class RoomConnection<
     this.serverClockSeeded = false;
     this.clockOffsets.length = 0;
     this.lastClockSampleAt = 0;
-    this.clockStepSince = 0;
+    this.clockStepSince = null;
     this.clockStepSamples.length = 0;
     this.lastReanchorAt = Number.NEGATIVE_INFINITY;
 
@@ -1280,8 +1281,12 @@ export class RoomConnection<
           // is the right one: a host whose mint endpoint answered 401 wants a
           // stack trace, not a silent ladder. Left restartable rather than
           // latched, because fixing the mint and calling `start()` again is
-          // exactly what a caller does next.
+          // exactly what a caller does next. The abandoned attempt is no
+          // longer evidence of anything, so its start time is cleared: left
+          // set, `pollStall` read a connection with no socket and no terminal
+          // as an 8 second connect stall and raised the banner after the throw.
           this.stopped = true;
+          this.connectStartedAt = null;
           this.setStatus('idle');
           throw new Error(message);
         }
@@ -2081,7 +2086,7 @@ export class RoomConnection<
         // While the step escape is deciding whether the offset belongs to a
         // timeline that still exists, `desired` is built on the estimate this
         // class has already stopped believing. See the gate in `netPolicy.ts`.
-        clockStepping: this.clockStepSince !== 0,
+        clockStepping: this.clockStepSince !== null,
       });
     if (shouldAnchor) {
       // The very first anchor of this connection's LIFETIME is not a
@@ -2159,7 +2164,11 @@ export class RoomConnection<
     // before the jump and then snaps to the host's guess, which is the order
     // a consumer wrote.
     const snap = decoded;
+    const gen = this.generation;
     this.emit(() => this.opts.onSnapshot?.(snap));
+    // The callback is host code and may have stopped or restarted this
+    // connection, which leaves nothing for this snapshot's pose to confirm.
+    if (gen !== this.generation) return;
 
     const predict = this.opts.predict;
     if (predict && this.entity !== null) {
@@ -2191,7 +2200,9 @@ export class RoomConnection<
           }
         }
         this.entity.reconcile(pose, decoded.tick);
-        this.ownConfirmed = true;
+        // A pose the reconcile refused confirms nothing, and `frame().own`
+        // would otherwise go on drawing the initial guess as the server's.
+        if (isFinitePose(pose)) this.ownConfirmed = true;
       }
     }
 
@@ -2274,22 +2285,23 @@ export class RoomConnection<
     // becomes the window outright. The sample count is the safety: an outage
     // produces the same disagreement with nothing to re-seed from.
     if (Math.abs(sample - this.serverClockOffset) > this.tickMs) {
-      if (this.clockStepSince === 0) this.clockStepSince = localNow;
+      const stepSince = this.clockStepSince ?? localNow;
+      this.clockStepSince = stepSince;
       this.clockStepSamples.push(sample);
       if (this.clockStepSamples.length > SERVER_CLOCK_WINDOW) this.clockStepSamples.shift();
       if (
-        localNow - this.clockStepSince > SERVER_CLOCK_STEP_MS &&
+        localNow - stepSince > SERVER_CLOCK_STEP_MS &&
         this.clockStepSamples.length >= SERVER_CLOCK_STEP_SAMPLES
       ) {
         this.clockOffsets = this.clockStepSamples.slice();
         this.serverClockOffset = Math.min(...this.clockOffsets);
-        this.clockStepSince = 0;
+        this.clockStepSince = null;
         this.clockStepSamples = [];
         this.lastClockSampleAt = localNow;
         return;
       }
     } else {
-      this.clockStepSince = 0;
+      this.clockStepSince = null;
       this.clockStepSamples.length = 0;
     }
 
@@ -2348,7 +2360,10 @@ export class RoomConnection<
     if (Math.abs(error) < TARGET_DEPTH_TICKS) return;
     const step = Math.max(-2, Math.min(2, Math.round(error)));
     const lowest = -this.leadTicks;
-    const highest = PLAYOUT_MAX_AHEAD / 2 - this.leadTicks;
+    // Floored at zero: above about 133Hz the configured lead alone is more
+    // than half the playout bound, and a negative ceiling turned every
+    // feedback step, an upward one included, into a cut to that ceiling.
+    const highest = Math.max(0, PLAYOUT_MAX_AHEAD / 2 - this.leadTicks);
     this.feedbackTicks = Math.max(lowest, Math.min(highest, this.feedbackTicks + step));
     // `shouldReanchor`'s tolerance path applies the change on the next
     // snapshot, so the correction arrives as one ordinary re-anchor with an
@@ -2357,10 +2372,19 @@ export class RoomConnection<
 
   private handleVersionSkew(): void {
     let recentlyReloaded = false;
-    const hasStorage = typeof sessionStorage !== 'undefined';
-    if (hasStorage) {
+    // `typeof sessionStorage` still resolves the global, and in a sandboxed
+    // iframe or with site data blocked that resolution itself throws a
+    // SecurityError. The whole detection goes through one try so a throw
+    // here reads as "no usable storage" rather than escaping onmessage.
+    let storage: Storage | null;
+    try {
+      storage = typeof sessionStorage === 'undefined' ? null : sessionStorage;
+    } catch {
+      storage = null;
+    }
+    if (storage) {
       try {
-        const raw = sessionStorage.getItem(RELOAD_STORAGE_KEY);
+        const raw = storage.getItem(RELOAD_STORAGE_KEY);
         const last = raw ? Number(raw) : 0;
         recentlyReloaded = last > 0 && Date.now() - last < RELOAD_WINDOW_MS;
       } catch {
@@ -2368,15 +2392,21 @@ export class RoomConnection<
       }
     }
 
-    if (!recentlyReloaded) {
-      if (hasStorage) {
-        try {
-          sessionStorage.setItem(RELOAD_STORAGE_KEY, String(Date.now()));
-        } catch {
-          // Storage denied (private browsing, quota): fall through to the
-          // terminal path below rather than looping reload attempts.
-        }
+    // A RELOAD IS ONLY SAFE ONCE THE MARKER IS WRITTEN, because the marker is
+    // the only thing the reloaded page can read to know it already tried. A
+    // denied write (private browsing, quota) followed by a reload anyway was a
+    // page that reloaded itself forever.
+    let marked = false;
+    if (!recentlyReloaded && storage) {
+      try {
+        storage.setItem(RELOAD_STORAGE_KEY, String(Date.now()));
+        marked = true;
+      } catch {
+        marked = false;
       }
+    }
+
+    if (marked) {
       if (typeof location !== 'undefined' && typeof location.reload === 'function') {
         try {
           location.reload();
@@ -2388,8 +2418,9 @@ export class RoomConnection<
     }
 
     // Either we already reloaded once this window (a server that keeps
-    // outrunning the client must not loop reloads forever), or there is no
-    // `location` to reload at all (this class running outside a browser tab).
+    // outrunning the client must not loop reloads forever), the marker could
+    // not be written, or there is no `location` to reload at all (this class
+    // running outside a browser tab).
     this.versionSkewStopped = true;
     this.enterTerminal('version-skew', 'closed');
   }
