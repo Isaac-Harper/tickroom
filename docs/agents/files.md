@@ -33,7 +33,12 @@ values, and the invariants below for the rules.
   limits its swap by; `JOIN_HEARTBEAT_MS` and `PRESENCE_TIMEOUT_HEARTBEATS`, from
   which `relay.ts` and `ticker.ts` each derive their half of the presence rule; and
   `encodeDepth`, `encodeInputLead`, `isInputLeadFrame`, `depthFor(frame, pid)`,
-  which reads OWN properties and finite numbers only, since the pid is a claim.
+  which reads OWN properties and finite numbers only, since the pid is a claim;
+  and `STANDBY_FRAME` (`{ t: 'standby', o, ms }`, a ticker asking the room's
+  relays for its standby successor, consumed by the relay, never forwarded),
+  `STANDBY_CLAIM_MAX_MS`, `encodeStandbyRequest` and `standbyRequestOf`, which
+  refuses an empty or overlong owner and a claim that is not a positive integer
+  under the cap, because a bus frame is a claim too.
 - `src/core/redisLike.ts` - structural minimum Redis interface, so core never
   hard-imports ioredis. Optional `on?`/`off?` is what lets the ticker treat a
   `'reconnecting'` bus as ownership it cannot vouch for and DETACH. IT IS THE
@@ -45,11 +50,12 @@ values, and the invariants below for the rules.
   `normalizeRoomId` falls back to a known-good id and delegates its base half to
   `normalizeBase`, which returns `null` because its only caller already answers 400
   and redirecting a hostile `?base=` would turn a refusal into a reassignment.
-  `roomKeys` is NINE suffixes, the seven original plus `crashes` and `timeline`
+  `roomKeys` is TEN suffixes, the seven original plus `crashes`, `timeline`
   (the last `serverTime` PUBLISHED, written by an exit that saves no final
-  checkpoint, read as a floor, deleted by any exit that does write one).
-  `KEY_SUFFIXES` is the one list, and `examples/node-server/README.md` prints all
-  nine.
+  checkpoint, read as a floor, deleted by any exit that does write one) and
+  `standby` (the one relay's `NX` claim on a ticker's standby request, valued
+  with the incumbent's owner id). `KEY_SUFFIXES` is the one list, and
+  `examples/node-server/README.md` prints all ten.
 - `src/core/lease.ts` - the exactly-one-writer mechanism plus the `OwnershipClock`
   two-clock rule. The single most safety-critical file.
 - `src/core/checkpoint.ts` - the checkpoint ENVELOPE grammar, pure:
@@ -133,7 +139,12 @@ values, and the invariants below for the rules.
   pid)` on `keys.metaout` for the relay, sampled where `onBufferHealth` is
   reported, and exports `HostTickerOptions` for the adapters to spread plus
   `DEFAULT_STANDBY_LEAD_MS`, imported directly by `adapters/vercel.ts` rather
-  than through the barrel.
+  than through the barrel. `standbyVia: 'relay'` replaces the standby
+  `spawnSuccessor` call with a `STANDBY_FRAME` publish on `keys.metaout`
+  (unawaited; a failed publish clears `standbySpawned`), and at a `'duration'`
+  exit a bounded GET of `keys.standby`: a claim holding THIS ticker's owner id
+  is the handover (and is deleted), anything else clears `standbySpawned`, logs
+  `ticker.spawn-failed` with `via: 'relay'` and lets the exit spawn go out.
 - `src/server/relay.ts` - `attachRelay`, `checkAdmission`, `HostRelayOptions`: one
   socket to the bus, and a CONSUMER of the control plane. It bounds its own
   subscribe, drops snapshots under transport backpressure, holds repeat spawns off,
@@ -161,7 +172,12 @@ values, and the invariants below for the rules.
   `relay.open-timeout`, `relay.no-ping`, `relay.send-failed`,
   `relay.subscriber-dead`, `relay.misaddressed-frame`, `relay.room-full`, and
   `relay.gaps` (`busGapMax`, `busGapOver150`, `sendLagMax`, live via
-  `RelayHandle.gapsSample()`).
+  `RelayHandle.gapsSample()`). A `STANDBY_FRAME` is consumed by `claimStandby`:
+  one `SET keys.standby owner PX ms NX` per socket, held off by
+  `spawnHoldoffMs` per socket, and only the winner calls
+  `spawnTicker(roomId, { standby: true })`; a refused spawn logs
+  `relay.spawn-failed` with `standby: true` and DELETES the claim, which is how
+  the incumbent learns it has no standby.
 - `src/server/roomSubscriber.ts` - ONE SUBSCRIBER PER ROOM PER PROCESS, reference
   counted, which is what `attachRelay` joins instead of opening a connection of
   its own. It owns the things that are properties of the SUBSCRIPTION rather
@@ -323,13 +339,18 @@ values, and the invariants below for the rules.
   (2000, the incumbent's own checkpoint and release) and fit under `maxRunMs`.
   The spawn URL carries `standby=1`, mapped to the resolved `standbyMs`, and
   `deliverSpawn(spawnUrl, standby)`'s `SPAWN_ACK_MS` (3000) IS COUPLED TO THE
-  TICKER'S `EXIT_SPAWN_WAIT_MS`: an EXIT spawn rejects only for a failure BEFORE
-  the receipt and resolves on a quick answer (the ordinary acquire-race
-  outcome), leaves the connection open and drops only the WAIT, never
+  TICKER'S `EXIT_SPAWN_WAIT_MS`: an EXIT spawn rejects for a failure BEFORE
+  the receipt and, since 1.4.0, for a NON-2XX answer inside it (a 508, a 403),
+  resolves on a quick 2xx (the ordinary acquire-race `busy`), leaves the
+  connection open and drops only the WAIT, never
   `AbortSignal.timeout`; a STANDBY spawn additionally REJECTS on ANY answer
   inside `SPAWN_ACK_MS`, because that means the standby never reached its lease
   poll and `runTicker` must not believe one is still coming. Exports the
   sentinel `SPAWN_DELIVERED`.
+  THE TICKER ROUTE PASSES `standbyVia: 'relay'` UNLESS THE HOST SAYS OTHERWISE,
+  and the relay route's `spawnTicker` sets `standby=1` when handed
+  `{ standby: true }`: a relay's invocation descends from a browser request, so
+  the standby is always the chain's second hop.
   `createRoom` IS THE PRIMARY ENTRY POINT (`VercelRoomOptions` in,
   `{ ticker, ws, session, balancer, config }` out, the `ticker`/`relay`/`balancer`
   hatches applied LAST, `namespace` before them since it prefixes keys AND

@@ -112,6 +112,12 @@ initialized counter and from a new epoch until the next one). Since 1.2.0.
 stepped on the startup gap between the first snapshot and the first stamped
 record. `LockstepOptions.idleInput` mirrors it. Since 1.3.0.
 
+`TickerOptions.standbyVia` (`'ticker' | 'relay'`), the relay's
+`spawnTicker(roomId, opts?: { standby })`, `roomKeys(...).standby`, and the
+`STANDBY_FRAME` wire (`STANDBY_FRAME`, `STANDBY_CLAIM_MAX_MS`, `StandbyFrame`;
+its `encodeStandbyRequest` and `standbyRequestOf` are internal like the other
+frame helpers). Since 1.4.0.
+
 ## `tickroom/codec`
 
 Everything the barrel exports is supported: `ByteWriter`, `ByteReader`,
@@ -135,7 +141,7 @@ major.
 - Contract constants, because each is a number a route file or a platform
   setting has to agree with: `MIN_TICKER_RUN_MS`, `MIN_RELAY_LIFETIME_MS`,
   `TICKER_EXIT_MARGIN_MS`, `RELAY_EXIT_MARGIN_MS`, `SPAWN_ACK_MS`.
-- Internal: `defaultDecodeInput`, `SPAWN_DELIVERED`, `STANDBY_WAIT_MS`, and
+- Internal: `defaultDecodeInput`, `deliverSpawn`, `SPAWN_DELIVERED`, `STANDBY_WAIT_MS`, and
   the `refuseSocket` and `registerConnection` re-exports (import them from
   `tickroom/server`).
 

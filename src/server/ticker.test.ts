@@ -11,6 +11,7 @@ import {
   JOIN_HEARTBEAT_MS,
   DEPTH_INTERVAL_MS,
   DEPTH_FRAME,
+  STANDBY_FRAME,
 } from '../core/index.js';
 import { decodeCheckpoint, readCheckpoint } from './checkpoint.js';
 import type { Subscriber } from './redis.js';
@@ -5473,6 +5474,88 @@ describe('runTicker: the standby successor', () => {
     expect(result.reason).toBe('duration');
     expect(spawn).toHaveBeenCalledTimes(1);
     expect(spawn).toHaveBeenCalledWith('r-standby-inflight', { standby: true });
+  });
+
+  describe("standbyVia 'relay': the standby is asked of the relays, so the chain of a ticker spawning a ticker never grows", () => {
+    /** A stand-in for the room's relays: claims every standby request it hears, the way the winning relay does. */
+    function claimingRelay(redis: FakeRedis, roomId: string, claim: (owner: string) => string | null): string[] {
+      const keys = roomKeys(roomId, NS);
+      const heard: string[] = [];
+      const listener = redis.fork();
+      listener.on('message', (ch: unknown, message: unknown) => {
+        if (ch !== keys.metaout || typeof message !== 'string') return;
+        const frame = JSON.parse(message) as { t?: unknown; o?: unknown; ms?: unknown };
+        if (frame.t !== STANDBY_FRAME) return;
+        heard.push(String(frame.o));
+        const value = claim(String(frame.o));
+        if (value !== null) void redis.set(keys.standby, value, 'PX', Number(frame.ms), 'NX');
+      });
+      void listener.subscribe(keys.metaout);
+      return heard;
+    }
+
+    function run(redis: FakeRedis, roomId: string, spawn: (room: string, opts: { standby: boolean }) => Promise<unknown>, log: (e: LogEvent) => void = () => {}) {
+      return runTicker({
+        runtime: makeCounterRuntime({ tickHz: 50, create: withAlice }),
+        redis,
+        createSubscriber: () => redis.fork(),
+        roomId,
+        namespace: NS,
+        maxRunMs: 400,
+        standbyLeadMs: 300,
+        emptyGraceMs: 100_000,
+        standbyVia: 'relay',
+        spawnSuccessor: spawn,
+        log,
+      });
+    }
+
+    it('publishes ONE standby request, never spawns a standby itself, and a claimed request suppresses the exit spawn', async () => {
+      const redis = new FakeRedis();
+      const keys = roomKeys('r-via-relay', NS);
+      const heard = claimingRelay(redis, 'r-via-relay', (owner) => owner);
+      const spawn = vi.fn().mockResolvedValue(undefined);
+
+      const result = await run(redis, 'r-via-relay', spawn);
+
+      expect(result.reason).toBe('duration');
+      expect(heard).toHaveLength(1);
+      expect(heard[0]).toMatch(/^r-via-relay:/);
+      expect(spawn).not.toHaveBeenCalled();
+      // Read back and cleared, so the next incumbent's request finds the key free.
+      expect(await redis.get(keys.standby)).toBeNull();
+    });
+
+    it('a request NOBODY claimed (or whose spawn a relay saw refused) still gets the exit spawn, and says so', async () => {
+      const redis = new FakeRedis();
+      const heard = claimingRelay(redis, 'r-via-relay-unclaimed', () => null);
+      const spawn = vi.fn().mockResolvedValue(undefined);
+      const lines: LogEvent[] = [];
+
+      const result = await run(redis, 'r-via-relay-unclaimed', spawn, (e) => void lines.push(e));
+
+      expect(result.reason).toBe('duration');
+      expect(heard).toHaveLength(1);
+      expect(spawn.mock.calls).toEqual([['r-via-relay-unclaimed', { standby: false }]]);
+      const failed = lines.filter((e) => e.kind === 'ticker.spawn-failed');
+      expect(failed).toHaveLength(1);
+      expect(failed[0]?.meta?.['via']).toBe('relay');
+    });
+
+    it("a claim holding SOMEBODY ELSE'S owner id is not this ticker's standby", async () => {
+      const redis = new FakeRedis();
+      const keys = roomKeys('r-via-relay-stale', NS);
+      await redis.set(keys.standby, 'r-via-relay-stale:an-older-incumbent', 'PX', 60_000);
+      claimingRelay(redis, 'r-via-relay-stale', (owner) => owner);
+      const spawn = vi.fn().mockResolvedValue(undefined);
+
+      const result = await run(redis, 'r-via-relay-stale', spawn);
+
+      expect(result.reason).toBe('duration');
+      expect(spawn.mock.calls).toEqual([['r-via-relay-stale', { standby: false }]]);
+      // Another incumbent's claim is not this one's to clear.
+      expect(await redis.get(keys.standby)).toBe('r-via-relay-stale:an-older-incumbent');
+    });
   });
 
   it('a spawnSuccessor that throws SYNCHRONOUSLY does not turn a healthy duration exit into an error', async () => {

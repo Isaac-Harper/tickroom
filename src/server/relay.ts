@@ -18,6 +18,8 @@ import {
   encodeInputLead,
   DEPTH_FRAME,
   depthFor,
+  STANDBY_FRAME,
+  standbyRequestOf,
 } from '../core/index.js';
 import type { Subscriber } from './redis.js';
 import {
@@ -203,8 +205,14 @@ export interface RelayOptions {
    * exits, minutes later; see `SPAWN_ACK_MS` in `adapters/vercel.ts`. The
    * rejection this contract buys is the only one worth an error line, which is
    * what `ensureTicker` below logs.
+   *
+   * `opts.standby` is set when this relay won the claim on a ticker's
+   * `STANDBY_FRAME` (see `TickerOptions.standbyVia`): the spawn is that
+   * ticker's standby successor and must be started as one, polling for the
+   * lease rather than failing fast. Every other call is the lease poll's
+   * ordinary spawn and passes no options.
    */
-  spawnTicker(roomId: string): Promise<unknown>;
+  spawnTicker(roomId: string, opts?: { standby: boolean } | undefined): Promise<unknown>;
   /** How often the join heartbeat republishes and the liveness/ping check runs. Defaults to `JOIN_HEARTBEAT_MS`, which is also the unit the ticker's `presenceTimeoutMs` is counted in; lowering it here means raising that there. */
   heartbeatMs?: number | undefined;
   /** Base interval between "does this room have a ticker" checks. Default 1000ms. */
@@ -644,6 +652,7 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
   let lifetimeTimer: ReturnType<typeof setTimeout> | null = null;
   let openDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
   let spawnHoldoffUntil = 0;
+  let standbyHoldoffUntil = 0;
   let subscription: RoomSubscriptionHandle | null = null;
 
   /**
@@ -985,6 +994,41 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
       .catch((err) => log({ lvl: 'warn', kind: 'relay.lease-check-failed', room: roomId, pid, meta: { error: String(err) } }));
   }
 
+  /**
+   * A ticker's standby request, acted on by exactly ONE relay in the room:
+   * every socket that hears it races one `SET NX` on `keys.standby`, and only
+   * the winner spawns. The claim is valued with the incumbent's owner id,
+   * which is how the incumbent tells at exit that its standby is coming, so a
+   * refused spawn DELETES it and the incumbent spawns its own exit successor.
+   * Held off per socket like the lease poll's spawn, because the frame is a
+   * bus message and anyone who can publish can repeat it.
+   */
+  function claimStandby(frame: MetaFrame | null): void {
+    const request = standbyRequestOf(frame);
+    if (request === undefined || closed) return;
+    const now = Date.now();
+    if (now < standbyHoldoffUntil) return;
+    standbyHoldoffUntil = now + spawnHoldoffMs;
+    redis
+      .set(keys.standby, request.owner, 'PX', request.claimMs, 'NX')
+      .then((won: unknown) => {
+        if (won !== 'OK') return;
+        Promise.resolve()
+          .then(() => spawnTicker(roomId, { standby: true }))
+          .catch((err) => {
+            log({
+              lvl: 'error',
+              kind: 'relay.spawn-failed',
+              room: roomId,
+              pid,
+              meta: { error: String(err), outcome: 'rejected-before-ack', standby: true },
+            });
+            redis.del(keys.standby).catch(() => undefined);
+          });
+      })
+      .catch((err) => log({ lvl: 'warn', kind: 'relay.lease-check-failed', room: roomId, pid, meta: { error: String(err), standby: true } }));
+  }
+
   function scheduleTickerCheck(): void {
     if (closed) return;
     // A JITTERED interval, not merely a periodic one, and the jitter is the
@@ -1186,6 +1230,12 @@ export function attachRelay(opts: RelayOptions): RelayHandle {
     if (frameType === DEPTH_FRAME) {
       const lead = depthFor(frame, pid);
       if (lead !== undefined && socket.readyState === WS_OPEN) rawSend(encodeInputLead(lead));
+      return;
+    }
+    // THE STANDBY REQUEST IS CONSUMED HERE AND NEVER FORWARDED: it is the
+    // ticker asking the room's relays for its successor. See `claimStandby`.
+    if (frameType === STANDBY_FRAME) {
+      claimStandby(frame);
       return;
     }
     // The other five library frames are per-socket and this relay is the only

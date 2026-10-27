@@ -98,6 +98,26 @@ export const ROOM_REJECT_FRAME = 'room-reject';
 export const DEPTH_FRAME = 'depth';
 
 /**
+ * The ticker publishes `{ t: 'standby', o, ms }` on the roster channel when it
+ * wants its STANDBY successor and was told to ask the relays for it rather
+ * than spawning one itself (`TickerOptions.standbyVia: 'relay'`). `o` is the
+ * incumbent's lease owner id and `ms` how long the claim lives. Every relay
+ * that receives it races one `SET {room}:standby o PX ms NX`, and only the
+ * winner spawns, so the request is acted on exactly once however many sockets
+ * the room has. The frame itself is never forwarded to a client.
+ *
+ * WHY A RELAY: a platform that counts how deep a chain of a deployment calling
+ * itself runs refuses the chain past a few hops (Vercel answers 508 at about
+ * the sixth), and a ticker spawning its own successor IS that chain, one hop
+ * deeper on every handoff. A relay's invocation descends from a browser's
+ * request, so the ticker it spawns is always the second hop.
+ */
+export const STANDBY_FRAME = 'standby';
+
+/** The longest claim a standby request may ask for, so a forged frame cannot park the claim key for a whole state TTL. */
+export const STANDBY_CLAIM_MAX_MS = 120_000;
+
+/**
  * How often the ticker publishes `DEPTH_FRAME`, and why once a second. The
  * client corrects its lead at most once per `REANCHOR_MIN_INTERVAL_MS` (2000)
  * and against an EMA, so a faster frame buys it nothing it can act on; and
@@ -162,6 +182,12 @@ export interface DepthFrame {
   d: Record<string, number>;
 }
 
+export interface StandbyFrame {
+  t: typeof STANDBY_FRAME;
+  o: string;
+  ms: number;
+}
+
 export interface InputLeadFrame {
   t: typeof SERVER_FRAMES.inputLead;
   lead: number;
@@ -218,4 +244,22 @@ export function depthFor(msg: unknown, pid: string): number | undefined {
   if (!Object.prototype.hasOwnProperty.call(f.d, pid)) return undefined;
   const lead = (f.d as Record<string, unknown>)[pid];
   return typeof lead === 'number' && Number.isFinite(lead) ? lead : undefined;
+}
+
+export function encodeStandbyRequest(owner: string, claimMs: number): string {
+  return JSON.stringify({ t: STANDBY_FRAME, o: owner, ms: claimMs } satisfies StandbyFrame);
+}
+
+/**
+ * The standby request a roster frame carries, or `undefined` when it is not
+ * one. A BUS FRAME IS A CLAIM, so the owner has to be a non-empty string of
+ * key-safe length and the claim a positive integer no longer than
+ * `STANDBY_CLAIM_MAX_MS`.
+ */
+export function standbyRequestOf(msg: unknown): { owner: string; claimMs: number } | undefined {
+  if (typeof msg !== 'object' || msg === null) return undefined;
+  const f = msg as { t?: unknown; o?: unknown; ms?: unknown };
+  if (f.t !== STANDBY_FRAME || typeof f.o !== 'string' || f.o.length === 0 || f.o.length > 256) return undefined;
+  if (typeof f.ms !== 'number' || !Number.isInteger(f.ms) || f.ms <= 0 || f.ms > STANDBY_CLAIM_MAX_MS) return undefined;
+  return { owner: f.o, claimMs: f.ms };
 }

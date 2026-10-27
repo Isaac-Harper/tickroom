@@ -256,6 +256,17 @@ Rules. The trap each one guards against is often a gotcha below.
   successor exits minutes later; a rejected standby does not suppress the exit
   spawn, and a STANDBY spawn answered inside `SPAWN_ACK_MS` is treated as a
   rejection for the same reason: the standby cannot have reached its poll yet.
+- A TICKER NEVER SPAWNS ITS OWN STANDBY ON A PLATFORM THAT COUNTS HOPS. A
+  function calling its own deployment is a chain, one hop deeper per call, and
+  Vercel refuses it with a 508 at about the sixth hop; a ticker-issued standby
+  added a hop per handoff, and a real deployment went cold on every fourth
+  planned handoff, strictly periodic. On `standbyVia: 'relay'` the incumbent
+  publishes `STANDBY_FRAME`, every relay races one `SET NX` on `keys.standby`,
+  and only the winner spawns, as the second hop of a chain that starts at a
+  browser. THE CLAIM IS THE RECEIPT: the incumbent skips its exit spawn only for
+  a claim holding its OWN owner id, a refused relay spawn deletes the claim, and
+  a frame nobody claimed leaves none, so neither can leave the room dark at the
+  cap. The exit spawn stays the ticker's, at most the third hop.
 - THE INPUT WINDOW IS PUSHED NEWEST FIRST, but only after the first consume,
   because before then the ahead bound has no consumer floor and the first push
   establishes the reference itself. Two regimes, cleanly separated. A `-1`

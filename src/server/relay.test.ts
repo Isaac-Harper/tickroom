@@ -10,11 +10,15 @@ import {
   RELAY_EXPIRY_LEAD_MS,
   JOIN_HEARTBEAT_MS,
   encodeDepth,
+  encodeStandbyRequest,
+  STANDBY_CLAIM_MAX_MS,
   type ClientInput,
   type RoomEnvelope,
+  type RoomRuntime,
 } from '../core/index.js';
 import { MemoryRedis as FakeRedis } from './memoryRedis.js';
 import { attachRelay, checkAdmission, DEFAULT_LIVENESS_TIMEOUT_MS } from './relay.js';
+import { runTicker } from './ticker.js';
 import { MockSocket } from '../../tests/helpers/mockSocket.js';
 
 const NS = 'test';
@@ -1144,6 +1148,123 @@ describe('attachRelay', () => {
       expect(socket.sent).toHaveLength(1);
       expect(Buffer.isBuffer(socket.sent[0])).toBe(true);
       expect(Buffer.from(socket.sent[0] as Buffer).equals(snapshot)).toBe(true);
+    });
+  });
+
+  // B4c. A ticker asking the room's relays for its standby successor: the
+  // frame reaches every socket in the room, and exactly one of them may act.
+  describe('the standby request is claimed by exactly one relay, and never forwarded', () => {
+    async function room(count: number, overrides: Partial<Parameters<typeof attachRelay>[0]> = {}) {
+      const redis = new FakeRedis();
+      // A live incumbent holds the lease, as it does when it asks for a
+      // standby, so the lease poll spawns nothing and every call seen below is
+      // the standby path's.
+      await redis.set(roomKeys('r1', NS).lease, 'r1:incumbent', 'PX', 60_000);
+      const createSubscriber = () => redis.fork();
+      const relays = [];
+      for (let i = 0; i < count; i++) {
+        const { socket, spawnTicker, opts } = baseOptions({ livenessTimeoutMs: 10_000, ...overrides });
+        const handle = attachRelay({ ...opts, redis, createSubscriber, pid: `p${i}` });
+        relays.push({ socket, spawnTicker, handle });
+      }
+      await new Promise((r) => setTimeout(r, 10));
+      for (const r of relays) r.socket.sent.length = 0;
+      return { redis, relays, keys: roomKeys('r1', NS) };
+    }
+
+    it('one spawn with standby set across five sockets, the claim valued with the requesting owner, nothing forwarded', async () => {
+      const { redis, relays, keys } = await room(5);
+      await redis.publish(keys.metaout, encodeStandbyRequest('r1:owner-a', 5000));
+      await new Promise((r) => setTimeout(r, 10));
+
+      const calls = relays.flatMap((r) => r.spawnTicker.mock.calls);
+      expect(calls).toEqual([['r1', { standby: true }]]);
+      expect(await redis.get(keys.standby)).toBe('r1:owner-a');
+      for (const r of relays) expect(r.socket.sent).toHaveLength(0);
+      for (const r of relays) r.handle.close();
+    });
+
+    it('a REFUSED standby spawn drops the claim, so the incumbent sees no standby and spawns its exit successor', async () => {
+      const log = vi.fn();
+      const { redis, relays, keys } = await room(3, { log });
+      for (const r of relays) r.spawnTicker.mockRejectedValue(new Error('spawn answered 508'));
+      await redis.publish(keys.metaout, encodeStandbyRequest('r1:owner-b', 5000));
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(relays.flatMap((r) => r.spawnTicker.mock.calls)).toHaveLength(1);
+      expect(await redis.get(keys.standby)).toBe(null);
+      const failed = log.mock.calls.filter((c) => c[0]?.kind === 'relay.spawn-failed');
+      expect(failed).toHaveLength(1);
+      expect(failed[0][0].meta.standby).toBe(true);
+      for (const r of relays) r.handle.close();
+    });
+
+    it('END TO END with a real ticker: its standby request reaches three relays and exactly one spawns it, and the incumbent hands over without an exit spawn', async () => {
+      const redis = new FakeRedis();
+      const createSubscriber = () => redis.fork();
+      const relays = [];
+      for (let i = 0; i < 3; i++) {
+        const { spawnTicker, opts } = baseOptions({ livenessTimeoutMs: 10_000, tickerCheckMs: 60_000 });
+        relays.push({ spawnTicker, handle: attachRelay({ ...opts, redis, createSubscriber, pid: `p${i}` }) });
+      }
+      const spawnSuccessor = vi.fn().mockResolvedValue(undefined);
+      const runtime: RoomRuntime<{ tick: number }, never> = {
+        tickHz: 50,
+        create: () => ({ tick: 0 }),
+        tick: (st) => void (st.tick += 1),
+        currentTick: (st) => st.tick,
+        playerCount: () => 1,
+        join: () => {},
+        leave: () => {},
+        applyInput: () => {},
+        serialize: (st) => JSON.stringify(st),
+        deserialize: (json) => JSON.parse(json) as { tick: number },
+        encodeSnapshot: (st) => JSON.stringify(st),
+      };
+
+      const result = await runTicker({
+        runtime,
+        redis,
+        createSubscriber,
+        roomId: 'r1',
+        namespace: NS,
+        maxRunMs: 400,
+        standbyLeadMs: 300,
+        emptyGraceMs: 100_000,
+        standbyVia: 'relay',
+        spawnSuccessor,
+        log: () => {},
+      });
+
+      expect(result.reason).toBe('duration');
+      const standbySpawns = relays.flatMap((r) => r.spawnTicker.mock.calls.filter((c) => c[1]?.standby === true));
+      expect(standbySpawns).toEqual([['r1', { standby: true }]]);
+      expect(spawnSuccessor).not.toHaveBeenCalled();
+      for (const r of relays) r.handle.close();
+    });
+
+    it('a malformed or oversized request spawns nothing and is not forwarded either', async () => {
+      const { redis, relays, keys } = await room(2);
+      await redis.publish(keys.metaout, JSON.stringify({ t: 'standby', o: '', ms: 5000 }));
+      await redis.publish(keys.metaout, JSON.stringify({ t: 'standby', o: 'r1:x', ms: STANDBY_CLAIM_MAX_MS + 1 }));
+      await redis.publish(keys.metaout, JSON.stringify({ t: 'standby', o: 'r1:x', ms: 1.5 }));
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(relays.flatMap((r) => r.spawnTicker.mock.calls)).toHaveLength(0);
+      for (const r of relays) expect(r.socket.sent).toHaveLength(0);
+      for (const r of relays) r.handle.close();
+    });
+
+    it('a repeated request inside the hold-off is not acted on twice by the same socket', async () => {
+      const { redis, relays, keys } = await room(1);
+      await redis.publish(keys.metaout, encodeStandbyRequest('r1:owner-c', 5000));
+      await new Promise((r) => setTimeout(r, 5));
+      await redis.del(keys.standby);
+      await redis.publish(keys.metaout, encodeStandbyRequest('r1:owner-d', 5000));
+      await new Promise((r) => setTimeout(r, 5));
+
+      expect(relays[0]!.spawnTicker).toHaveBeenCalledTimes(1);
+      relays[0]!.handle.close();
     });
   });
 

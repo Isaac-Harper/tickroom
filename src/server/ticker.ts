@@ -22,6 +22,8 @@ import {
   PRESENCE_TIMEOUT_HEARTBEATS,
   DEPTH_INTERVAL_MS,
   encodeDepth,
+  encodeStandbyRequest,
+  STANDBY_CLAIM_MAX_MS,
   packCheckpoint,
   inspectCheckpoint,
   PlayoutBuffer,
@@ -352,6 +354,32 @@ export interface TickerOptions<TState, TEvent> {
    * spawn already uses: a room with nobody in it does not need a handoff.
    */
   standbyLeadMs?: number | undefined;
+  /**
+   * WHO ISSUES THE STANDBY SPAWN. `'ticker'` (the default) calls
+   * `spawnSuccessor(roomId, { standby: true })` from this loop. `'relay'`
+   * publishes a `STANDBY_FRAME` on the roster channel instead, and the one
+   * relay that wins the `NX` claim on `keys.standby` spawns it through its own
+   * `spawnTicker(roomId, { standby: true })`; the exit spawn stays this
+   * ticker's either way.
+   *
+   * IT EXISTS FOR A PLATFORM THAT LIMITS A CHAIN OF A DEPLOYMENT CALLING
+   * ITSELF. A ticker spawning its successor is one hop deeper than the ticker
+   * that spawned it, so every planned handoff adds a hop, and Vercel refuses
+   * the chain with a 508 at about the sixth: measured on a real deployment as
+   * a cold start on every fourth handoff, strictly periodic. A relay's
+   * invocation descends from a browser's request, so a relay-issued standby is
+   * always the second hop and the chain never grows. `adapters/vercel.ts`
+   * defaults to `'relay'`; a host on a platform with no such limit has no
+   * reason to move off `'ticker'`.
+   *
+   * The two handoff flags keep their meaning: the standby counts as spawned
+   * from the moment the frame is published, and at a `'duration'` exit this
+   * ticker reads the claim back (bounded) and spawns its exit successor
+   * unless a relay holds a claim for THIS ticker's request. A relay deletes
+   * its claim when its spawn is refused, and a frame nobody claimed leaves
+   * none, so neither suppresses the exit spawn.
+   */
+  standbyVia?: 'ticker' | 'relay' | undefined;
 }
 
 /**
@@ -503,6 +531,9 @@ const CRASH_RECORD_TIMEOUT_MS = 500;
  */
 export const EXIT_SPAWN_WAIT_MS = 3500;
 
+/** How long a relay's standby claim outlives the lead it was requested with: the incumbent's final checkpoint, release and claim read, with a wide margin. */
+const STANDBY_CLAIM_SLACK_MS = 30_000;
+
 /**
  * How often the input subscription is probed, and how long it may go
  * unanswered before it is declared dead.
@@ -603,6 +634,7 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
     presenceTimeoutMs = DEFAULT_PRESENCE_TIMEOUT_MS,
     standbyMs = 0,
     standbyLeadMs = DEFAULT_STANDBY_LEAD_MS,
+    standbyVia = 'ticker',
   } = opts;
 
   // THE LIFETIME CLOCK, AND IT STARTS AT INVOCATION ENTRY RATHER THAN AT THE
@@ -617,6 +649,9 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
   const keys = roomKeys(roomId, namespace);
   const tickMs = 1000 / runtime.tickHz;
   const owner = `${roomId}:${randomUUID()}`;
+  // The claim has to outlive the lead and this ticker's own exit, which reads
+  // it back; the exit deletes it, so the TTL is only the belt.
+  const standbyClaimMs = Math.min(STANDBY_CLAIM_MAX_MS, Math.ceil(standbyLeadMs) + STANDBY_CLAIM_SLACK_MS);
   const renewEveryMs = leaseRenewMs ?? LEASE_RENEW_MS;
   // A TOLERANCE IS A TIME, SO IT IS SIZED AS ONE. `PLAYOUT_MAX_AHEAD` is 40,
   // chosen as two seconds at 20Hz, and it silently stops being two seconds the
@@ -2911,7 +2946,7 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
       // exit spawn is both the right answer and the only sensible one.
       if (
         !standbyRequested &&
-        spawnSuccessor !== undefined &&
+        (standbyVia === 'relay' || spawnSuccessor !== undefined) &&
         standbyLeadMs < maxRunMs &&
         playersNow > 0 &&
         now - startedAt >= maxRunMs - standbyLeadMs
@@ -2947,15 +2982,29 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
         // duration exit becomes 'error'. That costs the room its final
         // checkpoint and its successor and increments the crash counter, all
         // for a bug in the host's spawn call rather than in the room.
-        Promise.resolve()
-          .then(() => spawnSuccessor(roomId, { standby: true }))
-          .then(() => {
-            standbySpawned = true;
-          })
-          .catch((err) => {
-            standbySpawned = false;
-            log({ lvl: 'error', kind: 'ticker.spawn-failed', room: roomId, meta: { error: String(err), standby: true } });
-          });
+        if (standbyVia === 'relay') {
+          // ASKED OF THE RELAYS, NOT SPAWNED FROM HERE: see `standbyVia`. Not
+          // awaited, like every other publish in this loop. A publish that
+          // fails reached no relay, so it is a refusal exactly as a rejected
+          // spawn is; one that lands and is never claimed is caught at exit.
+          redis
+            .publish(keys.metaout, encodeStandbyRequest(owner, standbyClaimMs))
+            .catch((err) => {
+              standbySpawned = false;
+              log({ lvl: 'error', kind: 'ticker.spawn-failed', room: roomId, meta: { error: String(err), standby: true, via: 'relay' } });
+            });
+        } else {
+          const spawn = spawnSuccessor!;
+          Promise.resolve()
+            .then(() => spawn(roomId, { standby: true }))
+            .then(() => {
+              standbySpawned = true;
+            })
+            .catch((err) => {
+              standbySpawned = false;
+              log({ lvl: 'error', kind: 'ticker.spawn-failed', room: roomId, meta: { error: String(err), standby: true } });
+            });
+        }
       }
 
       // 12. exit conditions (a confirmed lease loss is checked earlier, before
@@ -3155,6 +3204,27 @@ export async function runTicker<TState, TEvent>(opts: TickerOptions<TState, TEve
       remaining = runtime.playerCount(state);
     } catch {
       remaining = 0;
+    }
+    // A RELAY-ISSUED STANDBY IS CONFIRMED BY ITS CLAIM, read back here because
+    // nothing else reports it to this ticker: a claim holding THIS ticker's
+    // owner id is a relay that spawned the standby and was not refused. No
+    // claim (a frame nobody received, a spawn a relay saw refused) means no
+    // standby, and the exit spawn below goes out. Bounded like every other
+    // wait in this block, and the claim is cleared once read so the next
+    // incumbent's request finds the key free.
+    if (standbyVia === 'relay' && standbySpawned && exitReason === 'duration') {
+      const claim = await Promise.race([redis.get(keys.standby).catch(() => null), sleep(CRASH_RECORD_TIMEOUT_MS).then(() => null)]);
+      if (claim === owner) {
+        redis.del(keys.standby).catch(() => undefined);
+      } else {
+        standbySpawned = false;
+        log({
+          lvl: 'error',
+          kind: 'ticker.spawn-failed',
+          room: roomId,
+          meta: { error: 'no relay holds a claim on this standby request', standby: true, via: 'relay' },
+        });
+      }
     }
     const alreadyHandedOver = standbySpawned && exitReason === 'duration';
     if (remaining > 0 && spawnSuccessor && exitReason !== 'error' && !alreadyHandedOver) {

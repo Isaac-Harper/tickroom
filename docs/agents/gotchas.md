@@ -243,11 +243,24 @@ is. Generate such an id PER INVOCATION, inside the handler.
 VERCEL AUTHENTICATION BLOCKS THE RELAY'S OWN TICKER SPAWN, AND THE ONLY SYMPTOM IS
 SILENCE. Deployment Protection is on by default and guards EVERY request to the
 deployment including one function calling another, so the spawn gets an SSO
-redirect. The spawn is caught and discarded by design, so nothing errors: a socket
-opens, the player joins, the roster seeds, and the room sits in perfect silence
-with no `/api/ticker` line in the invocation log at all. That ABSENCE is the whole
-signal. Turn Protection off, or set `VERCEL_AUTOMATION_BYPASS_SECRET` and send it
-on the spawn.
+redirect. Up to 1.3.0 that answer resolved the spawn, so nothing errored: a socket
+opened, the player joined, the roster seeded, and the room sat in perfect silence
+with no `/api/ticker` line in the invocation log at all, that ABSENCE being the
+whole signal. Since 1.4.0 any non-2xx inside the receipt rejects and
+`relay.spawn-failed` names the status. Turn Protection off, or set
+`VERCEL_AUTOMATION_BYPASS_SECRET` and send it on the spawn.
+
+VERCEL'S LOOP PROTECTION CUT THE STANDBY CHAIN, AND A NON-2XX THAT RESOLVED HID
+THE FALLBACK FAILING TOO. On a real deployment (`maxDurationS` 60, fourteen
+handoffs) the log ran one cold ticker, three standby handoffs, then
+`ticker.spawn-failed: standby spawn answered 508`, five cycles in a row: each
+ticker-spawned standby was one hop deeper than the ticker before it, and the
+platform refuses a function calling its own deployment at about the sixth. The
+exit spawn then hit the same 508 and resolved as the route's answer, so nothing
+said so, and the room waited for a relay's lease poll: a 135 to 350ms snapshot
+gap that re-anchored the client past `PLAYHEAD_SNAP_TICKS` and snapped the own
+timeline. The hop count is not documented beyond the error code; a browser's
+request starts a fresh chain, which is why the relays issue the standby now.
 
 UPSTASH'S `CLIENT LIST` CARRIES NO SUBSCRIBE-MODE FIELDS, so a count of lines
 matching a subscribe flag reads ZERO while a ticker subscriber and one per relay

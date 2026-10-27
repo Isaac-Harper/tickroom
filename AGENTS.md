@@ -29,8 +29,8 @@ or anything realtime where several clients need to agree on state changing many
 times a second.
 
 PUBLIC repo, MIT licensed, and PUBLISHED TO NPM as `tickroom`
-(`npm install tickroom ioredis`). `package.json` says 1.3.0 and this tree IS
-1.3.0: `CHANGELOG.md` is the record of what each release carries; its "Migrating from 0.3" list is still the break-by-break
+(`npm install tickroom ioredis`). `package.json` says 1.4.0 and this tree IS
+1.4.0: `CHANGELOG.md` is the record of what each release carries; its "Migrating from 0.3" list is still the break-by-break
 guide for anyone coming off the 0.x line.
 
 RELEASES GO OUT FROM A VERSION TAG through `.github/workflows/release.yml`
@@ -130,9 +130,9 @@ is documented at its own declaration.
 
 - `src/core/types.ts` - THE CONTRACT: `RoomRuntime`, `RoomEnvelope`, `ClientInput`, `CheckpointEnvelope`, `RoomStats`, `Logger`. Change only with a very good reason; `gridAt` is optional and additive.
 - `src/core/log.ts` - `LOG_KINDS` and `LogKind`; `log.test.ts` proves the converse of `tsc`. ADD THE KIND HERE FIRST, THEN EMIT IT.
-- `src/core/wire.ts` - THE CONTROL-PLANE CONTRACT both ends import: `CLOSE_CODES` (4001 to 4004, only 4004 non-terminal), `SERVER_FRAMES`, `CLIENT_FRAMES`, `ROOM_REJECT_FRAME`, `DEPTH_FRAME`, the ping, expiry and presence constants, and `depthFor` (own properties and finite numbers only).
+- `src/core/wire.ts` - THE CONTROL-PLANE CONTRACT both ends import: `CLOSE_CODES` (4001 to 4004, only 4004 non-terminal), `SERVER_FRAMES`, `CLIENT_FRAMES`, `ROOM_REJECT_FRAME`, `DEPTH_FRAME`, `STANDBY_FRAME`, the ping, expiry and presence constants, and `depthFor` / `standbyRequestOf` (own properties, finite and bounded numbers only).
 - `src/core/redisLike.ts` - the structural Redis interface and THE SUPPORTED SWAP POINT; optional `on`/`off` lets the ticker detach on `'reconnecting'`.
-- `src/core/ids.ts` - `roomKeys` (NINE suffixes, `KEY_SUFFIXES` the one list), `normalizeRoomId`, `normalizeBase`. A TRUST BOUNDARY: the value lands in key names.
+- `src/core/ids.ts` - `roomKeys` (TEN suffixes, `KEY_SUFFIXES` the one list), `normalizeRoomId`, `normalizeBase`. A TRUST BOUNDARY: the value lands in key names.
 - `src/core/lease.ts` - the exactly-one-writer lease and the `OwnershipClock` two-clock rule. The single most safety-critical file.
 - `src/core/checkpoint.ts` - the envelope grammar, pure; `inspectCheckpoint` says WHY it refused, `unpackCheckpoint` throws that away.
 - `src/core/playout.ts` - `PlayoutBuffer`: never-drop-late re-stamping, `aheadBase`, `PushResult` with separate `late` and `refused` counters.
@@ -145,8 +145,8 @@ is documented at its own declaration.
 - `src/server/redis.ts` - ioredis factories. The shared client has `commandTimeout: 2000`, the SUBSCRIBER deliberately none; read `tests/subscriber.redis.test.ts` before touching `createSubscriber`.
 - `src/server/session.ts` - HMAC tokens, and room-bound spawn tokens valid for TWO windows of `SPAWN_TOKEN_WINDOW_MS`.
 - `src/server/admission.ts` - `admitSocket`, `registerConnection`, `refuseSocket` (two latches). The per-subject cap is SOFT by two round trips.
-- `src/server/ticker.ts` - THE CORE, `runTicker`; read it slowly. `guardHost`, grid-time `serverTime`, `queueCheckpoint`, `abandonSetup`, `reconcileMembership`, the acquire recovery, the `room-reject` budget, the depth frame. `EXIT_SPAWN_WAIT_MS` (3500) is coupled to the adapter's `SPAWN_ACK_MS` (3000).
-- `src/server/relay.ts` - `attachRelay`, `checkAdmission`: one socket to the bus. Ping by literal prefix, `joinFragments`, the roster ALLOWLIST, 4004 never 1006, `relay.gaps`.
+- `src/server/ticker.ts` - THE CORE, `runTicker`; read it slowly. `guardHost`, grid-time `serverTime`, `queueCheckpoint`, `abandonSetup`, `reconcileMembership`, the acquire recovery, the `room-reject` budget, the depth frame, `standbyVia` (`'relay'` publishes `STANDBY_FRAME` and reads the claim back at exit). `EXIT_SPAWN_WAIT_MS` (3500) is coupled to the adapter's `SPAWN_ACK_MS` (3000).
+- `src/server/relay.ts` - `attachRelay`, `checkAdmission`: one socket to the bus. Ping by literal prefix, `joinFragments`, the roster ALLOWLIST, 4004 never 1006, `relay.gaps`, and `claimStandby` (one `SET NX` claim, so exactly one relay spawns a ticker's standby).
 - `src/server/roomSubscriber.ts` - ONE SUBSCRIBER PER ROOM PER PROCESS, reference counted: delivery, the shared SUBSCRIBE ack, the resubscribe, error counting, the self-probe. Keyed on the `createSubscriber` reference too; `sharedSubscriber: false` is the escape hatch.
 - `src/server/memoryRedis.ts` - THE IN-MEMORY REDIS, AND IT SHIPS, exported twice (the `tickroom/server/memoryRedis` subpath has no ioredis import). FOUR DELIBERATE GAPS.
 - `src/server/balancer.ts` - `assignRoom`; every-instance-excluded is an ORDINARY outcome.
@@ -165,7 +165,7 @@ is documented at its own declaration.
 - `src/codec/bytes.ts` - `ByteWriter`/`ByteReader`, BOTH TRUST BOUNDARIES (refuse, never wrap; any `ArrayBufferView`), and `ProtocolVersionError`, duck-typed BY NAME.
 - `src/codec/quantize.ts` - clamping helpers, `representableRange`, `CM_SCALE`; `quantize` throws on NaN.
 - `src/codec/snapshot.ts` - the default codec and input window; `decodeInputAuto` is THE ONE DECODER FOR BOTH INPUT WIRES and never throws.
-- `src/adapters/vercel.ts` - route factories by INJECTION; `createRoom` IS THE PRIMARY ENTRY POINT; `maxDurationS` ties the lifetimes to the platform cap; `deliverSpawn`; the session route is the fourth piece.
+- `src/adapters/vercel.ts` - route factories by INJECTION; `createRoom` IS THE PRIMARY ENTRY POINT; `maxDurationS` ties the lifetimes to the platform cap; `standbyVia: 'relay'` by default; `deliverSpawn` rejects any non-2xx inside the receipt; the session route is the fourth piece.
 - `src/adapters/node.ts` - the same core behind `ws`; imports server modules directly, never the barrel, nothing from the other adapter; `requireBothOrNeither`.
 - `src/testing/lockstep.ts` - `runLockstep`/`sweepLockstep`: a host's runtime against its own step, server half MIRRORING `ticker.ts`, options mirroring `predict`. No node builtin.
 
@@ -201,6 +201,7 @@ often a gotcha.
 - EVERY EXIT FROM THE TICK LOOP NAMES ITSELF; a lost lease has two finders that both set it, and a CONFIRMED LOSS IS CHECKED BEFORE THE PUBLISH BLOCK.
 - THE INVOCATION'S LIFETIME IS MEASURED FROM INVOCATION ENTRY; only ownership is dated from the acquire.
 - `standbyMs` MUST EXCEED `standbyLeadMs` plus the incumbent's exit and fit inside `maxRunMs`; `standbySpawned` is set on ISSUE, cleared on REJECT.
+- A TICKER NEVER SPAWNS ITS OWN STANDBY WHERE THE PLATFORM COUNTS HOPS: on `standbyVia: 'relay'` exactly one relay (the `NX` claim) spawns it, and the incumbent trusts only a claim holding its OWN owner id.
 
 **Checkpoints and the timeline**
 
@@ -326,7 +327,8 @@ Traps rather than rules: shapes that look right and are not. One line each here;
 - A COLD START SAYS SO NOW (`ticker.fresh`).
 - A FRAGMENTED FRAME IS THE RELAY'S PROBLEM (`joinFragments`).
 - FLUID COMPUTE CAN RUN THE STANDBY IN THE INCUMBENT'S CONTAINER: generate an instance id PER INVOCATION.
-- VERCEL AUTHENTICATION BLOCKS THE RELAY'S OWN TICKER SPAWN, AND THE ONLY SYMPTOM IS SILENCE.
+- VERCEL AUTHENTICATION BLOCKS THE RELAY'S OWN TICKER SPAWN; since 1.4.0 the 403 is a logged `relay.spawn-failed`, before that it was silence.
+- VERCEL'S LOOP PROTECTION CUTS A TICKER-SPAWNS-TICKER CHAIN WITH A 508 AT ABOUT THE SIXTH HOP: every fourth planned handoff went cold. Relays issue the standby.
 - UPSTASH'S `CLIENT LIST` CARRIES NO SUBSCRIBE-MODE FIELDS; read `INFO clients`.
 - A HOST CALIBRATION TAKEN AT MODULE LOAD CAN UNDER-READ THE RUN IT GATES.
 - UNDER `vi.useFakeTimers()`, ANYTHING DOWNSTREAM OF REAL I/O (GZIP INCLUDED) IS TIMESTAMPED NONDETERMINISTICALLY.
@@ -365,10 +367,10 @@ where the bench page lives now.
 
 ## Status
 
-On the 1.3.0 tree: `test:unit` **1219 across 34 files** (Redis pointed at an
-unused port), `test:integration` **1267 across 43** (Redis on 6399),
+On the 1.4.0 tree: `test:unit` **1232 across 34 files** (Redis pointed at an
+unused port), `test:integration` **1280 across 43** (Redis on 6399),
 `test:measure` **16 across 4** (not re-run since it was last touched), `npm test`
-**1283 across 47**; typecheck and build clean. PUBLISHED to npm and measured on a
+**1296 across 47**; typecheck and build clean. PUBLISHED to npm and measured on a
 real Vercel deployment (`docs/VERIFICATION.md`), never yet under production
 traffic. Long runs happen on the fw13 server. IF YOU ARE UPDATING STATUS, UPDATE
 EVERY PLACE THAT STATES IT, here and in

@@ -5,6 +5,45 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-10-27
+
+A planned handoff on Vercel no longer degrades to a cold start every fourth
+time, and a spawn the platform refuses is never silent.
+
+### Fixed
+
+- The standby successor is issued by a RELAY on the Vercel adapter. A ticker
+  spawning its own successor is a function calling its own deployment one hop
+  deeper per handoff, and Vercel refuses that chain with `508
+  INFINITE_LOOP_DETECTED` at about the sixth hop: measured on a real deployment
+  as one cold ticker, three standby handoffs and then
+  `ticker.spawn-failed: standby spawn answered 508`, five cycles in a row, with
+  every fourth planned handoff falling back to a relay-poll cold start and a
+  135 to 350ms snapshot gap. A relay's invocation descends from a browser's
+  request, so the standby it spawns is always the second hop.
+- An EXIT spawn (and a relay's lease-poll spawn) answered with a non-2xx inside
+  `SPAWN_ACK_MS` now rejects, so `ticker.spawn-failed` / `relay.spawn-failed`
+  names the status. It used to resolve as the route's own answer: the 508 that
+  refused the exit spawn above, and a 403 from Deployment Protection, logged
+  nothing at all. A 2xx (a route that lost the acquire race answers 200
+  `busy`) still resolves.
+
+### Added
+
+- `TickerOptions.standbyVia: 'ticker' | 'relay'` (default `'ticker'`;
+  `createTickerRoute` defaults it to `'relay'`). On `'relay'` the incumbent
+  publishes `STANDBY_FRAME` (`{ t: 'standby', o, ms }`) on the roster channel;
+  every relay that hears it races `SET {room}:standby o PX ms NX`, only the
+  winner calls `spawnTicker(roomId, { standby: true })`, and the frame is never
+  forwarded to a client. A refused spawn deletes the claim, and at a
+  `'duration'` exit the incumbent reads the claim back and spawns its exit
+  successor unless the claim holds its own owner id.
+- `RelayOptions.spawnTicker(roomId, opts?)`: `opts.standby` is set for a
+  claimed standby request. A host implementation that ignores the second
+  argument still compiles.
+- `roomKeys(...).standby`, the tenth key suffix. `STANDBY_FRAME`,
+  `STANDBY_CLAIM_MAX_MS` and `StandbyFrame` in `tickroom/core`.
+
 ## [1.3.0] - 2026-10-27
 
 A prediction that connects onto something moving can be exact from its first

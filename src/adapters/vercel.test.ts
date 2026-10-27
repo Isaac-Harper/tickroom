@@ -66,6 +66,7 @@ import {
   RELAY_EXIT_MARGIN_MS,
   SPAWN_ACK_MS,
   SPAWN_DELIVERED,
+  deliverSpawn,
   STANDBY_WAIT_MS,
   TICKER_EXIT_MARGIN_MS,
   createBalancerRoute,
@@ -496,18 +497,44 @@ describe('createTickerRoute', () => {
     expect(EXIT_SPAWN_WAIT_MS - SPAWN_ACK_MS).toBeGreaterThanOrEqual(500);
   });
 
-  it('a status answered QUICKLY is handed back as the route\'s own answer, unread and unwaited', async () => {
-    // Deployment Protection answers one function calling another with an SSO
-    // redirect rather than a 200, and it answers AT ONCE. That is a real
-    // response, so it resolves exactly as it always has (this spawn has never
-    // read a status); what it must not do is spend the receipt window on it.
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('forbidden', { status: 403 })));
+  it('an EXIT spawn answered with a non-2xx inside the receipt window REJECTS, so ticker.spawn-failed fires', async () => {
+    // Measured on a real deployment: Vercel's loop protection refused the exit
+    // spawn with a 508, this resolved it as the route's own answer, and the
+    // room waited for a relay's lease poll with nothing logged anywhere. A 403
+    // from Deployment Protection was the same silence. Each is a ticker that
+    // never started.
+    for (const status of [508, 403, 500]) {
+      mocks.runTicker.mockClear();
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('refused', { status })));
+      await callTicker(tickerRouteWith());
+      vi.useFakeTimers(); // no timer is advanced below: the answer alone settles it
+      await expect(tickerOptionsPassed().spawnSuccessor('lobby', { standby: false })).rejects.toThrow(String(status));
+      vi.useRealTimers();
+    }
+  });
+
+  it('CONTROL: an EXIT spawn answered 200 at once (a route that lost the acquire race) still resolves with the answer', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('busy', { status: 200 })));
     await callTicker(tickerRouteWith());
 
-    vi.useFakeTimers(); // no timer is advanced below: the answer alone settles it
+    vi.useFakeTimers();
     const answer: unknown = await tickerOptionsPassed().spawnSuccessor('lobby', { standby: false });
     expect(answer).toBeInstanceOf(Response);
-    expect((answer as Response).status).toBe(403);
+    expect((answer as Response).status).toBe(200);
+  });
+
+  it('deliverSpawn itself: a 508 rejects on both paths, delivered on neither', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('INFINITE_LOOP_DETECTED', { status: 508 })));
+    await expect(deliverSpawn('https://example.test/api/ticker?room=lobby', false)).rejects.toThrow('508');
+    await expect(deliverSpawn('https://example.test/api/ticker?room=lobby', true)).rejects.toThrow('508');
+  });
+
+  it('hands runTicker standbyVia relay by default, and lets the host keep the ticker-issued standby', async () => {
+    await callTicker(tickerRouteWith());
+    expect(tickerOptionsPassed().standbyVia).toBe('relay');
+    mocks.runTicker.mockClear();
+    await callTicker(tickerRouteWith({ standbyVia: 'ticker' }));
+    expect(tickerOptionsPassed().standbyVia).toBe('ticker');
   });
 
   it('a STANDBY spawn answered inside the receipt window REJECTS, so the exit spawn still fires', async () => {
@@ -810,6 +837,29 @@ describe('createRelayRoute', () => {
     // A poll spawn is one of many losers of an acquire race; it must never
     // ask to be a standby.
     expect(url.searchParams.get('standby')).toBe(null);
+    vi.unstubAllGlobals();
+  });
+
+  it('sets standby=1 on the relay spawn only when the relay claimed a ticker\'s standby request', async () => {
+    const fetchMock = vi.fn().mockReturnValue(new Promise(() => {}));
+    vi.stubGlobal('fetch', fetchMock);
+    await relayRouteWith(new MockSocket())(relayRequest());
+
+    vi.useFakeTimers();
+    const spawn = admitOptionsPassed().relay.spawnTicker('lobby', { standby: true });
+    await vi.advanceTimersByTimeAsync(SPAWN_ACK_MS);
+    await expect(spawn).resolves.toBe(SPAWN_DELIVERED);
+    vi.useRealTimers();
+    const url = new URL(String(fetchMock.mock.calls[0]?.[0]));
+    expect(url.searchParams.get('standby')).toBe('1');
+    expect(verifySpawnToken('lobby', url.searchParams.get('k'), SECRET)).toBe(true);
+    vi.unstubAllGlobals();
+  });
+
+  it('a relay-issued STANDBY answered 508 rejects, which is what makes the relay drop its claim', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('INFINITE_LOOP_DETECTED', { status: 508 })));
+    await relayRouteWith(new MockSocket())(relayRequest());
+    await expect(admitOptionsPassed().relay.spawnTicker('lobby', { standby: true })).rejects.toThrow('508');
     vi.unstubAllGlobals();
   });
 

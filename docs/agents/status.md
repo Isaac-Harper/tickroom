@@ -7,13 +7,13 @@ section", "the Status section" and "the table" mean
 [`gates.md`](gates.md), [`status.md`](status.md) and [`tiers.md`](tiers.md) in
 this directory; "above" and "below" mean wherever that file now is.
 
-MEASURED ON THIS TREE, not estimated, PER TIER, on the 1.3.0 tree:
-`npm run test:unit` is **1219 passed across 34 files** with
+MEASURED ON THIS TREE, not estimated, PER TIER, on the 1.4.0 tree:
+`npm run test:unit` is **1232 passed across 34 files** with
 `TICKROOM_TEST_REDIS_URL` pointed at an unused port (6499), which is the
 no-services promise proved rather than assumed; `npm run test:integration` is
-**1267 across 43** with a local Redis on 6399; `npm run test:measure` is **16
-across 4** on the same Redis and a quiet laptop (not re-run for 1.2.0 or 1.3.0,
-which touched no measurement file); `npm test` is the sum, **1283 across 47**. `npx tsc --noEmit` is clean repo-wide including `examples/`, and
+**1280 across 43** with a local Redis on 6399; `npm run test:measure` is **16
+across 4** on the same Redis and a quiet laptop (not re-run for 1.2.0, 1.3.0 or
+1.4.0, which touched no measurement file); `npm test` is the sum, **1296 across 47**. `npx tsc --noEmit` is clean repo-wide including `examples/`, and
 `npm run build` emits `dist/` cleanly. Roughly 18,700 lines of source and 28,700
 of tests. `README.md`, `AGENTS.md`, the five files under `docs/` and the six
 under `docs/agents/` are the whole of the prose.

@@ -24,7 +24,7 @@ You should see, immediately:
 tickroom node example on http://localhost:3100
 rooms: pong, cursors
 redis: redis://127.0.0.1:6399
-keys:  room:pong:in room:pong:out room:pong:lease room:pong:state room:pong:stats room:pong:meta room:pong:metaout room:pong:crashes room:pong:timeline
+keys:  room:pong:in room:pong:out room:pong:lease room:pong:state room:pong:stats room:pong:meta room:pong:metaout room:pong:crashes room:pong:timeline room:pong:standby
 ticker maxRunMs=700000 standbyMs=0 | relay lifetimeMs=none
 ```
 

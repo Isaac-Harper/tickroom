@@ -53,14 +53,26 @@ server ticks lost per handoff either way; the runs are in
 **Turn Vercel Authentication off, or bypass it on the spawn.** Deployment
 Protection is on by default for a personal project and guards every request to
 the deployment *including one of its own functions calling another*, so it
-answers the relay's fire-and-forget spawn of the ticker route with an SSO
-redirect. That spawn is caught and discarded by design, so nothing anywhere
-errors: a socket opens, the player joins, the roster seeds, and then the room
-sits in perfect silence with no ticker ever started and no `/api/ticker` line in
-the invocation log at all. That absence is the whole signal. Either turn
+answers the relay's spawn of the ticker route with an SSO redirect. Up to 1.3.0
+that answer resolved the spawn, so nothing anywhere errored: a socket opened, the
+player joined, the roster seeded, and then the room sat in perfect silence with
+no ticker ever started and no `/api/ticker` line in the invocation log at all.
+Since 1.4.0 the non-2xx rejects and `relay.spawn-failed` names the status, once
+per hold-off per socket. Either turn
 Protection off, which is the right answer for anything meant to be reachable by
 a browser that has not signed into your Vercel account, or set
 `VERCEL_AUTOMATION_BYPASS_SECRET` and send it on the spawn.
+
+**Vercel's loop protection is why the relays issue the standby.** A function
+calling its own deployment is a chain Vercel refuses with `508
+INFINITE_LOOP_DETECTED` at about the sixth hop, and a ticker spawning its own
+successor added a hop per handoff, so every fourth planned handoff on a real
+deployment fell back to a cold start. `createTickerRoute` passes
+`standbyVia: 'relay'` by default: the incumbent asks the room's relays on the bus
+and exactly one of them spawns the standby, always as the second hop of a chain
+that starts at a browser. Leave it there. A spawn the platform refuses now
+rejects and logs (`ticker.spawn-failed`, `relay.spawn-failed`) rather than
+resolving as the route's answer.
 
 **Fluid compute can run a standby successor in the same container as the
 incumbent**, so an instance id generated at module scope does not mark a

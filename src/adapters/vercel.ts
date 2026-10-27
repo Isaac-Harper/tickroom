@@ -199,12 +199,19 @@ export const SPAWN_DELIVERED = 'delivered';
 /**
  * Issues a spawn request and resolves as soon as it has been DELIVERED.
  *
- * Resolves with the `Response` when one arrives inside `SPAWN_ACK_MS` (a 403
- * from Deployment Protection, a 200 from a route that lost the lease race:
- * both are the route's own answer, and handing them back unread is what this
- * spawn has always done with a non-2xx), with `SPAWN_DELIVERED` when none
- * does, and REJECTS for a failure that lands before the receipt, which is the
- * only kind that means no ticker was started.
+ * Resolves with the `Response` when a 2xx arrives inside `SPAWN_ACK_MS` (a
+ * route that lost the lease race to a ticker already running the room answers
+ * 200 `busy` at once), with `SPAWN_DELIVERED` when nothing does, and REJECTS
+ * for a failure that lands before the receipt or for a NON-2XX ANSWER inside
+ * it: a 403 from Deployment Protection, a 508 from the platform's loop
+ * protection, a 5xx from a route that crashed. Each of those is a ticker that
+ * never started.
+ *
+ * A NON-2XX USED TO RESOLVE, AND THAT MADE THE EXIT SPAWN'S FAILURE SILENT.
+ * Measured on a real deployment: a 508 refused the exit spawn, `runTicker`
+ * read the resolution as delivered and logged nothing, and the room waited
+ * for a relay's lease poll to cold-start a ticker, a 135 to 350ms snapshot gap
+ * with nothing anywhere saying why.
  *
  * A STANDBY ALSO REJECTS ON ANY ANSWER INSIDE THE RECEIPT WINDOW. A standby
  * polls the lease for `standbyMs`, so a route that answers it that fast never
@@ -216,7 +223,7 @@ export const SPAWN_DELIVERED = 'delivered';
  * a ticker that lost the acquire to one already running the room, which is
  * the ordinary outcome of a race and nothing the exit would act on anyway.
  */
-function deliverSpawn(spawnUrl: string, standby: boolean): Promise<unknown> {
+export function deliverSpawn(spawnUrl: string, standby: boolean): Promise<unknown> {
   const attempt = fetch(spawnUrl);
   return new Promise<unknown>((resolve, reject) => {
     const receipt = setTimeout(() => resolve(SPAWN_DELIVERED), SPAWN_ACK_MS);
@@ -231,6 +238,10 @@ function deliverSpawn(spawnUrl: string, standby: boolean): Promise<unknown> {
         clearTimeout(receipt);
         if (standby) {
           reject(new Error(`standby spawn answered ${res.status} inside SPAWN_ACK_MS (${SPAWN_ACK_MS}ms): the standby is not waiting for the lease`));
+          return;
+        }
+        if (!res.ok) {
+          reject(new Error(`spawn answered ${res.status} inside SPAWN_ACK_MS (${SPAWN_ACK_MS}ms): no ticker was started`));
           return;
         }
         resolve(res);
@@ -408,6 +419,11 @@ export function createTickerRoute<TState, TEvent>(
       // standby waits; it is ignored on the ordinary path, where waiting at
       // all would be wrong.
       standbyMs: standby ? standbyMs : 0,
+      // THE RELAYS ISSUE THE STANDBY HERE, NOT THE TICKER: a ticker spawning
+      // its successor is a deployment calling itself one hop deeper on every
+      // handoff, and the platform refuses that chain with a 508 at about the
+      // sixth hop. See `TickerOptions.standbyVia`.
+      standbyVia: ticker.standbyVia ?? 'relay',
       // Must issue an authenticated request back to THIS SAME ROUTE, carrying
       // a fresh spawn token bound to the successor's room id (never the
       // token this invocation itself was called with: that one authorized
@@ -756,14 +772,20 @@ export function createRelayRoute(opts: VercelRelayRouteOptions): (req: Request) 
             ...relay,
             lifetimeMs,
             joinMeta: joinMeta ? joinMeta(claims, url) : undefined,
-            spawnTicker: async (targetRoomId: string): Promise<unknown> => {
+            spawnTicker: async (targetRoomId: string, spawnOpts?: { standby: boolean }): Promise<unknown> => {
               const spawnUrl = new URL(tickerUrl, url);
               spawnUrl.searchParams.set('room', targetRoomId);
               spawnUrl.searchParams.set('k', makeSpawnToken(targetRoomId, secret));
+              // A ticker's STANDBY, claimed by this relay off the roster
+              // channel: this invocation descends from a browser's request, so
+              // the standby is the second hop of its chain however many
+              // handoffs the room has had. See `TickerOptions.standbyVia`.
+              const standby = spawnOpts?.standby === true;
+              if (standby) spawnUrl.searchParams.set(STANDBY_PARAM, '1');
               // The ticker route holds its response open for the whole run, so
               // waiting for it reported a 300s headers timeout as a failed
               // spawn on the first socket of every room. See `SPAWN_ACK_MS`.
-              return deliverSpawn(spawnUrl.toString(), false);
+              return deliverSpawn(spawnUrl.toString(), standby);
             },
           },
         });

@@ -33,12 +33,20 @@ export interface RoomKeys {
    * anyone has seen.
    */
   timeline: string;
+  /**
+   * The claim on the incumbent's standby request (`STANDBY_FRAME`): written
+   * `NX` by the one relay that spawns the standby, valued with the
+   * incumbent's owner id, deleted by that relay when the spawn is refused and
+   * by the incumbent at exit. An incumbent that finds no claim of its own
+   * there at exit has no standby coming and spawns its exit successor.
+   */
+  standby: string;
 }
 
 export const DEFAULT_NAMESPACE = 'room';
 export const MAX_ROOMS_PER_BASE = 50;
 
-const KEY_SUFFIXES = ['in', 'out', 'lease', 'state', 'stats', 'meta', 'metaout', 'crashes', 'timeline'] as const;
+const KEY_SUFFIXES = ['in', 'out', 'lease', 'state', 'stats', 'meta', 'metaout', 'crashes', 'timeline', 'standby'] as const;
 
 /** `${namespace}:${roomId}:${suffix}` for every suffix tickroom needs. */
 export function roomKeys(roomId: string, namespace: string = DEFAULT_NAMESPACE): RoomKeys {
