@@ -704,6 +704,18 @@ player's feet wants where the entity IS, which is `conn.own`. `conn.ownStats`
 (`lastError`, `snaps`, `stamped`, `invalid`) is what a debug overlay reads to
 see how far the prediction and the server actually disagree.
 
+**`frame().ownTick` is the tick `own` was drawn at, and anything that has to
+line up with your own entity is drawn there.** It is the render playhead as a
+fractional tick on `conn.tick`'s timeline: about one tick behind
+`tick.value + tick.fraction`, moving at real time, and slewing across a
+re-anchor rather than following it. A floor your player stands on that is a
+function of the tick (a moving train, a lift, a conveyor) evaluated at
+`tick.value + tick.fraction` slides under the feet by exactly that difference;
+evaluated at `ownTick` it stays put. The same number is the own render timeline
+for drawing other players forward onto your time. It is `null` exactly when
+`own` is. `PredictedEntity.renderTick` is the same value for a host driving the
+entity by hand.
+
 **Throw `ProtocolVersionError` out of `decodeSnapshot` on a wire mismatch.** The connection's skew recovery (reload once the reload marker is written to `sessionStorage`, otherwise latch `'version-skew'` directly) fires on a returned `version` field *or* on a thrown error whose `name` is `'ProtocolVersionError'`, and the second is what a binary codec actually does: `decodeDefaultSnapshot` checks the version before reading a single field and throws exactly that. It is duck-typed on the name, so your own codec can participate without importing anything. A decoder that swallows the mismatch instead leaves every old client silently dropping every frame after a deploy, with nothing reloading and nothing latching.
 
 That is the whole browser integration, upstream and down. You now have

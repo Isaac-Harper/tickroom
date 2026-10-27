@@ -101,6 +101,12 @@ and exists so a no-Redis host never loads `ioredis`.
 what `predict` on the connection does for you. They stay supported for a host
 that needs its own call order; the documented path is the option.
 
+The own render timeline is public on both forms: `FrameView.ownTick`
+(`number | null`, the fractional tick `FrameView.own` was drawn at, `null`
+exactly when `own` is) and `PredictedEntity.renderTick` (`number | null`, the
+tick the last `advance` drew at, `null` before the first `advance` on an
+initialized counter and from a new epoch until the next one). Since 1.2.0.
+
 ## `tickroom/codec`
 
 Everything the barrel exports is supported: `ByteWriter`, `ByteReader`,

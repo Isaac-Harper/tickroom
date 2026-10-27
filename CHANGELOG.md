@@ -5,6 +5,26 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-10-27
+
+The own entity's render timeline is public. Nothing on the wire moved and no
+existing value changed.
+
+### Added
+
+- `FrameView.ownTick: number | null`, the fractional tick `FrameView.own` was
+  drawn at: the prediction's render playhead on `conn.tick`'s timeline, about
+  one tick behind `tick.value + tick.fraction`, moving at real time within
+  `RENDER_SLEW` and slewing across a re-anchor rather than following it.
+  `null` exactly when `own` is. Anything drawn as a function of the tick that
+  has to stay registered with the own entity (a platform it rides, other
+  players drawn forward onto the same time) is evaluated there; the only way
+  to get it before was a private field.
+- `PredictedEntity.renderTick: number | null`, the same value for a host
+  driving the entity by hand: the tick the last `advance` drew at, `null`
+  before the first `advance` on an initialized counter and from a new
+  connection epoch until the `advance` after it.
+
 ## [1.1.1] - 2026-10-26
 
 A bug-fix pass over the ticker's exit paths, the shared subscriber, the two

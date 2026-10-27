@@ -24,8 +24,8 @@ or anything realtime where several clients need to agree on state changing many
 times a second.
 
 PUBLIC repo, MIT licensed, and PUBLISHED TO NPM as `tickroom`
-(`npm install tickroom ioredis`). `package.json` says 1.1.1 and this tree IS
-1.1.1: `CHANGELOG.md` is the record of what each release carries; its "Migrating from 0.3" list is still the break-by-break
+(`npm install tickroom ioredis`). `package.json` says 1.2.0 and this tree IS
+1.2.0: `CHANGELOG.md` is the record of what each release carries; its "Migrating from 0.3" list is still the break-by-break
 guide for anyone coming off the 0.x line.
 
 RELEASES GO OUT FROM A VERSION TAG through `.github/workflows/release.yml`
@@ -327,7 +327,8 @@ values, and the invariants below for the rules.
   (`{ tick: ClientTickView; send(payload) }`), so a test passes a fake and
   `RoomConnection` passes as is, and THE TIMESTEP IS `conn.tick.tickMs`. API:
   `advance(input, dt)`, `reconcile(pose, snapTick)`, `snapTo(pose)`, `pose`,
-  `stats`; `Pose` is `{ x, y, heading? }` and A REPLAY KEEPS NOTHING ELSE. THE WIRE
+  `stats`, `renderTick` (the playhead the last `advance` drew at, `null` until the
+  first `advance` on an initialized counter and from a new epoch until the next); `Pose` is `{ x, y, heading? }` and A REPLAY KEEPS NOTHING ELSE. THE WIRE
   IS BINARY BY DEFAULT: `encodeInputWindow` REQUIRES `TInput` to be `DefaultInput`,
   and EVERY input is checked before anything moves, not only the first (a
   shape a wrong-typed input can satisfy on one call and fail on the next, since
@@ -341,7 +342,7 @@ values, and the invariants below for the rules.
   THE DRAW IS A PLAYHEAD, NOT THE COUNTER. The step is
   `step(pose, input, dt, tick)` at all three call sites, `tick` being the record's
   own `targetTick`. `snapTo(pose)` IS THE ONLY CALL THE GAME DRIVES and THE RECORDS
-  ARE KEPT across it. `predictedEntity.test.ts` (60 cases) drives it against a
+  ARE KEPT across it. `predictedEntity.test.ts` (64 cases) drives it against a
   server model and the REAL `ClientTick` and `PlayoutBuffer` on one wall clock.
 - `src/client/interpolation.ts` - `SnapshotInterpolator`: buffered playback on the
   SERVER timeline (`receivedAt` only estimates the clock offset), jitter-adaptive
@@ -365,7 +366,9 @@ values, and the invariants below for the rules.
   `RosterFrame`/`isRosterFrame`. THE THREE ORDERS IT OWNS, the reason `predict`
   exists: `frame` advances the entity LAST, after the counter and the interpolator
   sample, returning the drawn pose as `FrameView.own` (`null` until
-  `ownConfirmed`); `processSnapshot` pushes the frame, calls `interp.teleport(key)`
+  `ownConfirmed`) and the tick it was drawn at as `FrameView.ownTick` (the
+  entity's `renderTick`, `null` exactly when `own` is: THE OWN RENDER TIMELINE, the
+  tick a host draws anything registered with its own entity at); `processSnapshot` pushes the frame, calls `interp.teleport(key)`
   for every key of `interpolate.teleported(snap)`, THEN fires `onSnapshot`, and
   only then `snapTo` (if `predict.teleported(snap)`) and
   `reconcile(pose, snap.tick)`; THE CALLBACK RUNS BEFORE THE RECONCILE ON PURPOSE,
@@ -1437,7 +1440,7 @@ renew cadence or the lease constants moves, because a margin measured once is an
 anecdote.
 
 Measured on this tree after a clean build, `npm pack --dry-run` is **81 files,
-413.3 kB packed and 1.2 MB unpacked**. Re-measure those three numbers after a
+414.1 kB packed and 1.2 MB unpacked**. Re-measure those three numbers after a
 build rather than quoting them forward: they are the only thing that would have
 caught the `outDir` gotcha above.
 
@@ -1479,13 +1482,13 @@ are the package's site.
 
 ## Status
 
-MEASURED ON THIS TREE, not estimated, PER TIER, on the 1.1.1 working tree:
-`npm run test:unit` is **1208 passed across 34 files** with
+MEASURED ON THIS TREE, not estimated, PER TIER, on the 1.2.0 tree:
+`npm run test:unit` is **1213 passed across 34 files** with
 `TICKROOM_TEST_REDIS_URL` pointed at an unused port (6499), which is the
 no-services promise proved rather than assumed; `npm run test:integration` is
-**1256 across 43** with a local Redis on 6399; `npm run test:measure` is **16
-across 4** on the same Redis and a quiet laptop; `npm test` is the sum, **1272
-across 47**. `npx tsc --noEmit` is clean repo-wide including `examples/`, and
+**1261 across 43** with a local Redis on 6399; `npm run test:measure` is **16
+across 4** on the same Redis and a quiet laptop (not re-run for 1.2.0, which
+touched no measurement file); `npm test` is the sum, **1277 across 47**. `npx tsc --noEmit` is clean repo-wide including `examples/`, and
 `npm run build` emits `dist/` cleanly. Roughly 18,700 lines of source and 28,700
 of tests. `README.md`, `AGENTS.md` and the five files under `docs/` are the whole
 of the prose.

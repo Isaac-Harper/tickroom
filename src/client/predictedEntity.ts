@@ -364,7 +364,7 @@ export class PredictedEntity<TInput> {
    * jumped to and counted as a snap. `null` until the first frame on an
    * initialized counter, which seeds it on the target.
    */
-  private renderTick: number | null = null;
+  private playhead: number | null = null;
   /** High-water mark of the ticks stamped, so a frame that crossed no tick boundary stamps nothing and a frame that crossed two stamps two. -1 until the first `advance` on an initialized counter. */
   private lastStamped = -1;
   /** The last `INPUT_HISTORY` records, oldest first. The re-send window is its tail. */
@@ -424,6 +424,26 @@ export class PredictedEntity<TInput> {
   /** The raw prediction, the pose after the last stamped tick: no interpolation, no offset. For game logic (a collision check, a camera), not for drawing. A copy. */
   get pose(): Pose {
     return { ...this.curr };
+  }
+
+  /**
+   * THE TICK THE LAST `advance` DREW AT: the render playhead, a fractional
+   * tick on the counter's timeline, so the pose `advance` returned is the
+   * pose history read at exactly this tick (plus the correction offset). It
+   * moves forward at real time within `RENDER_SLEW` and never backward
+   * except on a counted snap, and it is NOT `tick.value + tick.fraction`:
+   * it sits about one tick behind that and slews across counter jumps rather
+   * than following them. For anything drawn as a function of the tick that
+   * has to stay registered with the own entity (a moving floor it stands on,
+   * remote entities drawn forward onto the same timeline), this is the tick
+   * to evaluate it at.
+   *
+   * `null` until the first `advance` on an initialized counter, and again
+   * from a new connection epoch until the `advance` after it, which re-seeds
+   * it on the new counter: never a number for "not yet".
+   */
+  get renderTick(): number | null {
+    return this.playhead;
   }
 
   /**
@@ -576,7 +596,7 @@ export class PredictedEntity<TInput> {
     // newest pose, nothing is drawn past the mark, and nothing is measured.
     const newest = this.poses[this.poses.length - 1];
     const exposed =
-      newest !== undefined && (newest.tick > this.lastStamped || (this.renderTick !== null && this.renderTick > newest.tick));
+      newest !== undefined && (newest.tick > this.lastStamped || (this.playhead !== null && this.playhead > newest.tick));
     const before = exposed ? this.drawBase() : null;
     const invalidBefore = this._stats.invalid;
 
@@ -633,11 +653,11 @@ export class PredictedEntity<TInput> {
     // the drawn pose move faster than the entity or backward along its path.
     const target = value - 1 + tick.fraction;
     const ticks = elapsed / this.dt;
-    const was = this.renderTick;
-    if (this.renderTick === null) {
-      this.renderTick = target;
-    } else if (Math.abs(target - this.renderTick) > PLAYHEAD_SNAP_TICKS && tick.anchored) {
-      this.renderTick = target;
+    const was = this.playhead;
+    if (this.playhead === null) {
+      this.playhead = target;
+    } else if (Math.abs(target - this.playhead) > PLAYHEAD_SNAP_TICKS && tick.anchored) {
+      this.playhead = target;
       this._stats.snaps += 1;
     } else {
       // AN UNANCHORED COUNTER IS PROVISIONAL, so the playhead neither chases
@@ -648,9 +668,9 @@ export class PredictedEntity<TInput> {
       // its capped dt in the same call, before the next snapshot re-anchors
       // it; chasing that capped advance would count the resume as one snap
       // and the re-anchor a frame later as a second, for one tab switch.
-      const lo = this.renderTick + ticks * (1 - RENDER_SLEW);
-      const hi = this.renderTick + ticks * (1 + RENDER_SLEW);
-      this.renderTick = tick.anchored ? Math.min(hi, Math.max(lo, target)) : this.renderTick + ticks;
+      const lo = this.playhead + ticks * (1 - RENDER_SLEW);
+      const hi = this.playhead + ticks * (1 + RENDER_SLEW);
+      this.playhead = tick.anchored ? Math.min(hi, Math.max(lo, target)) : this.playhead + ticks;
     }
 
     // THE SPECULATION, rebuilt for where the playhead is now with this
@@ -659,8 +679,8 @@ export class PredictedEntity<TInput> {
     // one, so it is never read again once they have: it is rebuilt before
     // anything below draws. On a steady counter this is one length check.
     const last = this.poses[this.poses.length - 1];
-    if (last !== undefined && (this.spec.length > 0 || this.renderTick > last.tick)) {
-      this.speculate(data ?? (JSON.parse(json) as TInput), this.renderTick);
+    if (last !== undefined && (this.spec.length > 0 || this.playhead > last.tick)) {
+      this.speculate(data ?? (JSON.parse(json) as TInput), this.playhead);
     }
     // Then the carry, at the playhead the `before` was measured at, which
     // the slew has since moved on from. An invalid step already snapped the
@@ -905,7 +925,7 @@ export class PredictedEntity<TInput> {
       this.poses.length = 0;
       this.spec.length = 0;
       this.lastStamped = -1;
-      this.renderTick = null;
+      this.playhead = null;
       this.confirmed = false;
       this.err.reset();
     }
@@ -982,7 +1002,7 @@ export class PredictedEntity<TInput> {
    * the last speculated (or, with none, the newest stored) pose beyond it,
    * and `curr` when there is no history yet. Never includes the offset.
    */
-  private drawBase(at: number | null = this.renderTick): Pose {
+  private drawBase(at: number | null = this.playhead): Pose {
     const n = this.poses.length + this.spec.length;
     if (this.poses.length === 0 || at === null) return { ...this.curr };
     const newest = this.entry(n - 1);

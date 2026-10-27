@@ -1596,4 +1596,70 @@ describe('PredictedEntity', () => {
       expect(res.frames[at]!.y - res.frames[at - 1]!.y).toBeCloseTo(jump * PER_TICK + SPEED * FRAME, 6);
     });
   });
+
+  describe('renderTick: the tick the draw was taken at', () => {
+    /** The pose after tick t with the key held from a seat at 99: what the history holds at every stamped tick, so the draw at a playhead p is exactly this at p. */
+    const heldAt = (t: number): number => 60 + (t - 99) * PER_TICK;
+    const perFrame = FRAME / DT;
+
+    it('is null before the first advance on an initialized counter, then the target one tick behind the stamp', () => {
+      const { entity, tick } = make();
+      expect(entity.renderTick).toBeNull();
+      entity.advance({ dir: 1 }, FRAME);
+      expect(entity.renderTick).toBeNull(); // an uninitialized counter draws `initial` at no tick at all
+      tick.anchorTo(100);
+      expect(entity.renderTick).toBeNull();
+      entity.advance({ dir: 1 }, FRAME);
+      expect(entity.renderTick).toBe(99);
+    });
+
+    it('is the tick the returned pose was read at, and moves at real time within the slew, through a forward and a backward re-anchor', () => {
+      const { entity, tick } = seated(100);
+      let prev = entity.renderTick;
+      expect(prev).toBeNull();
+      for (let i = 0; i < 150; i++) {
+        if (i === 40) tick.anchorTo(tick.value + 2);
+        if (i === 90) tick.anchorTo(tick.value - 3);
+        tick.advance(FRAME);
+        const drawn = entity.advance({ dir: 1 }, FRAME);
+        const at = entity.renderTick!;
+        expect(drawn.y).toBeCloseTo(heldAt(at), 9);
+        if (prev !== null) {
+          expect(at - prev).toBeGreaterThanOrEqual(perFrame * (1 - RENDER_SLEW) - 1e-9);
+          expect(at - prev).toBeLessThanOrEqual(perFrame * (1 + RENDER_SLEW) + 1e-9);
+        }
+        prev = at;
+      }
+      expect(entity.stats.snaps).toBe(1); // the seat, and nothing since
+    });
+
+    it('a counter jump past PLAYHEAD_SNAP_TICKS moves it onto the target in one frame, counted, and the draw is still read there', () => {
+      const { entity, tick } = seated(100);
+      entity.advance({ dir: 1 }, FRAME);
+      const snaps = entity.stats.snaps;
+      tick.anchorTo(tick.value + PLAYHEAD_SNAP_TICKS + 2);
+      const drawn = entity.advance({ dir: 1 }, FRAME);
+      expect(entity.renderTick).toBe(tick.value - 1);
+      expect(entity.stats.snaps).toBe(snaps + 1);
+      expect(drawn.y).toBeCloseTo(heldAt(entity.renderTick!), 9);
+    });
+
+    it('runs on at real time while unanchored, is null from a new epoch\'s first reconcile, and re-seeds on the new counter', () => {
+      const { entity, tick } = seated(100);
+      for (let i = 0; i < 10; i++) {
+        tick.advance(FRAME);
+        entity.advance({ dir: 1 }, FRAME);
+      }
+      const before = entity.renderTick!;
+      tick.markUnanchored();
+      entity.advance({ dir: 1 }, FRAME);
+      expect(entity.renderTick).toBeCloseTo(before + perFrame, 9);
+
+      tick.anchorTo(5000);
+      entity.reconcile({ x: 6, y: 500 }, 4996);
+      expect(entity.renderTick).toBeNull();
+      expect(entity.advance({ dir: 0 }, FRAME)).toEqual({ x: 6, y: 500 });
+      expect(entity.renderTick).toBe(4999);
+    });
+  });
 });

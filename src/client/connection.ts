@@ -587,6 +587,18 @@ export interface FrameView<K extends string | number> {
    * rather than drawing, is `conn.own`.
    */
   own: Pose | null;
+  /**
+   * THE TICK `own` WAS DRAWN AT: `PredictedEntity.renderTick`, the render
+   * playhead, a fractional tick on `conn.tick`'s timeline. It is the own
+   * render timeline for this frame, so anything drawn as a function of the
+   * tick that has to stay registered with the own entity (a platform it
+   * rides, other players drawn forward onto the same time) is evaluated
+   * here rather than at `tick.value + tick.fraction`, which the playhead
+   * trails by about a tick and slews across rather than follows. `null`
+   * exactly when `own` is: without `predict`, and before the first
+   * authoritative pose has been reconciled.
+   */
+  ownTick: number | null;
   /** Same value `stallView().stalled` reports; `onStallChange` has already fired if this call changed it. */
   stalled: boolean;
   /** Seconds since the previous `frame()` call, clamped to `FRAME_DT_CAP_S`. Zero on the first call. Returned because a host's own per-frame work usually wants the same delta rather than a second, differently clamped one. */
@@ -1033,12 +1045,16 @@ export class RoomConnection<
     // record one frame into the past; that ordering used to be two calls in
     // the host's frame function with a comment saying which came first.
     let own: Pose | null = null;
+    let ownTick: number | null = null;
     if (this.entity !== null) {
       const drawn = this.entity.advance(input as TInput, dt);
-      if (this.ownConfirmed) own = drawn;
+      if (this.ownConfirmed) {
+        own = drawn;
+        ownTick = this.entity.renderTick;
+      }
     }
 
-    return { entities, own, stalled, dt };
+    return { entities, own, ownTick, stalled, dt };
   }
 
   /**

@@ -4293,6 +4293,43 @@ describe('RoomConnection owns the prediction', () => {
     conn.stop();
   });
 
+  it('ownTick is null exactly when own is, and otherwise the tick own was drawn at', async () => {
+    useMonotonicFakeTimers();
+    const { conn, deliver } = predictRoom();
+    await conn.start();
+    live().open();
+    expect(conn.frame(performance.now(), HELD).ownTick).toBeNull();
+    deliver({ tick: 100, serverTime: performance.now(), own: null });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(conn.frame(performance.now(), HELD).ownTick).toBeNull();
+
+    deliver({ tick: 101, serverTime: performance.now(), own: { x: 5, y: 5 } });
+    let prev: { x: number; at: number } | null = null;
+    for (let i = 0; i < 30; i++) {
+      await vi.advanceTimersByTimeAsync(16);
+      const view = conn.frame(performance.now(), HELD);
+      expect(view.own).not.toBeNull();
+      const at = view.ownTick!;
+      expect(at).toBeLessThan(conn.tick.value + conn.tick.fraction);
+      // The held stick moves x by one tick of travel per tick, so the draw
+      // between two frames moves by exactly the playhead's own advance.
+      if (prev !== null) expect(view.own!.x - prev.x).toBeCloseTo((at - prev.at) * OWN_SPEED * 0.05, 9);
+      prev = { x: view.own!.x, at };
+    }
+    conn.stop();
+
+    const plain = new RoomConnection({
+      tickHz: 20,
+      mint: vi.fn().mockResolvedValue(makeSession()),
+      WebSocketImpl: IMPL,
+      socketUrl: () => 'ws://x',
+      decodeSnapshot: () => null,
+    });
+    await plain.start();
+    expect(plain.frame(1000).ownTick).toBeNull();
+    plain.stop();
+  });
+
   it('a non-finite own pose confirms nothing: own stays null until a pose the reconcile accepts', async () => {
     useMonotonicFakeTimers();
     const { conn, deliver } = predictRoom();
