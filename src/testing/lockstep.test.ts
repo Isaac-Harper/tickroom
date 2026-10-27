@@ -11,6 +11,8 @@ import { describe, expect, it } from 'vitest';
 import { decodePongSnapshot, encodePongSnapshot, type DecodedPongSnapshot } from '../../examples/pong/codec.js';
 import { FIELD_H, PADDLE_SPEED, pongRuntime, stepPaddleY, type PongState } from '../../examples/pong/sim.js';
 import type { Pose } from '../client/predictedEntity.js';
+import type { DefaultInput } from '../codec/snapshot.js';
+import type { RoomRuntime } from '../core/types.js';
 import { runLockstep, sweepLockstep, type LockstepOptions } from './lockstep.js';
 
 const ME = 'p1';
@@ -233,6 +235,120 @@ describe('the harness proving it can fail', () => {
       const label = `lead ${lead}, delay ${delay}`;
       expect(report.pinned.length, `${label}: pinned ticks`).toBeGreaterThan(10);
       expect(report.maxError, `${label}: reconcile error`).toBeGreaterThan(0);
+    }
+  });
+});
+
+/**
+ * A WORLD THAT MOVES WITH THE TICK: a belt under the player whose speed is a
+ * function of the tick, so a tick nobody steps is the belt's travel for that
+ * tick and nothing else. Pong's paddle stands still on an idle input, which is
+ * why the startup gap below never showed there.
+ */
+const BELT_HZ = 20;
+const WALK = 5;
+
+interface Walker {
+  x: number;
+  y: number;
+  input: DefaultInput;
+}
+
+interface BeltState {
+  tick: number;
+  players: Map<string, Walker>;
+}
+
+interface BeltSnapshot {
+  tick: number;
+  players: { pid: string; x: number; y: number }[];
+}
+
+const IDLE: DefaultInput = { axes: [0, 0], buttons: 0 };
+
+/** 5 or 10 units a second, a quarter or a half unit a tick, exact in binary floating point. */
+function beltSpeed(tick: number): number {
+  return tick % 40 < 20 ? 5 : 10;
+}
+
+function stepOnBelt(pose: Pose, input: DefaultInput, dt: number, tick: number): Pose {
+  return { x: pose.x + beltSpeed(tick) * dt + input.axes[0] * WALK * dt, y: pose.y + input.axes[1] * WALK * dt };
+}
+
+const beltRuntime: RoomRuntime<BeltState, unknown> = {
+  tickHz: BELT_HZ,
+  create: () => ({ tick: 0, players: new Map() }),
+  tick: (s, dt) => {
+    s.tick += 1;
+    for (const p of s.players.values()) {
+      const next = stepOnBelt(p, p.input, dt, s.tick);
+      p.x = next.x;
+      p.y = next.y;
+    }
+  },
+  currentTick: (s) => s.tick,
+  playerCount: (s) => s.players.size,
+  join: (s, pid) => void s.players.set(pid, { x: 0, y: 0, input: { ...IDLE } }),
+  leave: (s, pid) => void s.players.delete(pid),
+  applyInput: (s, pid, input) => {
+    const p = s.players.get(pid);
+    if (p) p.input = input.data as DefaultInput;
+  },
+  usesPlayout: () => true,
+  serialize: () => '',
+  deserialize: () => ({ tick: 0, players: new Map() }),
+  encodeSnapshot: (s) =>
+    JSON.stringify({ tick: s.tick, players: [...s.players].map(([pid, p]) => ({ pid, x: p.x, y: p.y })) } satisfies BeltSnapshot),
+};
+
+/** Joined at tick 400 with the belt already running, walking on and off it every seven ticks. */
+function beltBase(): Omit<LockstepOptions<BeltState, BeltSnapshot, DefaultInput>, 'lead' | 'delay'> {
+  return {
+    runtime: beltRuntime,
+    pid: ME,
+    setup: (s) => {
+      s.tick = 400;
+      beltRuntime.join(s, ME);
+    },
+    encode: (s) => beltRuntime.encodeSnapshot(s, s.tick * 50),
+    decode: (bytes) => JSON.parse(bytes as string) as BeltSnapshot,
+    step: stepOnBelt,
+    maxSpeed: 20,
+    ownPose: (snap) => {
+      const mine = snap.players.find((p) => p.pid === ME);
+      return mine === undefined ? null : { x: mine.x, y: mine.y };
+    },
+    input: (t) => ({ axes: [Math.floor(t / 7) % 2 === 0 ? 1 : 0, 0], buttons: 0 }),
+    ticks: 80,
+  };
+}
+
+describe('the startup gap: connecting while the world carries the player', () => {
+  const BELT_LEADS = [1, 2, 3, 5, 8];
+  const BELT_DELAYS = [0, 2, 4];
+
+  it('with idleInput every reconcile is exact at every lead and delay', () => {
+    for (const { lead, delay, report } of sweepLockstep({ ...beltBase(), idleInput: IDLE }, BELT_LEADS, BELT_DELAYS)) {
+      const label = `lead ${lead}, delay ${delay}`;
+      expect(report.maxError, `${label}: reconcile error`).toBe(0);
+      expect(report.reconciles, `${label}: reconciles`).toEqual([]);
+      expect(report.snaps, `${label}: snaps`).toBe(0);
+      expect(report.stamped, `${label}: records stamped`).toBe(80);
+    }
+  });
+
+  it('THE CONTROL: without it, one tick of belt travel per snapshot below the first record, and none after', () => {
+    for (const { lead, delay, report } of sweepLockstep(beltBase(), BELT_LEADS, BELT_DELAYS)) {
+      const label = `lead ${lead}, delay ${delay}`;
+      // The first record is stamped for 400 + lead, predicted from the pose
+      // after 400 + lead - 1, and the server stepped 401 to there with the
+      // seated input. The first confirmation (401) is a snap and is not
+      // listed; every snapshot after it inside the gap is short by one more
+      // tick of the belt.
+      const gap = [];
+      for (let t = 402; t <= 400 + lead - 1; t++) gap.push({ tick: t, error: beltSpeed(t) / BELT_HZ });
+      expect(report.reconciles, `${label}: reconciles`).toEqual(gap);
+      expect(report.snaps, `${label}: snaps`).toBe(0);
     }
   });
 });

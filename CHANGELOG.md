@@ -5,6 +5,28 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-10-27
+
+A prediction that connects onto something moving can be exact from its first
+confirmation. Nothing on the wire moved and nothing changes for a host that
+does not pass the new option.
+
+### Added
+
+- `predict.idleInput` (`PredictionOptions`, `PredictedEntityOptions`, and
+  `LockstepOptions` in `tickroom/testing`): the input the runtime's `join`
+  seats the player with. The first stamped record is a whole lead ahead of the
+  snapshot that anchored the counter, and the server steps the ticks in
+  between with the input it holds for the player, which no record of the
+  client's can cover. Up to 1.2.0 the replay skipped those ticks and the first
+  stamp seated the history on the snapshot's pose, which is exact only while a
+  step under the held input does nothing: a player connecting while riding a
+  platform that moves with the tick reconciled out by one more tick of the
+  platform's travel at every snapshot below the first record (glided, never
+  snapped, none after). With `idleInput` the first stamp and the replay step
+  that gap with it, never deeper than `INPUT_HISTORY`. Copied at construction,
+  never sent; a value that is not JSON data is a `TypeError`.
+
 ## [1.2.0] - 2026-10-27
 
 The own entity's render timeline is public. Nothing on the wire moved and no

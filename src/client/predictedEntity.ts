@@ -135,6 +135,22 @@ export interface PredictedEntityOptions<TInput> {
   wire?: 'binary' | 'json' | undefined;
   /** A host's own wire: the last `INPUT_WINDOW` records, oldest first, to one frame `conn.send` takes. Overrides `wire`; the relay's `decodeInput` has to be the inverse. */
   encodeInput?: ((records: StampedRecord<TInput>[]) => ArrayBuffer | Uint8Array | string) | undefined;
+  /**
+   * THE INPUT THE SERVER HOLDS FOR THIS ENTITY BEFORE ANY OF THIS CLIENT'S
+   * RECORDS REACH IT: what the runtime's `join` seats a player with, usually
+   * a released stick. It is stepped on the STARTUP GAP, the ticks between
+   * the epoch's first snapshot and its first stamped record. The server
+   * steps the entity on those ticks like any other, with that held input,
+   * and no record of this client's can ever cover them: the first stamp is
+   * a whole lead ahead of the snapshot that anchored the counter, by
+   * design. Left out, the gap is not stepped at all, which is exact only
+   * while a step under the held input does nothing; in a world that moves
+   * with the tick (a platform the entity rides, a current, gravity) it is
+   * the world's motion, and every snapshot below the first record
+   * reconciles out by the gap's share of it until the snapshots reach the
+   * first record. Never sent, only stepped, and copied at construction.
+   */
+  idleInput?: TInput | undefined;
 }
 
 /** One stamped record as it goes on the wire: `{ targetTick, data }`, which is the `ClientInput` shape less the `seq` the library documents it never reads. What `encodeInput` is handed, and what the JSON wire sends verbatim. */
@@ -375,6 +391,12 @@ export class PredictedEntity<TInput> {
   private wasAnchored = false;
   /** The newest finite authoritative pose, where the prediction is put back when a step or a replay produces something that is not a pose. `null` until the first confirmation; `initial` stands in before that. */
   private lastAuthoritative: Pose | null = null;
+  /** The tick `lastAuthoritative` was taken at, in this epoch. `null` until the epoch's first confirmation. */
+  private authoritativeTick: number | null = null;
+  /** The first tick this epoch stamped. Every tick before it that a replay reaches is the startup gap, stepped with `idleInput`. `null` until the epoch's first stamp. */
+  private firstStamp: number | null = null;
+  /** `idleInput`, copied. `undefined` leaves the startup gap unstepped. */
+  private readonly idleInput: TInput | undefined;
   private readonly _stats = { lastError: 0, snaps: 0, stamped: 0, invalid: 0 };
 
   constructor(opts: PredictedEntityOptions<TInput>) {
@@ -392,6 +414,13 @@ export class PredictedEntity<TInput> {
     const wire = opts.wire ?? 'binary';
     if (wire !== 'binary' && wire !== 'json') {
       throw new RangeError(`PredictedEntity: wire must be 'binary' or 'json', got ${String(wire)}`);
+    }
+    if (opts.idleInput !== undefined) {
+      const idle = JSON.stringify(opts.idleInput);
+      if (idle === undefined) throw new TypeError('PredictedEntity: idleInput must be JSON data');
+      this.idleInput = JSON.parse(idle) as TInput;
+    } else {
+      this.idleInput = undefined;
     }
     this.conn = opts.conn;
     this.step = opts.step;
@@ -539,7 +568,20 @@ export class PredictedEntity<TInput> {
       // the first record is predicted from is the history's first entry,
       // keyed by the tick before it, so the playhead has a segment to sit on
       // from the first frame.
+      //
+      // AND THAT POSE IS THE ONE AFTER `value - 1`, NOT AFTER THE SNAPSHOT.
+      // A connection reconciles its first snapshot before its first stamp,
+      // so a confirmed `curr` is the server's pose at that snapshot's tick,
+      // a whole lead short of here. The server steps the ticks in between
+      // with the input it holds, and so does this, when the host has named
+      // it; see `idleInput`.
       this.lastStamped = value - 1;
+      this.firstStamp = value;
+      if (this.confirmed && this.authoritativeTick !== null) {
+        const seated = this.stepGap(this.curr, this.authoritativeTick, value);
+        if (isFinitePose(seated)) this.curr = seated;
+        else this.invalidate();
+      }
       this.poses.push({ tick: value - 1, pose: { ...this.curr } });
     } else if (stamping && value + 1 < this.lastStamped) {
       // THE COUNTER JUMPED BACKWARD, past the one tick of slack a re-anchor
@@ -746,11 +788,16 @@ export class PredictedEntity<TInput> {
     // caller's snapshot.
     let replayed: Pose = { ...authoritative };
     if (!restarted) {
+      // THE STARTUP GAP FIRST: a snapshot below the epoch's first record
+      // reflects ticks the server stepped with the input it held, and the
+      // records that follow were predicted from the pose after them.
+      if (this.firstStamp !== null) replayed = this.stepGap(replayed, snapTick, this.firstStamp);
       for (const rec of this.records) {
         if (rec.targetTick > snapTick) replayed = this.step(replayed, rec.data, this.dt, rec.targetTick);
       }
     }
     this.lastAuthoritative = { ...authoritative };
+    this.authoritativeTick = snapTick;
     const first = !this.confirmed;
     this.confirmed = true;
     if (!isFinitePose(replayed)) {
@@ -925,11 +972,27 @@ export class PredictedEntity<TInput> {
       this.poses.length = 0;
       this.spec.length = 0;
       this.lastStamped = -1;
+      this.firstStamp = null;
+      this.authoritativeTick = null;
       this.playhead = null;
       this.confirmed = false;
       this.err.reset();
     }
     this.wasAnchored = anchored;
+  }
+
+  /**
+   * `pose`, the server's pose after tick `from`, stepped with `idleInput`
+   * through every tick before `until`: the startup gap, which no record
+   * covers. Unchanged without an `idleInput`, when there is no gap, and when
+   * the gap is deeper than `INPUT_HISTORY`, which no replay reaches either.
+   */
+  private stepGap(pose: Pose, from: number, until: number): Pose {
+    const idle = this.idleInput;
+    if (idle === undefined || until - from - 1 > INPUT_HISTORY) return pose;
+    let stepped = pose;
+    for (let t = from + 1; t < until; t++) stepped = this.step(stepped, idle, this.dt, t);
+    return stepped;
   }
 
   /**
@@ -952,6 +1015,7 @@ export class PredictedEntity<TInput> {
       this.curr = { ...this.poses[i]!.pose };
     }
     this.lastStamped = mark;
+    if (this.firstStamp !== null && mark + 1 < this.firstStamp) this.firstStamp = mark + 1;
     let n = this.records.length;
     while (n > 0 && this.records[n - 1]!.targetTick > mark) n--;
     this.records.length = n;

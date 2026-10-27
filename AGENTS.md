@@ -24,8 +24,8 @@ or anything realtime where several clients need to agree on state changing many
 times a second.
 
 PUBLIC repo, MIT licensed, and PUBLISHED TO NPM as `tickroom`
-(`npm install tickroom ioredis`). `package.json` says 1.2.0 and this tree IS
-1.2.0: `CHANGELOG.md` is the record of what each release carries; its "Migrating from 0.3" list is still the break-by-break
+(`npm install tickroom ioredis`). `package.json` says 1.3.0 and this tree IS
+1.3.0: `CHANGELOG.md` is the record of what each release carries; its "Migrating from 0.3" list is still the break-by-break
 guide for anyone coming off the 0.x line.
 
 RELEASES GO OUT FROM A VERSION TAG through `.github/workflows/release.yml`
@@ -342,7 +342,9 @@ values, and the invariants below for the rules.
   THE DRAW IS A PLAYHEAD, NOT THE COUNTER. The step is
   `step(pose, input, dt, tick)` at all three call sites, `tick` being the record's
   own `targetTick`. `snapTo(pose)` IS THE ONLY CALL THE GAME DRIVES and THE RECORDS
-  ARE KEPT across it. `predictedEntity.test.ts` (64 cases) drives it against a
+  ARE KEPT across it. `idleInput` (optional, copied, never sent) STEPS THE STARTUP
+  GAP, at the first stamp and in the replay; see the invariant.
+  `predictedEntity.test.ts` (68 cases) drives it against a
   server model and the REAL `ClientTick` and `PlayoutBuffer` on one wall clock.
 - `src/client/interpolation.ts` - `SnapshotInterpolator`: buffered playback on the
   SERVER timeline (`receivedAt` only estimates the clock offset), jitter-adaptive
@@ -994,6 +996,16 @@ Rules. The trap each one guards against is often a gotcha below.
   100 to 150ms on the one entity the player steers, on every tolerance
   correction. And a new epoch starts the entity over: no record, pose or offset
   crosses it, and its first reconcile is a counted snap.
+- THE STARTUP GAP IS TICKS THE SERVER STEPPED, NOT TICKS THAT DID NOT HAPPEN.
+  The epoch's first stamp is a whole lead past the snapshot that anchored the
+  counter, and the server steps the ticks in between with the input it holds for
+  the player, which no record covers. Skipping them is exact only while a step
+  under that input does nothing; in a world that moves with the tick (a train the
+  player rides) every snapshot below the first record reconciled out by one more
+  tick of its travel. The input is the HOST's to know, so it is
+  `predict.idleInput` rather than a default, and with it the first stamp and the
+  replay step the gap. A reconnect where the server still holds the old socket's
+  input stays inexact by design, bounded by the lead.
 - A FROZEN RENDER LOOP IS AN EPOCH BOUNDARY FOR THE COUNTER, and not for the
   interpolator. Nothing was rendered during the gap, so there is no continuity to
   protect; the interpolator's buffer and offset are still about the same socket.
@@ -1482,13 +1494,13 @@ are the package's site.
 
 ## Status
 
-MEASURED ON THIS TREE, not estimated, PER TIER, on the 1.2.0 tree:
-`npm run test:unit` is **1213 passed across 34 files** with
+MEASURED ON THIS TREE, not estimated, PER TIER, on the 1.3.0 tree:
+`npm run test:unit` is **1219 passed across 34 files** with
 `TICKROOM_TEST_REDIS_URL` pointed at an unused port (6499), which is the
 no-services promise proved rather than assumed; `npm run test:integration` is
-**1261 across 43** with a local Redis on 6399; `npm run test:measure` is **16
-across 4** on the same Redis and a quiet laptop (not re-run for 1.2.0, which
-touched no measurement file); `npm test` is the sum, **1277 across 47**. `npx tsc --noEmit` is clean repo-wide including `examples/`, and
+**1267 across 43** with a local Redis on 6399; `npm run test:measure` is **16
+across 4** on the same Redis and a quiet laptop (not re-run for 1.2.0 or 1.3.0,
+which touched no measurement file); `npm test` is the sum, **1283 across 47**. `npx tsc --noEmit` is clean repo-wide including `examples/`, and
 `npm run build` emits `dist/` cleanly. Roughly 18,700 lines of source and 28,700
 of tests. `README.md`, `AGENTS.md` and the five files under `docs/` are the whole
 of the prose.

@@ -107,6 +107,11 @@ exactly when `own` is) and `PredictedEntity.renderTick` (`number | null`, the
 tick the last `advance` drew at, `null` before the first `advance` on an
 initialized counter and from a new epoch until the next one). Since 1.2.0.
 
+`PredictionOptions.idleInput` and `PredictedEntityOptions.idleInput`
+(`TInput | undefined`): the input the runtime's `join` seats the player with,
+stepped on the startup gap between the first snapshot and the first stamped
+record. `LockstepOptions.idleInput` mirrors it. Since 1.3.0.
+
 ## `tickroom/codec`
 
 Everything the barrel exports is supported: `ByteWriter`, `ByteReader`,

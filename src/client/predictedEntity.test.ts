@@ -1009,6 +1009,97 @@ describe('PredictedEntity', () => {
     });
   });
 
+  describe('the startup gap: a world that moves with the tick under an entity that connects mid-motion', () => {
+    /**
+     * A belt under the entity whose speed is a function of the TICK, so a
+     * tick the replay skips is the belt's travel for exactly that tick and
+     * cannot hide as a constant offset. The connection's real order: the
+     * first snapshot anchors the counter `lead` ahead and is reconciled
+     * BEFORE the first stamp, so the ticks between that snapshot and the
+     * first record are stepped by the server with the input `join` seated
+     * the player with, and by nothing of the client's.
+     */
+    const belt = (tick: number): number => (tick % 6 < 3 ? 20 : 40);
+    const stepOnBelt = (pose: Pose, input: Dir, dt: number, tick: number): Pose => ({
+      x: pose.x,
+      y: pose.y + input.dir * SPEED * dt + belt(tick) * dt,
+    });
+
+    function run(idleInput: Dir | undefined): { snapTick: number; error: number }[] {
+      const lead = 5;
+      const idle: Dir = { dir: 0 };
+      let serverTick = 100;
+      let serverPose: Pose = INITIAL;
+      const buffer = new Map<number, Dir>();
+      let held: Dir = idle;
+
+      const { conn, tick, sent } = fakeConn();
+      const entity = new PredictedEntity<Dir>({
+        conn,
+        step: stepOnBelt,
+        maxSpeed: SPEED + 40,
+        initial: INITIAL,
+        wire: 'json',
+        ...(idleInput === undefined ? {} : { idleInput }),
+      });
+      tick.anchorTo(serverTick + lead);
+      entity.reconcile(serverPose, serverTick);
+
+      const out: { snapTick: number; error: number }[] = [];
+      for (let i = 0; i < 30; i++) {
+        entity.advance({ dir: i % 4 < 2 ? 1 : -1 }, FRAME);
+        for (const rec of lastPayload(sent)) buffer.set(rec.targetTick, rec.data);
+        tick.anchorTo(tick.value + 1);
+
+        const produced = serverTick + 1;
+        const rec = buffer.get(produced);
+        if (rec) held = rec;
+        serverPose = stepOnBelt(serverPose, held, DT, produced);
+        serverTick = produced;
+
+        entity.reconcile(serverPose, serverTick);
+        out.push({ snapTick: serverTick, error: entity.stats.lastError });
+      }
+      return out;
+    }
+
+    it('with idleInput every reconcile is exact, from the first snapshot after the confirmation', () => {
+      for (const e of run({ dir: 0 })) expect(e.error, `snapshot ${e.snapTick}`).toBe(0);
+    });
+
+    it('THE CONTROL: without it every snapshot below the first record reconciles out by the belt travel the replay skipped, and none after', () => {
+      const errors = run(undefined);
+      const nonzero = errors.filter((e) => e.error !== 0);
+      // The first stamp is 105, so 101 to 104 are the gap, and the
+      // prediction stepped none of them. Each snapshot inside it corrects one
+      // more tick of the belt; from 105 on, the first record's own tick, the
+      // replay starts past the gap and the prediction already holds it.
+      expect(nonzero.map((e) => e.snapTick)).toEqual([101, 102, 103, 104]);
+      for (const e of nonzero) expect(e.error).toBeGreaterThan(0);
+      for (const e of errors.filter((e) => e.snapTick >= 105)) expect(e.error).toBe(0);
+    });
+
+    it('is copied at construction: mutating the object passed in changes nothing a replay steps', () => {
+      const idle: Dir = { dir: 0 };
+      const { conn, tick } = fakeConn();
+      const entity = new PredictedEntity<Dir>({ conn, step: stepOnBelt, maxSpeed: SPEED + 40, initial: INITIAL, wire: 'json', idleInput: idle });
+      tick.anchorTo(105);
+      entity.reconcile(INITIAL, 100);
+      idle.dir = 1;
+      entity.advance({ dir: 0 }, FRAME);
+      let expected = INITIAL;
+      for (let t = 101; t <= 105; t++) expected = stepOnBelt(expected, { dir: 0 }, DT, t);
+      expect(entity.pose).toEqual(expected);
+    });
+
+    it('is refused with a TypeError when it is not JSON data', () => {
+      const { conn } = fakeConn();
+      expect(
+        () => new PredictedEntity<Dir>({ conn, step: stepOnBelt, maxSpeed: SPEED, wire: 'json', idleInput: (() => 0) as unknown as Dir }),
+      ).toThrow(TypeError);
+    });
+  });
+
   describe('the render contract, against the real counter, the real playout buffer and a server model on wall time', () => {
     /** One-way delays, ms, both directions. Well inside the lead, so a healthy run has no late input. */
     const UPLINK_MS = 30;

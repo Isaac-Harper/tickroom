@@ -590,6 +590,15 @@ const conn = new RoomConnection<Snapshot, string, DefaultInput>({
     // is not. `wire: 'json'` sends any JSON-shaped input as one text frame
     // (about 300 bytes for the same six), and `encodeInput` is your own wire.
     // The relay's default `decodeInput` in step 2 reads the first two.
+    //
+    // THE INPUT YOUR `join` SEATS A PLAYER WITH. The first record you stamp is
+    // a whole lead ahead of the snapshot that anchored the counter, so the
+    // server steps the ticks in between with this input and nothing of yours
+    // covers them. Name it and the replay steps them too. Leave it out only if
+    // a step under it never moves you (no platform, current or conveyor that
+    // carries a player who is not steering); see "Connecting onto something
+    // that moves" below.
+    idleInput: { axes: [0, 0], buttons: 0 },
   },
 
   // Everything the interpolator cannot smooth and the prediction does not own:
@@ -844,6 +853,24 @@ step refusing to move looks like from inside. `report.trace` is the whole run,
 tick by tick, when a number is not enough. Pass `onSnapshot` and update the same
 client-side context your page updates, or the harness tests a world your page
 never gives the step.
+
+**Connecting onto something that moves.** Pass `idleInput` exactly as on
+`predict`, and start one scenario with the player already riding whatever your
+world moves with the tick. A client's first stamped record is a whole lead
+ahead of the first snapshot it sees, because that is what the lead is: the
+ticks before it will have been stepped by the time any record could arrive. The
+server steps them with the input it holds for the player, which for a fresh
+seat is whatever `join` seated it with, and the client has no record of its own
+for any of them. Without `idleInput` the replay skips those ticks, which is
+exact only while a step under the held input does nothing. On a moving platform
+it is the platform's travel, so every snapshot below the first record
+reconciles out by one more tick of it (glided, never snapped, and none once the
+snapshots reach the first record). With `idleInput` the replay and the first
+stamp step the gap with it, and the run is exact from the first confirmation.
+It cannot be exact on a RECONNECT where the server still holds the previous
+socket's last input for the player (decayed by your `onStarve`), because that
+input is the server's to know; the new epoch's first snapshot is a snap anyway,
+and the gap's error is bounded by the lead.
 
 It imports no Node builtin and no `ioredis`, so it loads in the browser test
 runner your client code already runs in. `src/testing/lockstep.test.ts` runs the

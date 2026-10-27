@@ -96,6 +96,8 @@ export interface LockstepOptions<TState, TSnap, TInput> {
   wire?: 'binary' | 'json' | undefined;
   /** `predict.encodeInput`, for a host with a wire of its own. Pair it with the `decodeInput` that reads it. */
   encodeInput?: ((records: StampedRecord<TInput>[]) => ArrayBuffer | Uint8Array | string) | undefined;
+  /** `predict.idleInput`: the input your runtime's `join` seats the player with. Without it a scenario that starts on something moving with the tick reconciles out by the startup gap's share of that motion; see `PredictedEntityOptions.idleInput`. */
+  idleInput?: TInput | undefined;
   /** The scripted input for one client tick. Called once per iteration with the tick being stamped. */
   input: (tick: number) => TInput;
   /**
@@ -246,6 +248,7 @@ export function runLockstep<TState, TSnap, TInput>(opts: LockstepOptions<TState,
     initial,
     wire: opts.wire,
     encodeInput: opts.encodeInput,
+    idleInput: opts.idleInput,
   });
 
   const reconciles: LockstepReconcile[] = [];

@@ -282,6 +282,8 @@ export interface PredictionOptions<TSnap, TInput> {
   wire?: 'binary' | 'json' | undefined;
   /** A host's own wire: the last six stamped records, oldest first, to one frame `conn.send` takes. Overrides `wire`; the relay's `decodeInput` has to be its inverse. */
   encodeInput?: ((records: StampedRecord<TInput>[]) => ArrayBuffer | Uint8Array | string) | undefined;
+  /** The input the runtime's `join` seats this player with, usually a released stick: stepped on the ticks between the first snapshot and the first stamped record, which the server steps with it and no record covers. Name it whenever the world moves with the tick under an entity that is not steering (a platform it rides). See `PredictedEntityOptions.idleInput`. */
+  idleInput?: TInput | undefined;
 }
 
 /**
@@ -784,6 +786,7 @@ export class RoomConnection<
           initial: predict.initial,
           wire: predict.wire,
           encodeInput: predict.encodeInput,
+          idleInput: predict.idleInput,
         })
       : null;
   }
