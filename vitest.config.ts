@@ -17,7 +17,7 @@ import { defineConfig } from 'vitest/config';
 //
 // So the release gate runs `integration` and the measurement tier runs
 // elsewhere, nightly and on a quiet machine. The classification per file is the
-// table in AGENTS.md, and it is the source of truth; the globs below follow it.
+// table in docs/agents/tiers.md, and it is the source of truth; the globs below follow it.
 //
 // The tier is chosen with an env var rather than with three config files
 // because one list of globs in one place is the thing a future file has to be
@@ -74,7 +74,7 @@ export const MEASUREMENT = [
  * concatenation of the three tiers on purpose, so a thirteenth file under
  * `tests/` runs somewhere from the moment it is written. It still has to be
  * added to `INTEGRATION` or `MEASUREMENT` above to reach a gate, and to the
- * classification table in AGENTS.md to be findable. `tests/tiers.test.ts`
+ * classification table in docs/agents/tiers.md to be findable. `tests/tiers.test.ts`
  * fails the unit tier when a file under `tests/` is in no tier or in two,
  * because a branch written in parallel with the tiering left exactly one
  * file (`depth.redis.test.ts`) running under `npm test` and under no gate.
